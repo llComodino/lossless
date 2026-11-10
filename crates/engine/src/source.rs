@@ -11,6 +11,34 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::units::{TimeBase, Timestamp};
 
+fn ratio(tb: TimeBase) -> (u32, u32) {
+    (tb.numer.get(), tb.denom.get())
+}
+
+/// Frames at `rate` for timestamp `ts` in time base `numer/denom` seconds
+/// (no time base: the timestamp is already in frames).
+fn ts_to_frames(ts: i64, time_base: Option<(u32, u32)>, rate: u32) -> u64 {
+    let ts = ts.max(0) as u128;
+    match time_base {
+        Some((numer, denom)) => {
+            (ts * u128::from(numer) * u128::from(rate) / u128::from(denom)) as u64
+        }
+        None => ts as u64,
+    }
+}
+
+/// Inverse of `ts_to_frames`, rounding up so the timestamp is never before
+/// `frame`. Exact for FLAC/MP3, whose time base is 1/rate.
+fn frames_to_ts(frame: u64, time_base: Option<(u32, u32)>, rate: u32) -> Option<i64> {
+    let ts = match time_base {
+        Some((numer, denom)) => {
+            (u128::from(frame) * u128::from(denom)).div_ceil(u128::from(numer) * u128::from(rate))
+        }
+        None => u128::from(frame),
+    };
+    i64::try_from(ts).ok()
+}
+
 /// One decoded file: interleaved full-scale i32 chunks, seekable to the frame.
 pub struct Source {
     reader: Box<dyn FormatReader>,
@@ -82,14 +110,7 @@ impl Source {
     }
 
     fn ts_to_frames(&self, ts: Timestamp) -> u64 {
-        let ts = ts.get().max(0) as u128;
-        match self.time_base {
-            Some(tb) => {
-                (ts * u128::from(tb.numer.get()) * u128::from(self.format.rate)
-                    / u128::from(tb.denom.get())) as u64
-            }
-            None => ts as u64,
-        }
+        ts_to_frames(ts.get(), self.time_base.map(ratio), self.format.rate)
     }
 
     /// Next chunk of interleaved samples, or `None` at the end of the file.
@@ -120,18 +141,8 @@ impl Source {
         }
     }
 
-    /// Inverse of `ts_to_frames`, rounding up so the timestamp is never
-    /// before `frame`. Exact for FLAC/MP3, whose time base is 1/rate.
     fn frames_to_ts(&self, frame: u64) -> Option<Timestamp> {
-        let ts = match self.time_base {
-            Some(tb) => {
-                let num = u128::from(frame) * u128::from(tb.denom.get());
-                let den = u128::from(tb.numer.get()) * u128::from(self.format.rate);
-                num.div_ceil(den)
-            }
-            None => u128::from(frame),
-        };
-        i64::try_from(ts).ok().map(Timestamp::from)
+        frames_to_ts(frame, self.time_base.map(ratio), self.format.rate).map(Timestamp::from)
     }
 
     /// Seek so the next chunk starts exactly at `frame`. Returns that frame.
