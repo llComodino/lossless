@@ -42,10 +42,13 @@ fn parse_time(s: &str) -> Result<u64> {
     let mut secs: f64 = 0.0;
     for part in s.split(':') {
         let v: f64 = part.parse().with_context(|| format!("bad time {s:?}"))?;
+        if !v.is_finite() || v.is_sign_negative() {
+            bail!("bad time {s:?}");
+        }
         secs = secs * 60.0 + v;
     }
-    if secs < 0.0 {
-        bail!("negative time");
+    if !secs.is_finite() {
+        bail!("bad time {s:?}");
     }
     Ok((secs * 1000.0) as u64)
 }
@@ -260,6 +263,9 @@ mod tests {
         assert_eq!(parse_time("1:30").unwrap(), 90_000);
         assert_eq!(parse_time("1:00:05.5").unwrap(), 3_605_500);
         assert!(parse_time("x").is_err());
+        for bad in ["inf", "-inf", "NaN", "1e400", "1:-5", "-0", "1::2", ""] {
+            assert!(parse_time(bad).is_err(), "{bad:?} accepted");
+        }
     }
 
     #[test]
