@@ -19,3 +19,6 @@ lossless-library.workspace = true
 anyhow = "1.0.104"
 toml = "1.2.1"
 serde = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+lossless-engine = { workspace = true, features = ["fixtures"] }

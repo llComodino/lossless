@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
-#[cfg(test)]
-mod fixtures;
+#[cfg(any(test, feature = "fixtures"))]
+pub mod fixtures;
 mod output;
 mod player;
 mod source;

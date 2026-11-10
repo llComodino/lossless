@@ -10,6 +10,16 @@ anyhow = "1.0.104"
 lossless-proto.workspace = true
 symphonia = { version = "0.6.1", default-features = false, features = ["flac", "mp3"] }
 
+[dependencies.flacenc]
+version = "0.5.1"
+default-features = false
+optional = true
+
+[features]
+# Test fixtures (FLAC files with known samples) for other crates' tests.
+# Only enabled from dev-dependencies: never part of a release build.
+fixtures = ["dep:flacenc"]
+
 [dev-dependencies]
 flacenc = { version = "0.5.1", default-features = false }
 proptest = "1.12.0"

@@ -1,4 +1,4 @@
-//! Test-only FLAC fixtures with known samples.
+//! Test-only FLAC fixtures with known samples (feature `fixtures`).
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -40,6 +40,12 @@ impl Dir {
 
     pub fn path(&self, name: &str) -> PathBuf {
         self.0.join(name)
+    }
+}
+
+impl Default for Dir {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
