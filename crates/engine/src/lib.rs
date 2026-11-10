@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+mod fixtures;
 mod output;
 mod player;
 mod source;

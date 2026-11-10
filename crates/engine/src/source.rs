@@ -158,3 +158,95 @@ impl Source {
         Ok(required)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Source;
+    use crate::fixtures::{BLOCK, Dir, Fixture, flac, write_bytes};
+
+    fn decode_all(src: &mut Source) -> Vec<i32> {
+        let mut out = Vec::new();
+        while let Some(chunk) = src.next_chunk().unwrap() {
+            out.extend_from_slice(chunk);
+        }
+        out
+    }
+
+    fn check_exact(f: &Fixture) {
+        let mut src = Source::open(&f.path).unwrap();
+        assert_eq!(src.format.rate, f.rate);
+        assert_eq!(src.format.bits, f.bits);
+        assert_eq!(src.format.channels, f.channels);
+        assert_eq!(src.total_frames, Some(f.frames()));
+        assert!(decode_all(&mut src) == f.expected, "decoded samples differ");
+    }
+
+    #[test]
+    fn decodes_16_bit_exactly() {
+        let d = Dir::new();
+        check_exact(&flac(&d, "a.flac", 44_100, 16, 2, 3 * BLOCK));
+    }
+
+    #[test]
+    fn decodes_24_bit_exactly() {
+        let d = Dir::new();
+        // flacenc caps fixtures at 96 kHz; 24/192 is verified on hardware.
+        check_exact(&flac(&d, "a.flac", 48_000, 24, 2, 3 * BLOCK));
+        check_exact(&flac(&d, "b.flac", 96_000, 24, 2, 3 * BLOCK));
+    }
+
+    #[test]
+    fn decodes_mono_exactly() {
+        let d = Dir::new();
+        check_exact(&flac(&d, "a.flac", 48_000, 16, 1, 2 * BLOCK));
+    }
+
+    #[test]
+    fn seek_is_sample_accurate() {
+        let d = Dir::new();
+        let f = flac(&d, "a.flac", 44_100, 16, 2, 5 * BLOCK);
+        let ch = f.channels as usize;
+        let mut src = Source::open(&f.path).unwrap();
+        // Off block boundaries, at a boundary, at the start, at the last frame.
+        for frame in [12_345, 4_096, 0, 5 * BLOCK as u64 - 1, 7] {
+            assert_eq!(src.seek(frame).unwrap(), frame);
+            let rest = decode_all(&mut src);
+            assert!(
+                rest == f.expected[frame as usize * ch..],
+                "samples after seek to {frame} differ"
+            );
+        }
+    }
+
+    #[test]
+    fn seek_is_sample_accurate_at_24_bit() {
+        let d = Dir::new();
+        let f = flac(&d, "a.flac", 96_000, 24, 2, 3 * BLOCK);
+        let mut src = Source::open(&f.path).unwrap();
+        assert_eq!(src.seek(9_001).unwrap(), 9_001);
+        assert!(decode_all(&mut src) == f.expected[9_001 * 2..]);
+    }
+
+    #[test]
+    fn seek_past_end_is_an_error_not_a_panic() {
+        let d = Dir::new();
+        let f = flac(&d, "a.flac", 44_100, 16, 2, BLOCK);
+        let mut src = Source::open(&f.path).unwrap();
+        assert!(src.seek(1_000_000).is_err());
+    }
+
+    #[test]
+    fn bad_files_are_errors() {
+        let d = Dir::new();
+        assert!(Source::open(&d.path("missing.flac")).is_err());
+        assert!(Source::open(&write_bytes(&d, "empty.flac", b"")).is_err());
+        assert!(Source::open(&write_bytes(&d, "junk.flac", &[0x5a; 4096])).is_err());
+        let f = flac(&d, "a.flac", 44_100, 16, 2, 3 * BLOCK);
+        let bytes = std::fs::read(&f.path).unwrap();
+        let cut = write_bytes(&d, "cut.flac", &bytes[..bytes.len() / 2]);
+        // A truncated file opens and decodes what is there without panicking.
+        if let Ok(mut src) = Source::open(&cut) {
+            while let Ok(Some(_)) = src.next_chunk() {}
+        }
+    }
+}
