@@ -291,3 +291,34 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod props {
+    use proptest::prelude::*;
+
+    use super::{fit, parse, parse_time};
+
+    proptest! {
+        #[test]
+        fn fit_is_always_exactly_the_width(s in ".{0,80}", width in 0usize..100) {
+            prop_assert_eq!(fit(&s, width).chars().count(), width);
+        }
+
+        #[test]
+        fn parse_time_reads_clock_times(h in 0u64..100, m in 0u64..60, s in 0u64..60) {
+            let ms = ((h * 60 + m) * 60 + s) * 1000;
+            prop_assert_eq!(parse_time(&format!("{h}:{m:02}:{s:02}")).unwrap(), ms);
+            prop_assert_eq!(parse_time(&format!("{}", h * 3600 + m * 60 + s)).unwrap(), ms);
+        }
+
+        #[test]
+        fn parse_time_never_panics(s in ".{0,30}") {
+            let _ = parse_time(&s);
+        }
+
+        #[test]
+        fn parsing_arguments_never_panics(args in proptest::collection::vec(".{0,12}", 0..5)) {
+            let _ = parse(&args);
+        }
+    }
+}
