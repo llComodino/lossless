@@ -61,9 +61,22 @@ pub struct Source {
 impl Source {
     pub fn open(path: &Path) -> Result<Self> {
         let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-        let mss = MediaSourceStream::new(Box::new(file), Default::default());
+        let ext = path.extension().and_then(|e| e.to_str());
+        Self::from_media(Box::new(file), ext).with_context(|| path.display().to_string())
+    }
+
+    /// Decode a file held in memory; `ext` is a format hint ("flac", "mp3").
+    pub fn from_bytes(bytes: Vec<u8>, ext: Option<&str>) -> Result<Self> {
+        Self::from_media(Box::new(std::io::Cursor::new(bytes)), ext)
+    }
+
+    fn from_media(
+        media: Box<dyn symphonia::core::io::MediaSource>,
+        ext: Option<&str>,
+    ) -> Result<Self> {
+        let mss = MediaSourceStream::new(media, Default::default());
         let mut hint = Hint::new();
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        if let Some(ext) = ext {
             hint.with_extension(ext);
         }
         let reader = symphonia::default::get_probe()
@@ -73,10 +86,10 @@ impl Source {
                 FormatOptions::default(),
                 MetadataOptions::default(),
             )
-            .with_context(|| format!("probing {}", path.display()))?;
+            .context("probing format")?;
         let track = reader
             .default_track(TrackType::Audio)
-            .ok_or_else(|| anyhow!("no audio track in {}", path.display()))?;
+            .ok_or_else(|| anyhow!("no audio track"))?;
         let track_id = track.id;
         let time_base = track.time_base;
         let total_frames = track.num_frames;
@@ -243,6 +256,18 @@ mod tests {
         let mut src = Source::open(&f.path).unwrap();
         assert_eq!(src.seek(9_001).unwrap(), 9_001);
         assert!(decode_all(&mut src) == f.expected[9_001 * 2..]);
+    }
+
+    #[test]
+    fn decodes_from_memory_exactly() {
+        let d = Dir::new();
+        let f = flac(&d, "a.flac", 44_100, 16, 2, 2 * BLOCK);
+        let bytes = std::fs::read(&f.path).unwrap();
+        for ext in [Some("flac"), None] {
+            let mut src = Source::from_bytes(bytes.clone(), ext).unwrap();
+            assert!(decode_all(&mut src) == f.expected);
+        }
+        assert!(Source::from_bytes(Vec::new(), Some("flac")).is_err());
     }
 
     #[test]
