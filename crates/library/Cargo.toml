@@ -1,0 +1,8 @@
+[package]
+name = "lossless-library"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+lossless-proto.workspace = true
