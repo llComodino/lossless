@@ -1,0 +1,17 @@
+[package]
+name = "lossless-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "losslessd"
+path = "src/main.rs"
+
+[dependencies]
+lossless-proto.workspace = true
+lossless-engine.workspace = true
+lossless-library.workspace = true
+anyhow = "1.0.104"
+toml = "1.2.1"
+serde = { workspace = true, features = ["derive"] }
