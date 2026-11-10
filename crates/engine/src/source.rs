@@ -16,15 +16,17 @@ fn ratio(tb: TimeBase) -> (u32, u32) {
 }
 
 /// Frames at `rate` for timestamp `ts` in time base `numer/denom` seconds
-/// (no time base: the timestamp is already in frames).
+/// (no time base: the timestamp is already in frames). Saturates rather than
+/// wrapping; can't overflow in u128 (i64 * u32 * u32 < 2^128).
 fn ts_to_frames(ts: i64, time_base: Option<(u32, u32)>, rate: u32) -> u64 {
     let ts = ts.max(0) as u128;
-    match time_base {
+    let frames = match time_base {
         Some((numer, denom)) => {
-            (ts * u128::from(numer) * u128::from(rate) / u128::from(denom)) as u64
+            ts * u128::from(numer) * u128::from(rate) / u128::from(denom.max(1))
         }
-        None => ts as u64,
-    }
+        None => ts,
+    };
+    u64::try_from(frames).unwrap_or(u64::MAX)
 }
 
 /// Inverse of `ts_to_frames`, rounding up so the timestamp is never before
@@ -32,7 +34,11 @@ fn ts_to_frames(ts: i64, time_base: Option<(u32, u32)>, rate: u32) -> u64 {
 fn frames_to_ts(frame: u64, time_base: Option<(u32, u32)>, rate: u32) -> Option<i64> {
     let ts = match time_base {
         Some((numer, denom)) => {
-            (u128::from(frame) * u128::from(denom)).div_ceil(u128::from(numer) * u128::from(rate))
+            let per = u128::from(numer) * u128::from(rate);
+            if per == 0 {
+                return None;
+            }
+            (u128::from(frame) * u128::from(denom)).div_ceil(per)
         }
         None => u128::from(frame),
     };
@@ -82,7 +88,8 @@ impl Source {
             .clone();
         let rate = params
             .sample_rate
-            .ok_or_else(|| anyhow!("unknown sample rate"))?;
+            .filter(|&r| r > 0)
+            .ok_or_else(|| anyhow!("unknown or zero sample rate"))?;
         let channels = params
             .channels
             .as_ref()
@@ -258,6 +265,84 @@ mod tests {
         // A truncated file opens and decodes what is there without panicking.
         if let Ok(mut src) = Source::open(&cut) {
             while let Ok(Some(_)) = src.next_chunk() {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod props {
+    use proptest::prelude::*;
+
+    use super::{frames_to_ts, ts_to_frames};
+
+    /// Random values with the boundaries mixed in: plain random sampling
+    /// almost never produces 0 or MAX.
+    fn edgy_u32() -> impl Strategy<Value = u32> {
+        prop_oneof![
+            Just(0),
+            Just(1),
+            Just(u32::MAX),
+            Just(u32::MAX - 1),
+            any::<u32>()
+        ]
+    }
+
+    fn edgy_i64() -> impl Strategy<Value = i64> {
+        prop_oneof![
+            Just(0),
+            Just(-1),
+            Just(i64::MAX),
+            Just(i64::MIN),
+            any::<i64>()
+        ]
+    }
+
+    proptest! {
+        /// More timestamp never means fewer frames (a wrapping cast would).
+        #[test]
+        fn ts_to_frames_is_monotonic(
+            a in edgy_i64(),
+            b in edgy_i64(),
+            numer in edgy_u32().prop_filter("nonzero", |n| *n > 0),
+            denom in edgy_u32().prop_filter("nonzero", |n| *n > 0),
+            rate in edgy_u32(),
+        ) {
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            let tb = Some((numer, denom));
+            prop_assert!(ts_to_frames(lo, tb, rate) <= ts_to_frames(hi, tb, rate));
+        }
+
+        /// FLAC/MP3 time base (1/rate): timestamps are frames, both ways.
+        #[test]
+        fn native_time_base_is_identity(frame in 0u64..=i64::MAX as u64, rate in 1u32..=768_000) {
+            let tb = Some((1, rate));
+            prop_assert_eq!(frames_to_ts(frame, tb, rate), Some(frame as i64));
+            prop_assert_eq!(ts_to_frames(frame as i64, tb, rate), frame);
+        }
+
+        /// A seek target converted to a timestamp and back never lands
+        /// before the requested frame, for any time base and rate.
+        #[test]
+        fn seek_timestamp_never_lands_early(
+            frame in any::<u64>(),
+            numer in edgy_u32().prop_filter("nonzero", |n| *n > 0),
+            denom in edgy_u32().prop_filter("nonzero", |n| *n > 0),
+            rate in edgy_u32(),
+        ) {
+            if let Some(ts) = frames_to_ts(frame, Some((numer, denom)), rate) {
+                prop_assert!(ts_to_frames(ts, Some((numer, denom)), rate) >= frame);
+            }
+        }
+
+        #[test]
+        fn conversions_never_panic(
+            ts in edgy_i64(),
+            frame in prop_oneof![Just(0), Just(u64::MAX), any::<u64>()],
+            tb in proptest::option::of((1u32.., 1u32..)),
+            rate in edgy_u32(),
+        ) {
+            let _ = ts_to_frames(ts, tb, rate);
+            let _ = frames_to_ts(frame, tb, rate);
         }
     }
 }
