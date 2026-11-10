@@ -53,6 +53,7 @@ impl Player {
                 position_ms: 0,
                 duration_ms: None,
                 output: None,
+                track: None,
             },
             queue: Vec::new(),
         }));
@@ -195,6 +196,7 @@ impl Worker {
             position_ms: self.position_ms(),
             duration_ms,
             output: self.output.format(),
+            track: None,
         };
         snap.queue.clone_from(&self.queue);
     }

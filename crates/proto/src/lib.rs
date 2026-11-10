@@ -36,6 +36,12 @@ pub enum Command {
     },
     Clear,
     Subscribe,
+    /// Tracks whose artist, album, title or path contain every word.
+    Search {
+        query: String,
+    },
+    /// Rescan the music directory.
+    Update,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -65,6 +71,7 @@ pub enum Body {
     Done,
     Status(Status),
     Queue(Vec<Track>),
+    Tracks(Vec<Track>),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -74,6 +81,7 @@ pub enum Event {
     TrackChanged { index: Option<usize> },
     QueueChanged,
     Position { ms: u64 },
+    LibraryChanged { tracks: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +100,9 @@ pub struct Status {
     pub duration_ms: Option<u64>,
     /// What the output device was actually opened with.
     pub output: Option<StreamFormat>,
+    /// The current queue entry, with tags when the library knows it.
+    #[serde(default)]
+    pub track: Option<Track>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,6 +118,8 @@ pub struct Track {
     pub title: Option<String>,
     pub artist: Option<String>,
     pub album: Option<String>,
+    #[serde(default)]
+    pub track_number: Option<u32>,
     pub duration_ms: Option<u64>,
     pub format: Option<StreamFormat>,
 }

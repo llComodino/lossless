@@ -3,18 +3,18 @@
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 
 use anyhow::{Context, Result, bail};
 use lossless_engine::{Command as PlayerCmd, Player};
+use lossless_library::{Library, collect, read_track};
 use lossless_proto::{
     Body, Command, Event, Outcome, Request, ServerMessage, Track, decode, default_socket, encode,
 };
 use serde::Deserialize;
-
-const AUDIO_EXTENSIONS: &[&str] = &["flac", "mp3"];
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -82,40 +82,51 @@ fn send(writer: &Writer, msg: &ServerMessage) -> std::io::Result<()> {
     w.write_all(line.as_bytes())
 }
 
+type Subscribers = Arc<Mutex<Vec<Writer>>>;
+
+fn broadcast(subscribers: &Subscribers, event: Event) {
+    let msg = ServerMessage::Event { event };
+    let mut subs = subscribers.lock().unwrap_or_else(|e| e.into_inner());
+    subs.retain(|w| send(w, &msg).is_ok());
+}
+
 /// Forward player events to every subscribed client, dropping dead ones.
-fn fan_out(events: Receiver<Event>, subscribers: Arc<Mutex<Vec<Writer>>>) {
+fn fan_out(events: Receiver<Event>, subscribers: Subscribers) {
     for event in events {
-        let msg = ServerMessage::Event { event };
-        let mut subs = subscribers.lock().unwrap_or_else(|e| e.into_inner());
-        subs.retain(|w| send(w, &msg).is_ok());
+        broadcast(&subscribers, event);
     }
 }
 
-/// Expand files and directories (recursively, sorted) into playable tracks.
-fn collect(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    let meta = std::fs::metadata(path).with_context(|| format!("{}", path.display()))?;
-    if meta.is_dir() {
-        let mut entries: Vec<PathBuf> = std::fs::read_dir(path)?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .collect();
-        entries.sort();
-        for entry in entries {
-            collect(&entry, out)?;
-        }
-    } else if path
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| AUDIO_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
-    {
-        out.push(path.to_path_buf());
+/// Rescan `root` in the background unless a scan is already running.
+fn spawn_scan(
+    root: PathBuf,
+    library: Arc<RwLock<Library>>,
+    scanning: Arc<AtomicBool>,
+    subscribers: Subscribers,
+) {
+    if scanning.swap(true, Ordering::SeqCst) {
+        return;
     }
-    Ok(())
+    thread::spawn(move || {
+        match Library::scan(&root) {
+            Ok(lib) => {
+                let tracks = lib.len();
+                *library.write().unwrap_or_else(|e| e.into_inner()) = lib;
+                eprintln!("library: {tracks} tracks in {}", root.display());
+                broadcast(&subscribers, Event::LibraryChanged { tracks });
+            }
+            Err(e) => eprintln!("library: scan failed: {e:#}"),
+        }
+        scanning.store(false, Ordering::SeqCst);
+    });
 }
 
 struct State {
     player: Player,
     music_dir: Option<PathBuf>,
-    subscribers: Arc<Mutex<Vec<Writer>>>,
+    subscribers: Subscribers,
+    library: Arc<RwLock<Library>>,
+    scanning: Arc<AtomicBool>,
 }
 
 impl State {
@@ -127,25 +138,59 @@ impl State {
         }
     }
 
+    /// Library entry for `path`, or its tags read now if it isn't indexed.
+    fn track(&self, path: &Path) -> Track {
+        let lib = self.library.read().unwrap_or_else(|e| e.into_inner());
+        match lib.get(&path.display().to_string()) {
+            Some(t) => t.clone(),
+            None => read_track(path),
+        }
+    }
+
+    fn rescan(&self) -> Result<(), String> {
+        let root = self
+            .music_dir
+            .clone()
+            .ok_or_else(|| "no music_dir configured".to_string())?;
+        spawn_scan(
+            root,
+            Arc::clone(&self.library),
+            Arc::clone(&self.scanning),
+            Arc::clone(&self.subscribers),
+        );
+        Ok(())
+    }
+
     fn handle(&self, cmd: Command, writer: &Writer) -> Outcome {
         let ok = |b| Outcome::Ok(b);
         match cmd {
-            Command::Status => ok(Body::Status(self.player.snapshot().status)),
+            Command::Status => {
+                let snap = self.player.snapshot();
+                let mut status = snap.status;
+                status.track = status
+                    .index
+                    .and_then(|i| snap.queue.get(i))
+                    .map(|p| self.track(p));
+                ok(Body::Status(status))
+            }
             Command::Queue => ok(Body::Queue(
                 self.player
                     .snapshot()
                     .queue
                     .iter()
-                    .map(|p| Track {
-                        path: p.display().to_string(),
-                        title: None,
-                        artist: None,
-                        album: None,
-                        duration_ms: None,
-                        format: None,
-                    })
+                    .map(|p| self.track(p))
                     .collect(),
             )),
+            Command::Search { query } => {
+                let lib = self.library.read().unwrap_or_else(|e| e.into_inner());
+                ok(Body::Tracks(
+                    lib.search(&query).into_iter().cloned().collect(),
+                ))
+            }
+            Command::Update => match self.rescan() {
+                Ok(()) => ok(Body::Done),
+                Err(e) => Outcome::Err(e),
+            },
             Command::Add { paths } => {
                 let mut tracks = Vec::new();
                 for p in &paths {
@@ -176,9 +221,12 @@ impl State {
                     Command::Previous => PlayerCmd::Previous,
                     Command::Seek { ms } => PlayerCmd::Seek { ms },
                     Command::Clear => PlayerCmd::Clear,
-                    Command::Status | Command::Queue | Command::Add { .. } | Command::Subscribe => {
-                        unreachable!("handled above")
-                    }
+                    Command::Status
+                    | Command::Queue
+                    | Command::Add { .. }
+                    | Command::Subscribe
+                    | Command::Search { .. }
+                    | Command::Update => unreachable!("handled above"),
                 });
                 ok(Body::Done)
             }
@@ -230,7 +278,12 @@ fn main() -> Result<()> {
         player,
         music_dir: cfg.music_dir,
         subscribers,
+        library: Arc::new(RwLock::new(Library::default())),
+        scanning: Arc::new(AtomicBool::new(false)),
     });
+    if state.music_dir.is_some() {
+        let _ = state.rescan();
+    }
 
     for stream in listener.incoming() {
         let stream = match stream {

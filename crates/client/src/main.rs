@@ -6,8 +6,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
 use lossless_proto::{
-    Body, Command, Event, Outcome, PlayState, Request, ServerMessage, Status, StreamFormat, decode,
-    default_socket, encode,
+    Body, Command, Event, Outcome, PlayState, Request, ServerMessage, Status, StreamFormat, Track,
+    decode, default_socket, encode,
 };
 
 /// `println!` that exits quietly when stdout is closed (e.g. piped to `head`)
@@ -34,6 +34,8 @@ const USAGE: &str = "usage: lossless [--json] [--socket PATH] <command>
   next | prev
   seek <[[h:]m:]s>       seek within the current track
   clear                  stop and empty the queue
+  search <words>...      find tracks (artist, album, title or path)
+  update                 rescan the music directory
   watch                  print events until interrupted";
 
 fn parse_time(s: &str) -> Result<u64> {
@@ -67,6 +69,10 @@ fn parse(args: &[String]) -> Result<Command> {
         "prev" | "previous" => none(Command::Previous),
         "clear" => none(Command::Clear),
         "watch" => none(Command::Subscribe),
+        "update" => none(Command::Update),
+        "search" if !rest.is_empty() => Ok(Command::Search {
+            query: rest.join(" "),
+        }),
         "add" if !rest.is_empty() => Ok(Command::Add {
             paths: rest.to_vec(),
         }),
@@ -123,6 +129,44 @@ fn print_status(s: &Status) {
         "{state}  #{index}  {}/{duration}  output {output}",
         clock(s.position_ms)
     );
+    if let Some(t) = &s.track {
+        out!("{}", describe(t));
+    }
+}
+
+/// "Artist - Title (Album)", falling back to the file name.
+fn describe(t: &Track) -> String {
+    let name = || {
+        std::path::Path::new(&t.path)
+            .file_name()
+            .map_or_else(|| t.path.clone(), |n| n.to_string_lossy().into_owned())
+    };
+    let mut s = match (&t.artist, &t.title) {
+        (Some(a), Some(ti)) => format!("{a} - {ti}"),
+        (None, Some(ti)) => ti.clone(),
+        _ => name(),
+    };
+    if let Some(album) = &t.album {
+        s.push_str(&format!(" ({album})"));
+    }
+    s
+}
+
+/// Pad or cut `s` to exactly `width` characters.
+fn fit(s: &str, width: usize) -> String {
+    let len = s.chars().count();
+    if len <= width {
+        format!("{s}{}", " ".repeat(width - len))
+    } else {
+        let cut: String = s.chars().take(width - 3).collect();
+        format!("{cut}...")
+    }
+}
+
+fn track_line(n: usize, t: &Track) -> String {
+    let duration = t.duration_ms.map_or_else(|| "?".into(), clock);
+    let format = t.format.as_ref().map_or_else(String::new, format_str);
+    format!("{n:>4}  {}  {duration:>6}  {format}", fit(&describe(t), 60))
 }
 
 fn print_event(e: &Event) {
@@ -134,6 +178,7 @@ fn print_event(e: &Event) {
         },
         Event::QueueChanged => out!("queue changed"),
         Event::Position { ms } => out!("position {}", clock(*ms)),
+        Event::LibraryChanged { tracks } => out!("library {tracks} tracks"),
     }
 }
 
@@ -173,9 +218,15 @@ fn main() -> Result<()> {
                         match body {
                             Body::Done => {}
                             Body::Status(s) => print_status(&s),
+                            Body::Tracks(tracks) => {
+                                for (i, t) in tracks.iter().enumerate() {
+                                    out!("{}", track_line(i + 1, t));
+                                    out!("      {}", t.path);
+                                }
+                            }
                             Body::Queue(tracks) => {
                                 for (i, t) in tracks.iter().enumerate() {
-                                    out!("{:>4}  {}", i + 1, t.path);
+                                    out!("{}", track_line(i + 1, t));
                                 }
                             }
                         }
@@ -206,6 +257,13 @@ mod tests {
         assert_eq!(parse_time("1:30").unwrap(), 90_000);
         assert_eq!(parse_time("1:00:05.5").unwrap(), 3_605_500);
         assert!(parse_time("x").is_err());
+    }
+
+    #[test]
+    fn fit_pads_and_cuts_by_chars() {
+        assert_eq!(fit("ab", 4), "ab  ");
+        assert_eq!(fit("Earl\u{2019}s Court 2004", 10), "Earl\u{2019}s ...");
+        assert_eq!(fit("Earl\u{2019}s Court 2004", 10).chars().count(), 10);
     }
 
     #[test]
