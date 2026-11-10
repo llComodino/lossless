@@ -1,0 +1,15 @@
+# Scoped test runs: extra arguments are appended, so a module path narrows
+# further, e.g. `cargo te player::`, `cargo te source::tests::seek`.
+[alias]
+t = "test --workspace"
+tproto = "test -p lossless-proto"
+te = "test -p lossless-engine"
+tlib = "test -p lossless-library"
+td = "test -p lossless-daemon"
+tc = "test -p lossless-client"
+# Real DAC, digital silence only: LOSSLESS_TEST_DEVICE=hw:CARD=PRO2,DEV=0 cargo thw
+thw = "test -p lossless-engine output::tests::hardware -- --ignored"
+cov = "llvm-cov --workspace --summary-only"
+covmiss = "llvm-cov --workspace --show-missing-lines"
+# What the release binaries link: must list no test-only crate.
+reldeps = "tree --workspace -e normal,build --prefix none --format {p}"
