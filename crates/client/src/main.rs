@@ -157,6 +157,8 @@ fn fit(s: &str, width: usize) -> String {
     let len = s.chars().count();
     if len <= width {
         format!("{s}{}", " ".repeat(width - len))
+    } else if width < 3 {
+        s.chars().take(width).collect()
     } else {
         let cut: String = s.chars().take(width - 3).collect();
         format!("{cut}...")
@@ -265,6 +267,8 @@ mod tests {
         assert_eq!(fit("ab", 4), "ab  ");
         assert_eq!(fit("Earl\u{2019}s Court 2004", 10), "Earl\u{2019}s ...");
         assert_eq!(fit("Earl\u{2019}s Court 2004", 10).chars().count(), 10);
+        assert_eq!(fit("abcdef", 2), "ab", "too narrow for an ellipsis");
+        assert_eq!(fit("abcdef", 0), "");
     }
 
     #[test]
