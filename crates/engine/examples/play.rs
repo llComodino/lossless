@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Context;
-use lossless_engine::{Output, Source};
+use lossless_engine::{Output, Sink, Source};
 
 /// Play the first `seconds` of each file through one Output.
 fn main() -> anyhow::Result<()> {

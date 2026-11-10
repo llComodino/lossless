@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use lossless_proto::{Event, PlayState, Status};
 
-use crate::output::Output;
+use crate::output::{Output, Sink};
 use crate::source::Source;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -50,38 +50,17 @@ pub struct Player {
 }
 
 impl Player {
-    /// Start the playback thread on `device`. Events arrive on the returned
-    /// receiver.
+    /// Start the playback thread on ALSA `device`. Events arrive on the
+    /// returned receiver.
     pub fn spawn(device: impl Into<String>) -> (Self, Receiver<Event>) {
+        Self::spawn_with(Output::new(device))
+    }
+
+    /// Start the playback thread on any sink.
+    pub fn spawn_with<S: Sink + Send + 'static>(sink: S) -> (Self, Receiver<Event>) {
         let (tx, rx) = mpsc::channel();
-        let (events_tx, events_rx) = mpsc::channel();
-        let shared = Arc::new(Mutex::new(Shared {
-            status: Status {
-                state: PlayState::Stopped,
-                index: None,
-                position_ms: 0,
-                duration_ms: None,
-                output: None,
-                track: None,
-            },
-            queue: Arc::from(Vec::new()),
-            anchor: None,
-        }));
-        let worker = Worker {
-            output: Output::new(device),
-            queue: Vec::new(),
-            index: None,
-            state: PlayState::Stopped,
-            source: None,
-            written: 0,
-            anchor_ms: 0,
-            anchor_at: Instant::now(),
-            rx,
-            events: events_tx,
-            shared: Arc::clone(&shared),
-            dirty: false,
-            queue_dirty: false,
-        };
+        let (worker, events_rx) = Worker::new(sink, rx);
+        let shared = Arc::clone(&worker.shared);
         let thread = thread::Builder::new()
             .name("player".into())
             .spawn(move || worker.run())
@@ -101,18 +80,40 @@ impl Player {
     }
 
     pub fn snapshot(&self) -> Snapshot {
-        let shared = lock(&self.shared);
-        let mut status = shared.status.clone();
-        if let Some(at) = shared.anchor {
-            let elapsed = Instant::now().saturating_duration_since(at).as_millis() as u64;
-            status.position_ms += elapsed;
+        lock(&self.shared).at(Instant::now())
+    }
+}
+
+impl Shared {
+    fn new() -> Self {
+        Self {
+            status: Status {
+                state: PlayState::Stopped,
+                index: None,
+                position_ms: 0,
+                duration_ms: None,
+                output: None,
+                track: None,
+            },
+            queue: Arc::from(Vec::new()),
+            anchor: None,
+        }
+    }
+
+    /// The snapshot as seen at `now`: while playing, the position advances
+    /// from the anchor (never before it, never past the duration).
+    fn at(&self, now: Instant) -> Snapshot {
+        let mut status = self.status.clone();
+        if let Some(at) = self.anchor {
+            let elapsed = now.saturating_duration_since(at).as_millis() as u64;
+            status.position_ms = status.position_ms.saturating_add(elapsed);
             if let Some(d) = status.duration_ms {
                 status.position_ms = status.position_ms.min(d);
             }
         }
         Snapshot {
             status,
-            queue: Arc::clone(&shared.queue),
+            queue: Arc::clone(&self.queue),
         }
     }
 }
@@ -130,8 +131,8 @@ fn lock(m: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-struct Worker {
-    output: Output,
+struct Worker<S: Sink> {
+    output: S,
     queue: Vec<PathBuf>,
     index: Option<usize>,
     state: PlayState,
@@ -149,7 +150,27 @@ struct Worker {
     queue_dirty: bool,
 }
 
-impl Worker {
+impl<S: Sink> Worker<S> {
+    fn new(output: S, rx: Receiver<Command>) -> (Self, Receiver<Event>) {
+        let (events, events_rx) = mpsc::channel();
+        let worker = Self {
+            output,
+            queue: Vec::new(),
+            index: None,
+            state: PlayState::Stopped,
+            source: None,
+            written: 0,
+            anchor_ms: 0,
+            anchor_at: Instant::now(),
+            rx,
+            events,
+            shared: Arc::new(Mutex::new(Shared::new())),
+            dirty: false,
+            queue_dirty: false,
+        };
+        (worker, events_rx)
+    }
+
     fn run(mut self) {
         loop {
             // Idle: block until a command arrives. Playing: take whatever is
@@ -171,12 +192,18 @@ impl Worker {
                 }
                 self.handle(cmd);
             }
-            if self.state == PlayState::Playing {
-                self.pump();
-            }
-            if self.dirty {
-                self.publish();
-            }
+            self.step();
+        }
+    }
+
+    /// One unit of playback work after a command: decode and write a chunk
+    /// while playing, and publish if anything changed.
+    fn step(&mut self) {
+        if self.state == PlayState::Playing {
+            self.pump();
+        }
+        if self.dirty {
+            self.publish();
         }
     }
 

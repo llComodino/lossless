@@ -143,6 +143,24 @@ impl OpenStream {
     }
 }
 
+/// Where decoded audio goes. `Output` is the ALSA implementation; tests use
+/// a fake. The player is generic over it, so there is no dynamic dispatch.
+pub trait Sink {
+    /// Make sure the sink is open for `src`; returns the format it runs at.
+    fn ensure(&mut self, src: StreamFormat) -> Result<StreamFormat>;
+    fn format(&self) -> Option<StreamFormat>;
+    /// Write interleaved full-scale samples, blocking until all are taken.
+    fn write(&mut self, samples: &[i32]) -> Result<()>;
+    /// Frames written but not yet heard.
+    fn delay(&self) -> u64;
+    /// Throw away buffered audio but stay open.
+    fn discard(&mut self) -> Result<()>;
+    /// Let buffered audio play out, then release the device.
+    fn close(&mut self);
+    /// Release the device immediately, discarding buffered audio.
+    fn stop(&mut self);
+}
+
 /// A bit-perfect output on one ALSA device. The stream stays open while the
 /// source format allows it (gapless, and no clock switch); it is reopened,
 /// after `SETTLE`, only when the next source needs another format.
@@ -162,9 +180,11 @@ impl Output {
             scratch: Vec::new(),
         }
     }
+}
 
+impl Sink for Output {
     /// Make sure the device is open for `src`; returns the format it runs at.
-    pub fn ensure(&mut self, src: StreamFormat) -> Result<StreamFormat> {
+    fn ensure(&mut self, src: StreamFormat) -> Result<StreamFormat> {
         if let Some(s) = &self.stream
             && s.fits(src)
         {
@@ -190,13 +210,13 @@ impl Output {
         Ok(format)
     }
 
-    pub fn format(&self) -> Option<StreamFormat> {
+    fn format(&self) -> Option<StreamFormat> {
         self.stream.as_ref().map(|s| s.format)
     }
 
     /// Write interleaved full-scale samples, blocking until the device takes
     /// them all.
-    pub fn write(&mut self, samples: &[i32]) -> Result<()> {
+    fn write(&mut self, samples: &[i32]) -> Result<()> {
         let s = self
             .stream
             .as_ref()
@@ -215,7 +235,7 @@ impl Output {
     }
 
     /// Frames written but not yet heard.
-    pub fn delay(&self) -> u64 {
+    fn delay(&self) -> u64 {
         self.stream
             .as_ref()
             .and_then(|s| s.pcm.delay().ok())
@@ -224,7 +244,7 @@ impl Output {
 
     /// Throw away buffered audio but keep the device open (pause, seek,
     /// skip): no clock switch, so no settle delay.
-    pub fn discard(&mut self) -> Result<()> {
+    fn discard(&mut self) -> Result<()> {
         if let Some(s) = &self.stream {
             s.pcm.drop()?;
             if s.pcm.state() != State::Prepared {
@@ -235,7 +255,7 @@ impl Output {
     }
 
     /// Let buffered audio play out, then release the device.
-    pub fn close(&mut self) {
+    fn close(&mut self) {
         if let Some(s) = self.stream.take() {
             let _ = s.pcm.drain();
             self.closed_at = Some(Instant::now());
@@ -243,7 +263,7 @@ impl Output {
     }
 
     /// Release the device immediately, discarding buffered audio.
-    pub fn stop(&mut self) {
+    fn stop(&mut self) {
         if let Some(s) = self.stream.take() {
             let _ = s.pcm.drop();
             self.closed_at = Some(Instant::now());
