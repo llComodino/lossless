@@ -100,7 +100,18 @@ fn fan_out(events: Receiver<Event>, subscribers: Subscribers) {
     }
 }
 
-/// Rescan `root` in the background unless a scan is already running.
+/// Clears a flag when dropped, including while unwinding from a panic.
+struct ClearOnDrop(Arc<AtomicBool>);
+
+impl Drop for ClearOnDrop {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Rescan `root` in the background unless a scan is already running. If the
+/// scan panics (say, on a malformed tag), the flag is still cleared so later
+/// updates aren't silently ignored.
 fn spawn_scan(
     root: PathBuf,
     library: Arc<RwLock<Library>>,
@@ -111,6 +122,7 @@ fn spawn_scan(
         return;
     }
     thread::spawn(move || {
+        let _clear = ClearOnDrop(scanning);
         match Library::scan(&root) {
             Ok(lib) => {
                 let tracks = lib.len();
@@ -120,7 +132,6 @@ fn spawn_scan(
             }
             Err(e) => eprintln!("library: scan failed: {e:#}"),
         }
-        scanning.store(false, Ordering::SeqCst);
     });
 }
 
@@ -337,5 +348,26 @@ impl Daemon {
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::ClearOnDrop;
+
+    #[test]
+    fn scan_flag_is_cleared_when_the_scan_panics() {
+        let flag = Arc::new(AtomicBool::new(true));
+        let guard = ClearOnDrop(Arc::clone(&flag));
+        let crashed = std::thread::spawn(move || {
+            let _clear = guard;
+            panic!("malformed tag");
+        })
+        .join();
+        assert!(crashed.is_err());
+        assert!(!flag.load(Ordering::SeqCst));
     }
 }
