@@ -13,3 +13,6 @@ cov = "llvm-cov --workspace --summary-only"
 covmiss = "llvm-cov --workspace --show-missing-lines"
 # What the release binaries link: must list no test-only crate.
 reldeps = "tree --workspace -e normal,build --prefix none --format {p}"
+# Fuzzing (nightly, dev only; fuzz/ is its own workspace). Targets:
+# proto_request, config, decode, tags. One target, seeds included, 60 s:
+#   cargo fuzz run decode fuzz/corpus/decode fuzz/seeds/decode -- -max_total_time=60

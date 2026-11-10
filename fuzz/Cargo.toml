@@ -1,0 +1,47 @@
+[package]
+name = "lossless-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+lossless-proto = { path = "../crates/proto" }
+lossless-engine = { path = "../crates/engine" }
+lossless-library = { path = "../crates/library" }
+lossless-daemon = { path = "../crates/daemon" }
+
+# Its own workspace: libFuzzer never enters the main build.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "proto_request"
+path = "fuzz_targets/proto_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config"
+path = "fuzz_targets/config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tags"
+path = "fuzz_targets/tags.rs"
+test = false
+doc = false
+bench = false
