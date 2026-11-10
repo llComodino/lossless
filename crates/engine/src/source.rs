@@ -9,7 +9,7 @@ use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
-use symphonia::core::units::{Time, TimeBase, Timestamp};
+use symphonia::core::units::{TimeBase, Timestamp};
 
 /// One decoded file: interleaved full-scale i32 chunks, seekable to the frame.
 pub struct Source {
@@ -120,19 +120,34 @@ impl Source {
         }
     }
 
+    /// Inverse of `ts_to_frames`, rounding up so the timestamp is never
+    /// before `frame`. Exact for FLAC/MP3, whose time base is 1/rate.
+    fn frames_to_ts(&self, frame: u64) -> Option<Timestamp> {
+        let ts = match self.time_base {
+            Some(tb) => {
+                let num = u128::from(frame) * u128::from(tb.denom.get());
+                let den = u128::from(tb.numer.get()) * u128::from(self.format.rate);
+                num.div_ceil(den)
+            }
+            None => u128::from(frame),
+        };
+        i64::try_from(ts).ok().map(Timestamp::from)
+    }
+
     /// Seek so the next chunk starts exactly at `frame`. Returns that frame.
+    /// Seeks by timestamp in the track's time base: integer-exact, unlike
+    /// going through seconds.
     pub fn seek(&mut self, frame: u64) -> Result<u64> {
-        let rate = u64::from(self.format.rate);
-        let nanos = (frame % rate) * 1_000_000_000 / rate;
-        let time = Time::try_new((frame / rate) as i64, nanos as u32)
+        let ts = self
+            .frames_to_ts(frame)
             .ok_or_else(|| anyhow!("seek target out of range"))?;
         let seeked = self
             .reader
             .seek(
                 SeekMode::Accurate,
-                SeekTo::Time {
-                    time,
-                    track_id: Some(self.track_id),
+                SeekTo::Timestamp {
+                    ts,
+                    track_id: self.track_id,
                 },
             )
             .context("seeking")?;
