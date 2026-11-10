@@ -209,3 +209,66 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 }
+
+#[cfg(test)]
+mod props {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    fn library(entries: &[(String, String, String)]) -> Library {
+        let mut lib = Library::default();
+        for (i, (artist, album, title)) in entries.iter().enumerate() {
+            lib.insert(Track {
+                path: format!("/m/{i}.flac"),
+                title: Some(title.clone()),
+                artist: Some(artist.clone()),
+                album: Some(album.clone()),
+                track_number: None,
+                duration_ms: None,
+                format: None,
+            });
+        }
+        lib
+    }
+
+    fn entries() -> impl Strategy<Value = Vec<(String, String, String)>> {
+        proptest::collection::vec((".{0,12}", ".{0,12}", ".{0,12}"), 0..20)
+    }
+
+    proptest! {
+        /// Every hit contains every query word, and nothing outside the
+        /// library comes back.
+        #[test]
+        fn hits_contain_every_word(es in entries(), query in ".{0,20}") {
+            let lib = library(&es);
+            let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+            let hits = lib.search(&query);
+            prop_assert!(hits.len() <= lib.len());
+            for hit in hits {
+                let i = lib.by_path[&hit.path];
+                for w in &words {
+                    prop_assert!(lib.haystack[i].contains(w.as_str()));
+                }
+            }
+        }
+
+        /// Search finds every track whose fields contain the query.
+        #[test]
+        fn search_finds_what_is_there(es in entries(), pick in any::<prop::sample::Index>()) {
+            prop_assume!(!es.is_empty());
+            let lib = library(&es);
+            let (_, _, title) = &es[pick.index(es.len())];
+            prop_assume!(!title.trim().is_empty());
+            let path = format!("/m/{}.flac", pick.index(es.len()));
+            prop_assert!(lib.search(title).iter().any(|t| t.path == path));
+        }
+
+        #[test]
+        fn ascii_search_ignores_case(es in entries(), query in "[a-zA-Z ]{0,10}") {
+            let lib = library(&es);
+            let paths = |q: &str| lib.search(q).iter().map(|t| t.path.clone()).collect::<Vec<_>>();
+            prop_assert_eq!(paths(&query.to_uppercase()), paths(&query.to_lowercase()));
+        }
+    }
+}

@@ -8,3 +8,6 @@ rust-version.workspace = true
 anyhow = "1.0.104"
 lofty = "0.24.0"
 lossless-proto.workspace = true
+
+[dev-dependencies]
+proptest = "1.12.0"
