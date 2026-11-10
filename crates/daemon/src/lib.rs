@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -237,26 +237,52 @@ impl State {
     }
 }
 
+/// Longest accepted request line. Real requests are tiny; the cap stops a
+/// client from making the daemon buffer an endless line.
+pub const MAX_REQUEST: usize = 64 * 1024;
+
+fn bad(msg: String) -> ServerMessage {
+    ServerMessage::Reply {
+        id: 0,
+        result: Outcome::Err(msg),
+    }
+}
+
 fn serve(state: &State, stream: UnixStream) -> Result<()> {
     let writer: Writer = Arc::new(Mutex::new(stream.try_clone()?));
-    for line in BufReader::new(stream).lines() {
-        let line = line?;
+    let mut reader = BufReader::new(stream);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        let n = (&mut reader)
+            .take(MAX_REQUEST as u64 + 1)
+            .read_until(b'\n', &mut buf)?;
+        if n == 0 {
+            return Ok(());
+        }
+        if n > MAX_REQUEST {
+            send(
+                &writer,
+                &bad(format!("request longer than {MAX_REQUEST} bytes")),
+            )?;
+            return Ok(());
+        }
+        let Ok(line) = std::str::from_utf8(&buf) else {
+            send(&writer, &bad("request is not UTF-8".into()))?;
+            continue;
+        };
         if line.trim().is_empty() {
             continue;
         }
-        let reply = match decode::<Request>(&line) {
+        let reply = match decode::<Request>(line) {
             Ok(req) => ServerMessage::Reply {
                 id: req.id,
                 result: state.handle(req.command, &writer),
             },
-            Err(e) => ServerMessage::Reply {
-                id: 0,
-                result: Outcome::Err(format!("bad request: {e}")),
-            },
+            Err(e) => bad(format!("bad request: {e}")),
         };
         send(&writer, &reply)?;
     }
-    Ok(())
 }
 
 /// A running daemon: player, library and subscribers, ready to serve.
