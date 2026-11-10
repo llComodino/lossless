@@ -77,11 +77,19 @@ pub enum Body {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
-    State { state: PlayState },
-    TrackChanged { index: Option<usize> },
+    /// Sent on every state change and seek. While playing, clients advance
+    /// `position_ms` with their own clock: the server sends no ticks.
+    State {
+        state: PlayState,
+        position_ms: u64,
+    },
+    TrackChanged {
+        index: Option<usize>,
+    },
     QueueChanged,
-    Position { ms: u64 },
-    LibraryChanged { tracks: usize },
+    LibraryChanged {
+        tracks: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,11 +205,12 @@ mod tests {
         let ev = ServerMessage::Event {
             event: Event::State {
                 state: PlayState::Playing,
+                position_ms: 1500,
             },
         };
         assert_eq!(
             encode(&ev).unwrap(),
-            "{\"type\":\"event\",\"event\":\"state\",\"state\":\"playing\"}\n"
+            "{\"type\":\"event\",\"event\":\"state\",\"state\":\"playing\",\"position_ms\":1500}\n"
         );
         assert_eq!(decode::<ServerMessage>(&encode(&ev).unwrap()).unwrap(), ev);
     }

@@ -171,13 +171,14 @@ fn track_line(n: usize, t: &Track) -> String {
 
 fn print_event(e: &Event) {
     match e {
-        Event::State { state } => out!("state {state:?}"),
+        Event::State { state, position_ms } => {
+            out!("state {state:?} at {}", clock(*position_ms))
+        }
         Event::TrackChanged { index } => match index {
             Some(i) => out!("track #{}", i + 1),
             None => out!("track none"),
         },
         Event::QueueChanged => out!("queue changed"),
-        Event::Position { ms } => out!("position {}", clock(*ms)),
         Event::LibraryChanged { tracks } => out!("library {tracks} tracks"),
     }
 }
