@@ -1,1 +1,3 @@
 /target
+# The global ignore has `test*/`; Rust integration tests live in tests/.
+!tests/
