@@ -2,3 +2,6 @@ target/
 corpus/
 artifacts/
 coverage/
+# The global ignore has `config` and `tags`; these are seed folders.
+!seeds/config/
+!seeds/tags/
