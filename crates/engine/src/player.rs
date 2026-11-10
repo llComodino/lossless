@@ -145,6 +145,9 @@ struct Worker<S: Sink> {
     anchor_at: Instant,
     rx: Receiver<Command>,
     events: Sender<Event>,
+    /// Events of the current step, sent only after the snapshot is
+    /// published, so a client reacting to one never reads stale status.
+    pending: Vec<Event>,
     shared: Arc<Mutex<Shared>>,
     dirty: bool,
     queue_dirty: bool,
@@ -164,6 +167,7 @@ impl<S: Sink> Worker<S> {
             anchor_at: Instant::now(),
             rx,
             events,
+            pending: Vec::new(),
             shared: Arc::new(Mutex::new(Shared::new())),
             dirty: false,
             queue_dirty: false,
@@ -209,7 +213,7 @@ impl<S: Sink> Worker<S> {
 
     fn emit(&mut self, event: Event) {
         self.dirty = true;
-        let _ = self.events.send(event);
+        self.pending.push(event);
     }
 
     fn rate(&self) -> u64 {
@@ -262,6 +266,10 @@ impl<S: Sink> Worker<S> {
         if self.queue_dirty {
             self.queue_dirty = false;
             shared.queue = Arc::from(self.queue.as_slice());
+        }
+        drop(shared);
+        for event in self.pending.drain(..) {
+            let _ = self.events.send(event);
         }
     }
 
@@ -642,8 +650,11 @@ mod tests {
         let a = flac(&d, "a.flac", 44_100, 16, 2, BLOCK);
         let (mut w, events) = worker(FakeSink::default());
         w.handle(Command::Add(vec![a.path.clone()]));
+        w.publish();
         let _ = states(&events);
         w.handle(Command::Play(None));
+        assert!(states(&events).is_empty(), "nothing sent before publishing");
+        w.publish();
         assert_eq!(states(&events), [(PlayState::Playing, 0)]);
     }
 
@@ -662,6 +673,7 @@ mod tests {
         }
         let heard_frames = w.written - 1_000;
         w.handle(Command::Pause);
+        w.publish();
         assert_eq!(w.state, PlayState::Paused);
         assert_eq!(w.written, heard_frames, "decoder rewound to what was heard");
         assert_eq!(w.anchor_ms, heard_frames * 1000 / 44_100);
@@ -911,8 +923,10 @@ mod tests {
                 _ => assert!(Instant::now() < deadline, "playback never ended"),
             }
         }
+        // The event was sent after publishing: status already agrees.
         let snap = player.snapshot();
         assert_eq!(snap.status.state, PlayState::Stopped);
+        assert_eq!(snap.status.index, None);
         assert_eq!(snap.queue.len(), 1);
         drop(player);
     }
