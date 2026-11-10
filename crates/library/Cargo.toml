@@ -10,4 +10,5 @@ lofty = "0.24.0"
 lossless-proto.workspace = true
 
 [dev-dependencies]
+lossless-engine = { workspace = true, features = ["fixtures"] }
 proptest = "1.12.0"

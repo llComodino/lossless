@@ -44,8 +44,21 @@ pub fn collect(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 /// Tags and audio properties of one file. Unreadable tags leave the fields
 /// empty rather than failing: the file may still play.
 pub fn read_track(path: &Path) -> Track {
+    describe(path.display().to_string(), lofty::read_from_path(path).ok())
+}
+
+/// Like `read_track`, for a file already in memory; `path` is only recorded.
+pub fn read_track_from(path: &str, bytes: &[u8]) -> Track {
+    let file = lofty::probe::Probe::new(std::io::Cursor::new(bytes))
+        .guess_file_type()
+        .ok()
+        .and_then(|p| p.read().ok());
+    describe(path.to_string(), file)
+}
+
+fn describe(path: String, file: Option<lofty::file::TaggedFile>) -> Track {
     let mut track = Track {
-        path: path.display().to_string(),
+        path,
         title: None,
         artist: None,
         album: None,
@@ -53,7 +66,7 @@ pub fn read_track(path: &Path) -> Track {
         duration_ms: None,
         format: None,
     };
-    let Ok(file) = lofty::read_from_path(path) else {
+    let Some(file) = file else {
         return track;
     };
     let props = file.properties();
@@ -182,6 +195,25 @@ mod tests {
         assert_eq!(
             lib.get("/m/queen/x.flac").unwrap().artist.as_deref(),
             Some("Queen")
+        );
+    }
+
+    #[test]
+    fn tags_from_disk_and_memory_agree() {
+        use lossless_engine::fixtures::{BLOCK, Dir, flac};
+        let d = Dir::new();
+        let f = flac(&d, "a.flac", 96_000, 24, 2, 2 * BLOCK);
+        let on_disk = read_track(&f.path);
+        let bytes = std::fs::read(&f.path).unwrap();
+        let in_memory = read_track_from(&f.path.display().to_string(), &bytes);
+        assert_eq!(on_disk, in_memory);
+        let fmt = on_disk.format.expect("format");
+        assert_eq!((fmt.rate, fmt.bits, fmt.channels), (96_000, 24, 2));
+        assert_eq!(on_disk.duration_ms, Some(2 * BLOCK as u64 * 1000 / 96_000));
+        let junk = read_track_from("junk", &[0x5a; 64]);
+        assert_eq!(
+            (junk.format, junk.duration_ms, junk.title),
+            (None, None, None)
         );
     }
 
