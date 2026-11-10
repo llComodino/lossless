@@ -431,3 +431,42 @@ mod tests {
         assert_eq!(back, src16);
     }
 }
+
+#[cfg(test)]
+mod props {
+    use proptest::prelude::*;
+
+    use super::Layout;
+
+    proptest! {
+        #[test]
+        fn s16_packing_is_exact(v in any::<i16>()) {
+            let mut out = Vec::new();
+            Layout::S16.pack(&[i32::from(v) << 16], &mut out);
+            prop_assert_eq!(out, v.to_le_bytes().to_vec());
+        }
+
+        #[test]
+        fn s24_packing_is_exact(v in -(1i32 << 23)..(1i32 << 23)) {
+            let mut out = Vec::new();
+            Layout::S24Packed.pack(&[v << 8], &mut out);
+            prop_assert_eq!(i32::from_le_bytes([0, out[0], out[1], out[2]]) >> 8, v);
+        }
+
+        #[test]
+        fn s32_packing_is_exact(v in any::<i32>()) {
+            let mut out = Vec::new();
+            Layout::S32.pack(&[v], &mut out);
+            prop_assert_eq!(out, v.to_le_bytes().to_vec());
+        }
+
+        #[test]
+        fn packed_length_matches_layout(samples in proptest::collection::vec(any::<i32>(), 0..512)) {
+            let mut out = Vec::new();
+            for l in [Layout::S16, Layout::S24Packed, Layout::S32] {
+                l.pack(&samples, &mut out);
+                prop_assert_eq!(out.len(), samples.len() * l.bytes());
+            }
+        }
+    }
+}

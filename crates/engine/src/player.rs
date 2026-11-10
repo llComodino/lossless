@@ -931,3 +931,41 @@ mod tests {
         drop(player);
     }
 }
+
+#[cfg(test)]
+mod props {
+    use std::time::{Duration, Instant};
+
+    use lossless_proto::PlayState;
+    use proptest::prelude::*;
+
+    use super::Shared;
+
+    proptest! {
+        /// The derived position never goes backwards and never passes the
+        /// duration, whatever the anchor and the clock say.
+        #[test]
+        fn position_is_monotonic_and_bounded(
+            base in any::<u64>(),
+            duration in proptest::option::of(any::<u64>()),
+            mut a in 0u64..1 << 40,
+            mut b in 0u64..1 << 40,
+        ) {
+            if a > b {
+                std::mem::swap(&mut a, &mut b);
+            }
+            let mut shared = Shared::new();
+            let t0 = Instant::now();
+            shared.status.state = PlayState::Playing;
+            shared.status.position_ms = base;
+            shared.status.duration_ms = duration;
+            shared.anchor = Some(t0);
+            let pa = shared.at(t0 + Duration::from_millis(a)).status.position_ms;
+            let pb = shared.at(t0 + Duration::from_millis(b)).status.position_ms;
+            prop_assert!(pa <= pb);
+            if let Some(d) = duration {
+                prop_assert!(pb <= d.max(base.min(d)));
+            }
+        }
+    }
+}
