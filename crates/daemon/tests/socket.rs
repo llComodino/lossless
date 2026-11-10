@@ -1,0 +1,394 @@
+//! The daemon over a real unix socket. The player runs on a real-time fake
+//! sink, so timing behaves like a DAC without needing one.
+
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
+use std::time::Duration;
+
+use lossless_daemon::{Daemon, MAX_REQUEST, bind, parse_config};
+use lossless_engine::Player;
+use lossless_engine::fixtures::{BLOCK, Dir, PacedSink, flac_at};
+use lossless_proto::{
+    Body, Command, Event, Outcome, PlayState, Request, ServerMessage, decode, encode,
+};
+
+const WAIT: Duration = Duration::from_secs(10);
+
+/// A daemon serving on `dir/sock`, with music in `dir/music`.
+struct Server {
+    dir: Dir,
+}
+
+impl Server {
+    fn start(with_music: bool) -> Self {
+        let dir = Dir::new();
+        let music = dir.path("music");
+        for d in ["album", ".incomplete", "empty"] {
+            std::fs::create_dir_all(music.join(d)).unwrap();
+        }
+        let listener = bind(&dir.path("sock")).unwrap();
+        let (player, events) = Player::spawn_with(PacedSink::default());
+        let daemon = Daemon::start(player, events, with_music.then_some(music)).unwrap();
+        thread::spawn(move || daemon.serve(listener));
+        Self { dir }
+    }
+
+    fn music(&self) -> PathBuf {
+        self.dir.path("music")
+    }
+
+    fn socket(&self) -> PathBuf {
+        self.dir.path("sock")
+    }
+
+    fn connect(&self) -> Client {
+        Client::connect(&self.socket())
+    }
+
+    /// Two 16/44.1 tracks of `blocks` blocks in `album/`, plus files `add`
+    /// must skip. 20 blocks play for about 1.9 s each.
+    fn album(&self, blocks: usize) -> Vec<PathBuf> {
+        let m = self.music();
+        std::fs::write(m.join("album/cover.jpg"), b"jpeg").unwrap();
+        std::fs::write(m.join(".incomplete/x.flac"), b"partial").unwrap();
+        ["01 one.flac", "02 two.flac"]
+            .iter()
+            .map(|n| flac_at(&m.join("album").join(n), 44_100, 16, 2, blocks * BLOCK).path)
+            .collect()
+    }
+}
+
+/// A protocol client that keeps events it reads while waiting for replies.
+struct Client {
+    writer: UnixStream,
+    lines: Receiver<String>,
+    next_id: u64,
+    events: Vec<Event>,
+}
+
+impl Client {
+    fn connect(socket: &Path) -> Self {
+        let writer = UnixStream::connect(socket).unwrap();
+        let reader = BufReader::new(writer.try_clone().unwrap());
+        let (tx, lines) = mpsc::channel();
+        thread::spawn(move || {
+            for line in reader.lines() {
+                let Ok(line) = line else { break };
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            writer,
+            lines,
+            next_id: 1,
+            events: Vec::new(),
+        }
+    }
+
+    fn raw(&mut self, bytes: &[u8]) {
+        self.writer.write_all(bytes).unwrap();
+    }
+
+    fn recv(&mut self) -> ServerMessage {
+        let line = self
+            .lines
+            .recv_timeout(WAIT)
+            .expect("no message from daemon");
+        decode(&line).unwrap()
+    }
+
+    /// Next reply, keeping any events that arrive first.
+    fn reply(&mut self) -> (u64, Outcome) {
+        loop {
+            match self.recv() {
+                ServerMessage::Reply { id, result } => return (id, result),
+                ServerMessage::Event { event } => self.events.push(event),
+            }
+        }
+    }
+
+    fn call(&mut self, command: Command) -> Outcome {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.raw(encode(&Request { id, command }).unwrap().as_bytes());
+        let (got, result) = self.reply();
+        assert_eq!(got, id, "reply for the wrong request");
+        result
+    }
+
+    fn ok(&mut self, command: Command) -> Body {
+        match self.call(command) {
+            Outcome::Ok(body) => body,
+            Outcome::Err(e) => panic!("unexpected error: {e}"),
+        }
+    }
+
+    fn err(&mut self, command: Command) -> String {
+        match self.call(command) {
+            Outcome::Err(e) => e,
+            Outcome::Ok(body) => panic!("unexpected success: {body:?}"),
+        }
+    }
+
+    /// Wait for an event matching `want`, keeping the ones before it.
+    fn wait_for(&mut self, want: impl Fn(&Event) -> bool) -> Event {
+        if let Some(i) = self.events.iter().position(&want) {
+            return self.events.remove(i);
+        }
+        loop {
+            if let ServerMessage::Event { event } = self.recv() {
+                if want(&event) {
+                    return event;
+                }
+                self.events.push(event);
+            }
+        }
+    }
+}
+
+fn status(c: &mut Client) -> lossless_proto::Status {
+    match c.ok(Command::Status) {
+        Body::Status(s) => s,
+        other => panic!("not a status: {other:?}"),
+    }
+}
+
+fn queue(c: &mut Client) -> Vec<String> {
+    match c.ok(Command::Queue) {
+        Body::Queue(tracks) => tracks.into_iter().map(|t| t.path).collect(),
+        other => panic!("not a queue: {other:?}"),
+    }
+}
+
+#[test]
+fn fresh_daemon_is_stopped_and_empty() {
+    let s = Server::start(true);
+    let mut c = s.connect();
+    let st = status(&mut c);
+    assert_eq!(st.state, PlayState::Stopped);
+    assert_eq!((st.index, st.output, st.track), (None, None, None));
+    assert!(queue(&mut c).is_empty());
+}
+
+#[test]
+fn add_resolves_folders_relative_to_music_dir() {
+    let s = Server::start(true);
+    let files = s.album(1);
+    let mut c = s.connect();
+    c.ok(Command::Add {
+        paths: vec!["album".into()],
+    });
+    let q = queue(&mut c);
+    let want: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
+    assert_eq!(q, want, "sorted, audio only, no hidden or cover files");
+    // Absolute paths work too.
+    c.ok(Command::Add {
+        paths: vec![files[0].display().to_string()],
+    });
+    assert_eq!(queue(&mut c).len(), 3);
+}
+
+#[test]
+fn add_reports_errors() {
+    let s = Server::start(true);
+    s.album(1);
+    let mut c = s.connect();
+    assert!(
+        c.err(Command::Add {
+            paths: vec!["nope".into()]
+        })
+        .contains("nope")
+    );
+    assert_eq!(
+        c.err(Command::Add {
+            paths: vec!["empty".into()]
+        }),
+        "no playable files"
+    );
+    assert_eq!(c.err(Command::Add { paths: vec![] }), "no playable files");
+    // A failing path rejects the whole request.
+    c.err(Command::Add {
+        paths: vec!["album".into(), "nope".into()],
+    });
+    assert!(queue(&mut c).is_empty());
+}
+
+#[test]
+fn update_scans_and_search_finds() {
+    let s = Server::start(true);
+    s.album(1);
+    let mut c = s.connect();
+    c.ok(Command::Subscribe);
+    c.ok(Command::Update);
+    let ev = c.wait_for(|e| matches!(e, Event::LibraryChanged { .. }));
+    assert_eq!(ev, Event::LibraryChanged { tracks: 2 });
+    let hits = match c.ok(Command::Search {
+        query: "TWO".into(),
+    }) {
+        Body::Tracks(t) => t,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(hits.len(), 1);
+    assert!(hits[0].path.ends_with("02 two.flac"));
+    let f = hits[0].format.expect("format read from the file");
+    assert_eq!((f.rate, f.bits, f.channels), (44_100, 16, 2));
+    assert!(hits[0].duration_ms.is_some());
+    match c.ok(Command::Search { query: "".into() }) {
+        Body::Tracks(t) => assert!(t.is_empty()),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn update_without_music_dir_is_an_error() {
+    let s = Server::start(false);
+    let mut c = s.connect();
+    assert_eq!(c.err(Command::Update), "no music_dir configured");
+}
+
+#[test]
+fn playback_events_reach_subscribers_in_order() {
+    let s = Server::start(true);
+    s.album(1);
+    let mut c = s.connect();
+    c.ok(Command::Subscribe);
+    c.ok(Command::Add {
+        paths: vec!["album".into()],
+    });
+    c.ok(Command::Play { index: None });
+    c.wait_for(|e| *e == Event::TrackChanged { index: None });
+    let order: Vec<Event> = c
+        .events
+        .iter()
+        .filter(|e| !matches!(e, Event::QueueChanged))
+        .cloned()
+        .collect();
+    assert_eq!(order.first(), Some(&Event::TrackChanged { index: Some(0) }));
+    assert!(order.contains(&Event::TrackChanged { index: Some(1) }));
+    assert!(order.contains(&Event::State {
+        state: PlayState::Playing,
+        position_ms: 0
+    }));
+    // Events go out after the status they describe is published.
+    let st = status(&mut c);
+    assert_eq!((st.state, st.index), (PlayState::Stopped, None));
+}
+
+#[test]
+fn status_names_the_current_track() {
+    let s = Server::start(true);
+    let files = s.album(20);
+    let mut c = s.connect();
+    c.ok(Command::Add {
+        paths: vec!["album".into()],
+    });
+    c.ok(Command::Next);
+    assert_eq!(status(&mut c).index, None, "next with nothing loaded");
+    c.ok(Command::Play { index: Some(1) });
+    let st = status(&mut c);
+    assert_eq!((st.state, st.index), (PlayState::Playing, Some(1)));
+    let t = st.track.expect("current track");
+    assert_eq!(t.path, files[1].display().to_string());
+    assert_eq!(t.format.map(|f| f.rate), Some(44_100));
+    c.ok(Command::Pause);
+    let paused = status(&mut c);
+    assert_eq!(paused.state, PlayState::Paused);
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        status(&mut c).position_ms,
+        paused.position_ms,
+        "position holds while paused"
+    );
+    c.ok(Command::Seek { ms: 1_000 });
+    assert_eq!(status(&mut c).position_ms, 1_000);
+    c.ok(Command::Stop);
+    let st = status(&mut c);
+    assert_eq!((st.state, st.output), (PlayState::Stopped, None));
+    c.ok(Command::Clear);
+    assert!(queue(&mut c).is_empty());
+}
+
+#[test]
+fn bad_requests_get_errors_and_the_connection_survives() {
+    let s = Server::start(true);
+    let mut c = s.connect();
+    for line in [
+        &b"not json\n"[..],
+        b"{\"id\":5,\"cmd\":\"fly\"}\n",
+        b"{\"cmd\":\"status\"}\n",
+        b"\xff\xfe\xfd\n",
+        b"[1,2,3]\n",
+    ] {
+        c.raw(line);
+        let (id, result) = c.reply();
+        assert_eq!(id, 0);
+        assert!(matches!(result, Outcome::Err(_)), "{line:?} accepted");
+    }
+    c.raw(b"\n   \n");
+    assert_eq!(status(&mut c).state, PlayState::Stopped);
+}
+
+#[test]
+fn oversized_request_closes_only_that_connection() {
+    let s = Server::start(true);
+    let mut big = UnixStream::connect(s.socket()).unwrap();
+    big.set_read_timeout(Some(WAIT)).unwrap();
+    let _ = big.write_all(&vec![b'x'; MAX_REQUEST + 10]);
+    let mut out = Vec::new();
+    // The daemon answers and hangs up; a reset is fine too.
+    let _ = big.read_to_end(&mut out);
+    let text = String::from_utf8_lossy(&out);
+    assert!(out.is_empty() || text.contains("longer than"), "{text}");
+    assert_eq!(status(&mut s.connect()).state, PlayState::Stopped);
+}
+
+#[test]
+fn a_dead_subscriber_does_not_stop_the_others() {
+    let s = Server::start(true);
+    s.album(1);
+    let mut gone = s.connect();
+    gone.ok(Command::Subscribe);
+    drop(gone);
+    let mut c = s.connect();
+    c.ok(Command::Subscribe);
+    c.ok(Command::Add {
+        paths: vec!["album".into()],
+    });
+    c.wait_for(|e| *e == Event::QueueChanged);
+    c.ok(Command::Add {
+        paths: vec!["album".into()],
+    });
+    c.wait_for(|e| *e == Event::QueueChanged);
+}
+
+#[test]
+fn bind_refuses_a_live_daemon_and_replaces_a_stale_socket() {
+    let s = Server::start(true);
+    assert!(bind(&s.socket()).is_err(), "took over a live daemon");
+    let stale = s.dir.path("stale.sock");
+    drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+    assert!(stale.exists());
+    assert!(bind(&stale).is_ok(), "stale socket not replaced");
+}
+
+#[test]
+fn config_parsing() {
+    let home = std::env::var("HOME").unwrap();
+    let cfg = parse_config("").unwrap();
+    assert_eq!(cfg.device, "default");
+    assert_eq!((cfg.music_dir, cfg.socket), (None, None));
+    let cfg = parse_config(
+        "device = \"hw:CARD=PRO2,DEV=0\"\nmusic_dir = \"~/m\"\nsocket = \"/run/x.sock\"",
+    )
+    .unwrap();
+    assert_eq!(cfg.device, "hw:CARD=PRO2,DEV=0");
+    assert_eq!(cfg.music_dir, Some(Path::new(&home).join("m")));
+    assert_eq!(cfg.socket, Some(PathBuf::from("/run/x.sock")));
+    assert!(parse_config("devise = \"x\"").is_err(), "typo accepted");
+    assert!(parse_config("device = ").is_err());
+}
