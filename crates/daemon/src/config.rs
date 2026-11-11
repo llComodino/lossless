@@ -1,4 +1,4 @@
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -37,13 +37,29 @@ pub fn config_path() -> PathBuf {
     base.join("lossless/config.toml")
 }
 
-/// Read the config at `path`; a missing file means all defaults.
+/// Largest accepted config file. Real configs are a few lines.
+pub const MAX_CONFIG: u64 = 64 * 1024;
+
+/// Read the config at `path`; a missing file means all defaults. Only a
+/// regular file (or a symlink to one) of at most `MAX_CONFIG` bytes is read:
+/// a FIFO or device would block or stream forever.
 pub fn load_config(path: &Path) -> Result<Config> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    let ctx = || format!("reading {}", path.display());
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == ErrorKind::NotFound => return parse_config(""),
+        Err(e) => return Err(e).with_context(ctx),
     };
+    if !meta.is_file() {
+        bail!("{} is not a regular file", path.display());
+    }
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .and_then(|f| f.take(MAX_CONFIG + 1).read_to_string(&mut text))
+        .with_context(ctx)?;
+    if text.len() as u64 > MAX_CONFIG {
+        bail!("{} is larger than {MAX_CONFIG} bytes", path.display());
+    }
     parse_config(&text).with_context(|| format!("parsing {}", path.display()))
 }
 
@@ -257,6 +273,74 @@ mod tests {
         ] {
             assert!(parse_config(bad).is_err(), "{bad}");
         }
+    }
+
+    struct Tmp(PathBuf);
+
+    impl Tmp {
+        fn new(name: &str) -> Self {
+            let p =
+                std::env::temp_dir().join(format!("lossless-cfg-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+    }
+
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn loading_reads_only_small_regular_files() {
+        let t = Tmp::new("load");
+        let p = t.0.join("config.toml");
+        assert_eq!(
+            load_config(&p).unwrap().device,
+            "default",
+            "missing means defaults"
+        );
+
+        std::fs::write(&p, "device = \"null\"\n").unwrap();
+        assert_eq!(load_config(&p).unwrap().device, "null");
+        let link = t.0.join("link.toml");
+        std::os::unix::fs::symlink(&p, &link).unwrap();
+        assert_eq!(load_config(&link).unwrap().device, "null");
+
+        let err = |p: &Path| format!("{:#}", load_config(p).unwrap_err());
+        assert!(err(&t.0).contains("not a regular file"));
+        assert!(err(Path::new("/dev/zero")).contains("not a regular file"));
+
+        let big = format!("# {}\n", "x".repeat(MAX_CONFIG as usize));
+        std::fs::write(&p, big).unwrap();
+        assert!(err(&p).contains("larger than"));
+        let exact = format!("#{}", "x".repeat(MAX_CONFIG as usize - 1));
+        std::fs::write(&p, exact).unwrap();
+        assert!(load_config(&p).is_ok(), "exactly the cap is fine");
+
+        std::fs::write(&p, b"device = \"\xff\"").unwrap();
+        assert!(err(&p).contains("reading"));
+        std::fs::write(&p, "device = \"file:'|id'\"").unwrap();
+        let e = err(&p);
+        assert!(e.contains("parsing") && e.contains("not allowed"), "{e}");
+
+        let blocked = t.0.join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::write(blocked.join("config.toml"), "").unwrap();
+        std::fs::set_permissions(
+            &blocked,
+            std::os::unix::fs::PermissionsExt::from_mode(0o000),
+        )
+        .unwrap();
+        let denied = load_config(&blocked.join("config.toml"));
+        std::fs::set_permissions(
+            &blocked,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        assert!(format!("{:#}", denied.unwrap_err()).contains("reading"));
     }
 
     #[test]
