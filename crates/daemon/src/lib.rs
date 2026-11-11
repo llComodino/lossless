@@ -23,7 +23,7 @@ use config::expand_tilde;
 pub use config::{
     Config, MAX_CONFIG, check_device, check_path, config_path, load_config, parse_config,
 };
-use error::RequestError;
+pub use error::RequestError;
 
 /// Bind the socket, owner-only. An existing path is replaced only if it is
 /// itself a stale socket: never a live daemon, a symlink or any other file.
@@ -152,8 +152,12 @@ impl State {
     }
 
     fn handle(&self, cmd: Command, writer: &Writer) -> Result<Body, RequestError> {
-        let ok = Ok;
-        let play = |c| Ok(self.player.send(c).map(|()| Body::Done)?);
+        let play = |c| {
+            self.player
+                .send(c)
+                .map(|()| Body::Done)
+                .map_err(RequestError::from)
+        };
         match cmd {
             Command::Status => {
                 let snap = self.player.snapshot();
@@ -162,9 +166,9 @@ impl State {
                     .index
                     .and_then(|i| snap.queue.get(i))
                     .map(|p| self.track(p));
-                ok(Body::Status(status))
+                Ok(Body::Status(status))
             }
-            Command::Queue => ok(Body::Queue(
+            Command::Queue => Ok(Body::Queue(
                 self.player
                     .snapshot()
                     .queue
@@ -174,7 +178,7 @@ impl State {
             )),
             Command::Search { query } => {
                 let lib = self.library.read().unwrap_or_else(PoisonError::into_inner);
-                ok(Body::Tracks(
+                Ok(Body::Tracks(
                     lib.search(&query).into_iter().cloned().collect(),
                 ))
             }
@@ -185,7 +189,7 @@ impl State {
                     collect(&self.resolve(p), &mut tracks)?;
                 }
                 if tracks.is_empty() {
-                    return Err(RequestError::NoPlayableFiles);
+                    return Err(RequestError::NoPlayableFiles(paths));
                 }
                 play(PlayerCmd::Add(tracks))
             }
@@ -194,7 +198,7 @@ impl State {
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .push(Arc::clone(writer));
-                ok(Body::Done)
+                Ok(Body::Done)
             }
             Command::Play { index } => play(PlayerCmd::Play(index)),
             Command::Pause => play(PlayerCmd::Pause),
@@ -315,8 +319,8 @@ impl Daemon {
     }
 
     /// Start a background scan of the music directory, if there is one.
-    pub fn rescan(&self) -> Result<(), String> {
-        self.state.rescan().map(drop).map_err(|e| e.to_string())
+    pub fn rescan(&self) -> Result<(), RequestError> {
+        self.state.rescan().map(drop)
     }
 
     /// Accept clients until the listener fails; one thread per client.
@@ -430,7 +434,10 @@ mod tests {
         assert!(line.contains("\"id\":3"), "{line}");
         assert!(line.contains("\"code\":\"scan_running\""), "{line}");
         assert!(line.contains("a scan is already running"), "{line}");
-        assert_eq!(daemon.rescan().unwrap_err(), "a scan is already running");
+        assert_eq!(
+            daemon.rescan().unwrap_err().to_string(),
+            "a scan is already running"
+        );
     }
 
     #[test]
@@ -446,7 +453,7 @@ mod tests {
         let mut tracks = Vec::new();
         collect(&fixture.path, &mut tracks).unwrap();
         daemon.state.player.send(PlayerCmd::Add(tracks)).unwrap();
-        let _ = daemon.state.player.send(PlayerCmd::Play(None));
+        daemon.state.player.send(PlayerCmd::Play(None)).unwrap();
         rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
     }
 

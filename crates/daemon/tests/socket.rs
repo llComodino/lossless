@@ -208,12 +208,10 @@ fn add_reports_errors() {
         .contains("nope")
     );
     let e = c.err(Command::Add {
-        paths: vec!["empty".into()],
+        paths: vec!["empty".into(), "empty".into()],
     });
-    assert_eq!(
-        (e.code, e.message.as_str()),
-        (ErrorCode::NotFound, "no playable files")
-    );
+    assert_eq!(e.code, ErrorCode::NotFound);
+    assert_eq!(e.message, "no playable files in empty, empty");
     let e = c.err(Command::Add { paths: vec![] });
     assert_eq!(
         (e.code, e.message.as_str()),
@@ -254,17 +252,6 @@ fn error_codes_name_the_problem() {
         assert_eq!(id, 0);
         assert!(matches!(result, Outcome::Err(e) if e.code == ErrorCode::BadRequest));
     }
-    let mut big = UnixStream::connect(s.socket()).unwrap();
-    big.set_read_timeout(Some(WAIT)).unwrap();
-    let _ = big.write_all(&vec![b'x'; MAX_REQUEST + 10]);
-    let mut out = Vec::new();
-    let _ = big.read_to_end(&mut out);
-    let text = String::from_utf8_lossy(&out);
-    assert!(
-        out.is_empty() || text.contains("\"code\":\"bad_request\""),
-        "{text}"
-    );
-
     let e = c.err(Command::Add {
         paths: vec!["nope".into()],
     });
@@ -404,12 +391,12 @@ fn oversized_request_closes_only_that_connection() {
     let s = Server::start(true);
     let mut big = UnixStream::connect(s.socket()).unwrap();
     big.set_read_timeout(Some(WAIT)).unwrap();
-    let _ = big.write_all(&vec![b'x'; MAX_REQUEST + 10]);
+    big.write_all(&vec![b'x'; MAX_REQUEST + 1]).unwrap();
     let mut out = Vec::new();
-    // The daemon answers and hangs up; a reset is fine too.
-    let _ = big.read_to_end(&mut out);
+    big.read_to_end(&mut out).unwrap();
     let text = String::from_utf8_lossy(&out);
-    assert!(out.is_empty() || text.contains("longer than"), "{text}");
+    assert!(text.contains("\"code\":\"bad_request\""), "{text}");
+    assert!(text.contains("longer than"), "{text}");
     assert_eq!(status(&mut s.connect()).state, PlayState::Stopped);
 }
 
