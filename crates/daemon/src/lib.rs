@@ -6,7 +6,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::thread;
 
 use anyhow::{Context, Result, bail};
@@ -49,7 +49,7 @@ type Writer = Arc<Mutex<UnixStream>>;
 
 fn send(writer: &Writer, msg: &ServerMessage) -> std::io::Result<()> {
     let line = encode(msg).map_err(std::io::Error::other)?;
-    let mut w = writer.lock().unwrap_or_else(|e| e.into_inner());
+    let mut w = writer.lock().unwrap_or_else(PoisonError::into_inner);
     w.write_all(line.as_bytes())
 }
 
@@ -57,7 +57,7 @@ type Subscribers = Arc<Mutex<Vec<Writer>>>;
 
 fn broadcast(subscribers: &Subscribers, event: Event) {
     let msg = ServerMessage::Event { event };
-    let mut subs = subscribers.lock().unwrap_or_else(|e| e.into_inner());
+    let mut subs = subscribers.lock().unwrap_or_else(PoisonError::into_inner);
     subs.retain(|w| send(w, &msg).is_ok());
 }
 
@@ -94,7 +94,7 @@ fn spawn_scan(
         match Library::scan(&root) {
             Ok(lib) => {
                 let tracks = lib.len();
-                *library.write().unwrap_or_else(|e| e.into_inner()) = lib;
+                *library.write().unwrap_or_else(PoisonError::into_inner) = lib;
                 eprintln!("library: {tracks} tracks in {}", root.display());
                 broadcast(&subscribers, Event::LibraryChanged { tracks });
             }
@@ -122,7 +122,7 @@ impl State {
 
     /// Library entry for `path`, or its tags read now if it isn't indexed.
     fn track(&self, path: &Path) -> Track {
-        let lib = self.library.read().unwrap_or_else(|e| e.into_inner());
+        let lib = self.library.read().unwrap_or_else(PoisonError::into_inner);
         match lib.get(&path.display().to_string()) {
             Some(t) => t.clone(),
             None => read_track(path),
@@ -145,6 +145,10 @@ impl State {
 
     fn handle(&self, cmd: Command, writer: &Writer) -> Outcome {
         let ok = |b| Outcome::Ok(b);
+        let play = |c| {
+            self.player.send(c);
+            Outcome::Ok(Body::Done)
+        };
         match cmd {
             Command::Status => {
                 let snap = self.player.snapshot();
@@ -164,7 +168,7 @@ impl State {
                     .collect(),
             )),
             Command::Search { query } => {
-                let lib = self.library.read().unwrap_or_else(|e| e.into_inner());
+                let lib = self.library.read().unwrap_or_else(PoisonError::into_inner);
                 ok(Body::Tracks(
                     lib.search(&query).into_iter().cloned().collect(),
                 ))
@@ -189,29 +193,18 @@ impl State {
             Command::Subscribe => {
                 self.subscribers
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap_or_else(PoisonError::into_inner)
                     .push(Arc::clone(writer));
                 ok(Body::Done)
             }
-            other => {
-                self.player.send(match other {
-                    Command::Play { index } => PlayerCmd::Play(index),
-                    Command::Pause => PlayerCmd::Pause,
-                    Command::Toggle => PlayerCmd::Toggle,
-                    Command::Stop => PlayerCmd::Stop,
-                    Command::Next => PlayerCmd::Next,
-                    Command::Previous => PlayerCmd::Previous,
-                    Command::Seek { ms } => PlayerCmd::Seek { ms },
-                    Command::Clear => PlayerCmd::Clear,
-                    Command::Status
-                    | Command::Queue
-                    | Command::Add { .. }
-                    | Command::Subscribe
-                    | Command::Search { .. }
-                    | Command::Update => unreachable!("handled above"),
-                });
-                ok(Body::Done)
-            }
+            Command::Play { index } => play(PlayerCmd::Play(index)),
+            Command::Pause => play(PlayerCmd::Pause),
+            Command::Toggle => play(PlayerCmd::Toggle),
+            Command::Stop => play(PlayerCmd::Stop),
+            Command::Next => play(PlayerCmd::Next),
+            Command::Previous => play(PlayerCmd::Previous),
+            Command::Seek { ms } => play(PlayerCmd::Seek { ms }),
+            Command::Clear => play(PlayerCmd::Clear),
         }
     }
 }
