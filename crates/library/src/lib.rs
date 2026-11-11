@@ -41,18 +41,40 @@ pub fn collect(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Parse with the parser the extension names, never by sniffing content:
+/// lofty's sniffer routes bytes that look like ADTS to its AAC parser, which
+/// can loop forever on crafted input, and only FLAC and MP3 are indexed.
+fn parse<R: std::io::Read + std::io::Seek>(
+    reader: &mut R,
+    path: &Path,
+) -> Option<lofty::file::TaggedFile> {
+    use lofty::config::ParseOptions;
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    let opts = ParseOptions::new();
+    match ext.as_str() {
+        "flac" => lofty::flac::FlacFile::read_from(reader, opts)
+            .ok()
+            .map(Into::into),
+        "mp3" => lofty::mpeg::MpegFile::read_from(reader, opts)
+            .ok()
+            .map(Into::into),
+        _ => None,
+    }
+}
+
 /// Tags and audio properties of one file. Unreadable tags leave the fields
 /// empty rather than failing: the file may still play.
 pub fn read_track(path: &Path) -> Track {
-    describe(path.display().to_string(), lofty::read_from_path(path).ok())
+    let file = std::fs::File::open(path)
+        .ok()
+        .and_then(|f| parse(&mut std::io::BufReader::new(f), path));
+    describe(path.display().to_string(), file)
 }
 
-/// Like `read_track`, for a file already in memory; `path` is only recorded.
+/// Like `read_track`, for a file already in memory. `path` is recorded and
+/// its extension picks the parser.
 pub fn read_track_from(path: &str, bytes: &[u8]) -> Track {
-    let file = lofty::probe::Probe::new(std::io::Cursor::new(bytes))
-        .guess_file_type()
-        .ok()
-        .and_then(|p| p.read().ok());
+    let file = parse(&mut std::io::Cursor::new(bytes), Path::new(path));
     describe(path.to_string(), file)
 }
 
@@ -215,6 +237,48 @@ mod tests {
             (junk.format, junk.duration_ms, junk.title),
             (None, None, None)
         );
+    }
+
+    /// Found by the `tags` fuzzer: lofty's content sniffing calls these
+    /// ADTS/AAC-looking bytes and its AAC parser never returns (0.24 and
+    /// 0.25.5). Named .flac or .mp3 they must fail fast; anything else isn't
+    /// parsed at all.
+    #[test]
+    fn adts_looking_bytes_do_not_hang() {
+        let inputs: [&[u8]; 2] = [
+            &[
+                0x00, 0x00, 0x00, 0xd9, 0xff, 0xd9, 0xff, 0xf8, 0xf9, 0x00, 0x00, 0x00, 0xd9, 0xff,
+                0xd9, 0xff, 0xf8, 0xf9, 0x00, 0x00,
+            ],
+            &[
+                0xff, 0xf9, 0x00, 0x00, 0x00, 0x4b, 0xf0, 0xff, 0xf9, 0x00, 0x00, 0x00, 0x4b, 0x04,
+                0xff, 0xf9, 0x00, 0x08, 0x00, 0x00, 0x00, 0xff, 0xf9, 0x00, 0x10, 0x00, 0x00, 0x00,
+                0xf0,
+            ],
+        ];
+        for bytes in inputs {
+            for name in ["x.flac", "x.mp3", "x.aac", "x"] {
+                let bytes = bytes.to_vec();
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || tx.send(read_track_from(name, &bytes)).unwrap());
+                let t = rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap_or_else(|_| panic!("tag reader hung on {name}"));
+                assert_eq!(t.format, None);
+            }
+        }
+    }
+
+    #[test]
+    fn other_extensions_are_not_parsed() {
+        use lossless_engine::fixtures::{BLOCK, Dir, flac};
+        let d = Dir::new();
+        let f = flac(&d, "a.flac", 44_100, 16, 2, BLOCK);
+        let bytes = std::fs::read(&f.path).unwrap();
+        assert!(read_track_from("a.flac", &bytes).format.is_some());
+        assert!(read_track_from("a.FLAC", &bytes).format.is_some());
+        assert!(read_track_from("a.ogg", &bytes).format.is_none());
+        assert!(read_track_from("a", &bytes).format.is_none());
     }
 
     #[test]
