@@ -1,11 +1,12 @@
 #![forbid(unsafe_code)]
 
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::thread;
 
 use anyhow::{Context, Result, bail};
@@ -14,74 +15,43 @@ use lossless_library::{Library, collect, read_track};
 use lossless_proto::{
     Body, Command, Event, Outcome, Request, ServerMessage, Track, decode, encode,
 };
-use serde::Deserialize;
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Config {
-    /// ALSA device, e.g. "hw:CARD=PRO2,DEV=0" for bit-perfect, "default" for
-    /// the PipeWire path.
-    #[serde(default = "default_device")]
-    pub device: String,
-    /// Relative paths in `add` resolve against this.
-    pub music_dir: Option<PathBuf>,
-    pub socket: Option<PathBuf>,
-}
+mod config;
 
-fn default_device() -> String {
-    "default".into()
-}
+use config::expand_tilde;
+pub use config::{
+    Config, MAX_CONFIG, check_device, check_path, config_path, load_config, parse_config,
+};
 
-fn home() -> PathBuf {
-    std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from)
-}
-
-fn expand_tilde(p: &Path) -> PathBuf {
-    match p.strip_prefix("~") {
-        Ok(rest) => home().join(rest),
-        Err(_) => p.to_path_buf(),
-    }
-}
-
-pub fn config_path() -> PathBuf {
-    let base =
-        std::env::var_os("XDG_CONFIG_HOME").map_or_else(|| home().join(".config"), PathBuf::from);
-    base.join("lossless/config.toml")
-}
-
-/// Read the config at `path`; a missing file means all defaults.
-pub fn load_config(path: &Path) -> Result<Config> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-    };
-    parse_config(&text).with_context(|| format!("parsing {}", path.display()))
-}
-
-pub fn parse_config(text: &str) -> Result<Config> {
-    let mut cfg: Config = toml::from_str(text)?;
-    cfg.music_dir = cfg.music_dir.map(|d| expand_tilde(&d));
-    cfg.socket = cfg.socket.map(|s| expand_tilde(&s));
-    Ok(cfg)
-}
-
-/// Bind the socket, replacing a stale file but never a live daemon.
+/// Bind the socket, owner-only. An existing path is replaced only if it is
+/// itself a stale socket: never a live daemon, a symlink or any other file.
 pub fn bind(path: &Path) -> Result<UnixListener> {
-    if path.exists() {
-        if UnixStream::connect(path).is_ok() {
-            bail!("another daemon is listening on {}", path.display());
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("checking {}", path.display())),
+        Ok(meta) if !meta.file_type().is_socket() => {
+            bail!("{} exists and is not a socket", path.display())
         }
-        std::fs::remove_file(path).with_context(|| format!("removing stale {}", path.display()))?;
+        Ok(_) => {
+            if UnixStream::connect(path).is_ok() {
+                bail!("another daemon is listening on {}", path.display());
+            }
+            std::fs::remove_file(path)
+                .with_context(|| format!("removing stale {}", path.display()))?;
+        }
     }
-    UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))
+    let listener =
+        UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("restricting {}", path.display()))?;
+    Ok(listener)
 }
 
 type Writer = Arc<Mutex<UnixStream>>;
 
 fn send(writer: &Writer, msg: &ServerMessage) -> std::io::Result<()> {
     let line = encode(msg).map_err(std::io::Error::other)?;
-    let mut w = writer.lock().unwrap_or_else(|e| e.into_inner());
+    let mut w = writer.lock().unwrap_or_else(PoisonError::into_inner);
     w.write_all(line.as_bytes())
 }
 
@@ -89,7 +59,7 @@ type Subscribers = Arc<Mutex<Vec<Writer>>>;
 
 fn broadcast(subscribers: &Subscribers, event: Event) {
     let msg = ServerMessage::Event { event };
-    let mut subs = subscribers.lock().unwrap_or_else(|e| e.into_inner());
+    let mut subs = subscribers.lock().unwrap_or_else(PoisonError::into_inner);
     subs.retain(|w| send(w, &msg).is_ok());
 }
 
@@ -117,22 +87,22 @@ fn spawn_scan(
     library: Arc<RwLock<Library>>,
     scanning: Arc<AtomicBool>,
     subscribers: Subscribers,
-) {
+) -> Option<thread::JoinHandle<()>> {
     if scanning.swap(true, Ordering::SeqCst) {
-        return;
+        return None;
     }
-    thread::spawn(move || {
+    Some(thread::spawn(move || {
         let _clear = ClearOnDrop(scanning);
         match Library::scan(&root) {
             Ok(lib) => {
                 let tracks = lib.len();
-                *library.write().unwrap_or_else(|e| e.into_inner()) = lib;
+                *library.write().unwrap_or_else(PoisonError::into_inner) = lib;
                 eprintln!("library: {tracks} tracks in {}", root.display());
                 broadcast(&subscribers, Event::LibraryChanged { tracks });
             }
             Err(e) => eprintln!("library: scan failed: {e:#}"),
         }
-    });
+    }))
 }
 
 struct State {
@@ -154,29 +124,33 @@ impl State {
 
     /// Library entry for `path`, or its tags read now if it isn't indexed.
     fn track(&self, path: &Path) -> Track {
-        let lib = self.library.read().unwrap_or_else(|e| e.into_inner());
+        let lib = self.library.read().unwrap_or_else(PoisonError::into_inner);
         match lib.get(&path.display().to_string()) {
             Some(t) => t.clone(),
             None => read_track(path),
         }
     }
 
-    fn rescan(&self) -> Result<(), String> {
+    /// Start a scan; `None` if one is already running.
+    fn rescan(&self) -> Result<Option<thread::JoinHandle<()>>, String> {
         let root = self
             .music_dir
             .clone()
             .ok_or_else(|| "no music_dir configured".to_string())?;
-        spawn_scan(
+        Ok(spawn_scan(
             root,
             Arc::clone(&self.library),
             Arc::clone(&self.scanning),
             Arc::clone(&self.subscribers),
-        );
-        Ok(())
+        ))
     }
 
     fn handle(&self, cmd: Command, writer: &Writer) -> Outcome {
         let ok = |b| Outcome::Ok(b);
+        let play = |c| {
+            self.player.send(c);
+            Outcome::Ok(Body::Done)
+        };
         match cmd {
             Command::Status => {
                 let snap = self.player.snapshot();
@@ -196,13 +170,13 @@ impl State {
                     .collect(),
             )),
             Command::Search { query } => {
-                let lib = self.library.read().unwrap_or_else(|e| e.into_inner());
+                let lib = self.library.read().unwrap_or_else(PoisonError::into_inner);
                 ok(Body::Tracks(
                     lib.search(&query).into_iter().cloned().collect(),
                 ))
             }
             Command::Update => match self.rescan() {
-                Ok(()) => ok(Body::Done),
+                Ok(_) => ok(Body::Done),
                 Err(e) => Outcome::Err(e),
             },
             Command::Add { paths } => {
@@ -221,29 +195,18 @@ impl State {
             Command::Subscribe => {
                 self.subscribers
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap_or_else(PoisonError::into_inner)
                     .push(Arc::clone(writer));
                 ok(Body::Done)
             }
-            other => {
-                self.player.send(match other {
-                    Command::Play { index } => PlayerCmd::Play(index),
-                    Command::Pause => PlayerCmd::Pause,
-                    Command::Toggle => PlayerCmd::Toggle,
-                    Command::Stop => PlayerCmd::Stop,
-                    Command::Next => PlayerCmd::Next,
-                    Command::Previous => PlayerCmd::Previous,
-                    Command::Seek { ms } => PlayerCmd::Seek { ms },
-                    Command::Clear => PlayerCmd::Clear,
-                    Command::Status
-                    | Command::Queue
-                    | Command::Add { .. }
-                    | Command::Subscribe
-                    | Command::Search { .. }
-                    | Command::Update => unreachable!("handled above"),
-                });
-                ok(Body::Done)
-            }
+            Command::Play { index } => play(PlayerCmd::Play(index)),
+            Command::Pause => play(PlayerCmd::Pause),
+            Command::Toggle => play(PlayerCmd::Toggle),
+            Command::Stop => play(PlayerCmd::Stop),
+            Command::Next => play(PlayerCmd::Next),
+            Command::Previous => play(PlayerCmd::Previous),
+            Command::Seek { ms } => play(PlayerCmd::Seek { ms }),
+            Command::Clear => play(PlayerCmd::Clear),
         }
     }
 }
@@ -296,6 +259,26 @@ fn serve(state: &State, stream: UnixStream) -> Result<()> {
     }
 }
 
+/// Load the config at `config`, bind its socket (or `default_socket`), open
+/// its device and serve until the listener fails.
+pub fn run(config: &Path, default_socket: PathBuf) -> Result<()> {
+    let cfg = load_config(config)?;
+    let socket = cfg.socket.unwrap_or(default_socket);
+    let listener = bind(&socket)?;
+    eprintln!(
+        "losslessd: device {} socket {}",
+        cfg.device,
+        socket.display()
+    );
+    let (player, events) = Player::spawn(cfg.device);
+    let daemon = Daemon::start(player, events, cfg.music_dir)?;
+    if let Err(e) = daemon.rescan() {
+        eprintln!("library: {e}");
+    }
+    daemon.serve(listener);
+    Ok(())
+}
+
 /// A running daemon: player, library and subscribers, ready to serve.
 pub struct Daemon {
     state: Arc<State>,
@@ -328,12 +311,17 @@ impl Daemon {
 
     /// Start a background scan of the music directory, if there is one.
     pub fn rescan(&self) -> Result<(), String> {
-        self.state.rescan()
+        self.state.rescan().map(drop)
     }
 
     /// Accept clients until the listener fails; one thread per client.
     pub fn serve(&self, listener: UnixListener) {
-        for stream in listener.incoming() {
+        self.accept(listener.incoming());
+    }
+
+    /// Serve each connection; a failed accept is logged and skipped.
+    fn accept(&self, incoming: impl IntoIterator<Item = std::io::Result<UnixStream>>) {
+        for stream in incoming {
             let stream = match stream {
                 Ok(s) => s,
                 Err(e) => {
@@ -353,10 +341,68 @@ impl Daemon {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, RwLock};
 
-    use super::ClearOnDrop;
+    use lossless_engine::Player;
+    use lossless_engine::fixtures::{Dir, PacedSink};
+    use lossless_library::Library;
+
+    use super::{ClearOnDrop, Daemon, MAX_REQUEST, serve, spawn_scan};
+
+    fn scan(root: PathBuf, busy: bool) -> (Option<std::thread::JoinHandle<()>>, Arc<AtomicBool>) {
+        let flag = Arc::new(AtomicBool::new(busy));
+        let library = Arc::new(RwLock::new(Library::default()));
+        let subs = Arc::new(Mutex::new(Vec::new()));
+        (spawn_scan(root, library, Arc::clone(&flag), subs), flag)
+    }
+
+    #[test]
+    fn no_second_scan_while_one_runs() {
+        let (handle, flag) = scan(PathBuf::from("/nonexistent"), true);
+        assert!(handle.is_none());
+        // The running scan still owns the flag.
+        assert!(flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_failed_scan_clears_the_flag() {
+        let dir = Dir::new();
+        let (handle, flag) = scan(dir.path("missing"), false);
+        handle.unwrap().join().unwrap();
+        assert!(!flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_client_gone_before_its_error_reply_ends_only_its_session() {
+        let (player, events) = Player::spawn_with(PacedSink::default());
+        let daemon = Daemon::start(player, events, None).unwrap();
+        let (server, mut client) = UnixStream::pair().unwrap();
+        client.write_all(&vec![b'x'; MAX_REQUEST + 1]).unwrap();
+        drop(client);
+        let err = serve(&daemon.state, server).unwrap_err();
+        assert!(err.to_string().contains("pipe"), "{err}");
+    }
+
+    #[test]
+    fn a_failed_accept_does_not_stop_serving() {
+        let (player, events) = Player::spawn_with(PacedSink::default());
+        let daemon = Daemon::start(player, events, None).unwrap();
+        let (server, mut client) = UnixStream::pair().unwrap();
+        daemon.accept([
+            Err(std::io::Error::other("too many open files")),
+            Ok(server),
+        ]);
+        client
+            .write_all(b"{\"id\":7,\"cmd\":\"status\"}\n")
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(client).read_line(&mut line).unwrap();
+        assert!(line.contains("\"id\":7"), "{line}");
+    }
 
     #[test]
     fn scan_flag_is_cleared_when_the_scan_panics() {

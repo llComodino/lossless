@@ -367,6 +367,55 @@ fn a_dead_subscriber_does_not_stop_the_others() {
 }
 
 #[test]
+fn blank_lines_are_skipped() {
+    let s = Server::start(false);
+    let mut c = s.connect();
+    c.raw(b"\n   \n\t\n");
+    // `call` checks the reply id: blank lines produced no reply of their own.
+    assert_eq!(status(&mut c).state, PlayState::Stopped);
+}
+
+#[test]
+fn queued_library_tracks_come_from_the_index() {
+    let s = Server::start(true);
+    s.album(1);
+    let mut c = s.connect();
+    c.ok(Command::Subscribe);
+    c.ok(Command::Update);
+    c.wait_for(|e| matches!(e, Event::LibraryChanged { .. }));
+    let Body::Tracks(indexed) = c.ok(Command::Search {
+        query: "one".into(),
+    }) else {
+        panic!("not tracks")
+    };
+    c.ok(Command::Add {
+        paths: vec!["album/01 one.flac".into()],
+    });
+    let Body::Queue(queued) = c.ok(Command::Queue) else {
+        panic!("not a queue")
+    };
+    assert_eq!(queued, indexed);
+}
+
+#[test]
+fn tracks_outside_the_library_are_read_on_demand() {
+    let s = Server::start(false);
+    let files = s.album(1);
+    let mut c = s.connect();
+    c.ok(Command::Add {
+        paths: vec![files[0].display().to_string()],
+    });
+    match c.ok(Command::Queue) {
+        Body::Queue(tracks) => {
+            assert_eq!(tracks.len(), 1);
+            assert!(tracks[0].duration_ms.is_some(), "not read: {:?}", tracks[0]);
+            assert!(tracks[0].format.is_some());
+        }
+        other => panic!("not a queue: {other:?}"),
+    }
+}
+
+#[test]
 fn bind_refuses_a_live_daemon_and_replaces_a_stale_socket() {
     let s = Server::start(true);
     assert!(bind(&s.socket()).is_err(), "took over a live daemon");
@@ -374,6 +423,56 @@ fn bind_refuses_a_live_daemon_and_replaces_a_stale_socket() {
     drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
     assert!(stale.exists());
     assert!(bind(&stale).is_ok(), "stale socket not replaced");
+}
+
+#[test]
+fn bind_never_removes_anything_but_a_socket() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = Dir::new();
+    let key = dir.path("id_ed25519");
+    std::fs::write(&key, b"secret").unwrap();
+    let err = bind(&key).unwrap_err().to_string();
+    assert!(err.contains("not a socket"), "{err}");
+    assert_eq!(std::fs::read(&key).unwrap(), b"secret");
+
+    let link = dir.path("link.sock");
+    std::os::unix::fs::symlink(&key, &link).unwrap();
+    assert!(bind(&link).is_err(), "followed a symlink");
+    assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+    assert_eq!(std::fs::read(&key).unwrap(), b"secret");
+
+    let dangling = dir.path("dangling.sock");
+    std::os::unix::fs::symlink(dir.path("nowhere"), &dangling).unwrap();
+    assert!(bind(&dangling).is_err(), "replaced a dangling symlink");
+    assert!(!dir.path("nowhere").exists());
+
+    let under_file = key.join("x.sock");
+    assert!(
+        bind(&under_file)
+            .unwrap_err()
+            .to_string()
+            .contains("checking")
+    );
+
+    std::fs::create_dir(dir.path("d")).unwrap();
+    assert!(bind(&dir.path("d")).is_err());
+    assert!(dir.path("d").is_dir());
+
+    let long = dir.path(&"s".repeat(120));
+    assert!(bind(&long).unwrap_err().to_string().contains("binding"));
+
+    let locked = dir.path("locked");
+    std::fs::create_dir(&locked).unwrap();
+    drop(std::os::unix::net::UnixListener::bind(locked.join("stale.sock")).unwrap());
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let err = bind(&locked.join("stale.sock")).map(drop);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(err.unwrap_err().to_string().contains("removing stale"));
+
+    let sock = dir.path("ok.sock");
+    let _l = bind(&sock).unwrap();
+    let mode = std::fs::metadata(&sock).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600, "socket mode {mode:o}");
 }
 
 #[test]

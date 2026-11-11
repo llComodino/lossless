@@ -45,3 +45,10 @@ path = "fuzz_targets/tags.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "device"
+path = "fuzz_targets/device.rs"
+test = false
+doc = false
+bench = false
