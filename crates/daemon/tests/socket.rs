@@ -367,6 +367,33 @@ fn a_dead_subscriber_does_not_stop_the_others() {
 }
 
 #[test]
+fn blank_lines_are_skipped() {
+    let s = Server::start(false);
+    let mut c = s.connect();
+    c.raw(b"\n   \n\t\n");
+    // `call` checks the reply id: blank lines produced no reply of their own.
+    assert_eq!(status(&mut c).state, PlayState::Stopped);
+}
+
+#[test]
+fn tracks_outside_the_library_are_read_on_demand() {
+    let s = Server::start(false);
+    let files = s.album(1);
+    let mut c = s.connect();
+    c.ok(Command::Add {
+        paths: vec![files[0].display().to_string()],
+    });
+    match c.ok(Command::Queue) {
+        Body::Queue(tracks) => {
+            assert_eq!(tracks.len(), 1);
+            assert!(tracks[0].duration_ms.is_some(), "not read: {:?}", tracks[0]);
+            assert!(tracks[0].format.is_some());
+        }
+        other => panic!("not a queue: {other:?}"),
+    }
+}
+
+#[test]
 fn bind_refuses_a_live_daemon_and_replaces_a_stale_socket() {
     let s = Server::start(true);
     assert!(bind(&s.socket()).is_err(), "took over a live daemon");

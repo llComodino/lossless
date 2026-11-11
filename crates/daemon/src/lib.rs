@@ -339,10 +339,59 @@ impl Daemon {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, RwLock};
 
-    use super::ClearOnDrop;
+    use lossless_engine::Player;
+    use lossless_engine::fixtures::{Dir, PacedSink};
+    use lossless_library::Library;
+
+    use super::{ClearOnDrop, Daemon, spawn_scan};
+
+    fn scan(root: PathBuf, busy: bool) -> (Option<std::thread::JoinHandle<()>>, Arc<AtomicBool>) {
+        let flag = Arc::new(AtomicBool::new(busy));
+        let library = Arc::new(RwLock::new(Library::default()));
+        let subs = Arc::new(Mutex::new(Vec::new()));
+        (spawn_scan(root, library, Arc::clone(&flag), subs), flag)
+    }
+
+    #[test]
+    fn no_second_scan_while_one_runs() {
+        let (handle, flag) = scan(PathBuf::from("/nonexistent"), true);
+        assert!(handle.is_none());
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "the running scan still owns the flag"
+        );
+    }
+
+    #[test]
+    fn a_failed_scan_clears_the_flag() {
+        let dir = Dir::new();
+        let (handle, flag) = scan(dir.path("missing"), false);
+        handle.unwrap().join().unwrap();
+        assert!(!flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_failed_accept_does_not_stop_serving() {
+        let (player, events) = Player::spawn_with(PacedSink::default());
+        let daemon = Daemon::start(player, events, None).unwrap();
+        let (server, mut client) = UnixStream::pair().unwrap();
+        daemon.accept([
+            Err(std::io::Error::other("too many open files")),
+            Ok(server),
+        ]);
+        client
+            .write_all(b"{\"id\":7,\"cmd\":\"status\"}\n")
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(client).read_line(&mut line).unwrap();
+        assert!(line.contains("\"id\":7"), "{line}");
+    }
 
     #[test]
     fn scan_flag_is_cleared_when_the_scan_panics() {
