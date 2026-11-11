@@ -277,6 +277,102 @@ mod tests {
         assert_eq!(fit("abcdef", 0), "");
     }
 
+    fn track(path: &str, artist: Option<&str>, title: Option<&str>, album: Option<&str>) -> Track {
+        Track {
+            path: path.into(),
+            title: title.map(Into::into),
+            artist: artist.map(Into::into),
+            album: album.map(Into::into),
+            track_number: None,
+            duration_ms: None,
+            format: None,
+        }
+    }
+
+    #[test]
+    fn clock_shows_hours_only_when_needed() {
+        assert_eq!(clock(0), "0:00");
+        assert_eq!(clock(59_999), "0:59");
+        assert_eq!(clock(3_599_999), "59:59");
+        assert_eq!(clock(3_600_000), "1:00:00");
+        assert_eq!(clock(36_061_000), "10:01:01");
+    }
+
+    #[test]
+    fn formats_read_as_bits_rate_channels() {
+        let f = |rate, bits| {
+            format_str(&StreamFormat {
+                rate,
+                bits,
+                channels: 2,
+            })
+        };
+        assert_eq!(f(44_100, 16), "16-bit/44.1 kHz/2ch");
+        assert_eq!(f(192_000, 24), "24-bit/192 kHz/2ch");
+    }
+
+    #[test]
+    fn describe_falls_back_to_the_file_name() {
+        let p = "/m/a/01 x.flac";
+        assert_eq!(
+            describe(&track(p, Some("A"), Some("T"), Some("L"))),
+            "A - T (L)"
+        );
+        assert_eq!(describe(&track(p, None, Some("T"), None)), "T");
+        assert_eq!(describe(&track(p, Some("A"), None, None)), "01 x.flac");
+        assert_eq!(describe(&track(p, None, None, Some("L"))), "01 x.flac (L)");
+        assert_eq!(describe(&track("/", None, None, None)), "/");
+    }
+
+    #[test]
+    fn track_lines_have_fixed_columns() {
+        let mut t = track("/m/a.flac", Some("A"), Some("T"), None);
+        assert_eq!(
+            track_line(3, &t),
+            format!("   3  {}       ?  ", fit("A - T", 60))
+        );
+        t.duration_ms = Some(61_000);
+        t.format = Some(StreamFormat {
+            rate: 96_000,
+            bits: 24,
+            channels: 2,
+        });
+        assert_eq!(
+            track_line(12, &t),
+            format!("  12  {}    1:01  24-bit/96 kHz/2ch", fit("A - T", 60))
+        );
+    }
+
+    #[test]
+    fn commands_and_their_arguments() {
+        let args = |s: &[&str]| s.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        let ok = |s: &[&str]| parse(&args(s)).unwrap();
+        let err = |s: &[&str]| parse(&args(s)).unwrap_err().to_string();
+        assert_eq!(ok(&["previous"]), Command::Previous);
+        assert_eq!(ok(&["prev"]), Command::Previous);
+        assert_eq!(ok(&["watch"]), Command::Subscribe);
+        assert_eq!(ok(&["seek", "1:30"]), Command::Seek { ms: 90_000 });
+        assert_eq!(
+            ok(&["search", "a", "b"]),
+            Command::Search {
+                query: "a b".into()
+            }
+        );
+        assert_eq!(
+            ok(&["add", "x", "y"]),
+            Command::Add {
+                paths: vec!["x".into(), "y".into()]
+            }
+        );
+        assert_eq!(err(&["status", "x"]), "status takes no arguments");
+        assert_eq!(err(&["seek"]), "seek takes one time");
+        assert_eq!(err(&["play", "1", "2"]), "play takes at most one index");
+        assert!(err(&["play", "x"]).contains("bad index"));
+        for usage in [&[][..], &["add"], &["search"], &["bogus"]] {
+            assert_eq!(err(usage), USAGE, "{usage:?}");
+        }
+    }
+
     #[test]
     fn play_is_one_based() {
         let args = |s: &[&str]| s.iter().map(|a| a.to_string()).collect::<Vec<_>>();

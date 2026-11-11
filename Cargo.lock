@@ -401,6 +401,8 @@ name = "lossless-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "lossless-daemon",
+ "lossless-engine",
  "lossless-proto",
  "proptest",
 ]
