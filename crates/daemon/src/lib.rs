@@ -85,11 +85,11 @@ fn spawn_scan(
     library: Arc<RwLock<Library>>,
     scanning: Arc<AtomicBool>,
     subscribers: Subscribers,
-) {
+) -> Option<thread::JoinHandle<()>> {
     if scanning.swap(true, Ordering::SeqCst) {
-        return;
+        return None;
     }
-    thread::spawn(move || {
+    Some(thread::spawn(move || {
         let _clear = ClearOnDrop(scanning);
         match Library::scan(&root) {
             Ok(lib) => {
@@ -100,7 +100,7 @@ fn spawn_scan(
             }
             Err(e) => eprintln!("library: scan failed: {e:#}"),
         }
-    });
+    }))
 }
 
 struct State {
@@ -129,18 +129,18 @@ impl State {
         }
     }
 
-    fn rescan(&self) -> Result<(), String> {
+    /// Start a scan; `None` if one is already running.
+    fn rescan(&self) -> Result<Option<thread::JoinHandle<()>>, String> {
         let root = self
             .music_dir
             .clone()
             .ok_or_else(|| "no music_dir configured".to_string())?;
-        spawn_scan(
+        Ok(spawn_scan(
             root,
             Arc::clone(&self.library),
             Arc::clone(&self.scanning),
             Arc::clone(&self.subscribers),
-        );
-        Ok(())
+        ))
     }
 
     fn handle(&self, cmd: Command, writer: &Writer) -> Outcome {
@@ -174,7 +174,7 @@ impl State {
                 ))
             }
             Command::Update => match self.rescan() {
-                Ok(()) => ok(Body::Done),
+                Ok(_) => ok(Body::Done),
                 Err(e) => Outcome::Err(e),
             },
             Command::Add { paths } => {
@@ -309,12 +309,17 @@ impl Daemon {
 
     /// Start a background scan of the music directory, if there is one.
     pub fn rescan(&self) -> Result<(), String> {
-        self.state.rescan()
+        self.state.rescan().map(drop)
     }
 
     /// Accept clients until the listener fails; one thread per client.
     pub fn serve(&self, listener: UnixListener) {
-        for stream in listener.incoming() {
+        self.accept(listener.incoming());
+    }
+
+    /// Serve each connection; a failed accept is logged and skipped.
+    fn accept(&self, incoming: impl IntoIterator<Item = std::io::Result<UnixStream>>) {
+        for stream in incoming {
             let stream = match stream {
                 Ok(s) => s,
                 Err(e) => {
