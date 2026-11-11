@@ -377,6 +377,37 @@ fn bind_refuses_a_live_daemon_and_replaces_a_stale_socket() {
 }
 
 #[test]
+fn bind_never_removes_anything_but_a_socket() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = Dir::new();
+    let key = dir.path("id_ed25519");
+    std::fs::write(&key, b"secret").unwrap();
+    let err = bind(&key).unwrap_err().to_string();
+    assert!(err.contains("not a socket"), "{err}");
+    assert_eq!(std::fs::read(&key).unwrap(), b"secret");
+
+    let link = dir.path("link.sock");
+    std::os::unix::fs::symlink(&key, &link).unwrap();
+    assert!(bind(&link).is_err(), "followed a symlink");
+    assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+    assert_eq!(std::fs::read(&key).unwrap(), b"secret");
+
+    let dangling = dir.path("dangling.sock");
+    std::os::unix::fs::symlink(dir.path("nowhere"), &dangling).unwrap();
+    assert!(bind(&dangling).is_err(), "replaced a dangling symlink");
+    assert!(!dir.path("nowhere").exists());
+
+    std::fs::create_dir(dir.path("d")).unwrap();
+    assert!(bind(&dir.path("d")).is_err());
+    assert!(dir.path("d").is_dir());
+
+    let sock = dir.path("ok.sock");
+    let _l = bind(&sock).unwrap();
+    let mode = std::fs::metadata(&sock).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600, "socket mode {mode:o}");
+}
+
+#[test]
 fn config_parsing() {
     let home = std::env::var("HOME").unwrap();
     let cfg = parse_config("").unwrap();

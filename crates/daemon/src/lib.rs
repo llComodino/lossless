@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -66,15 +67,28 @@ pub fn parse_config(text: &str) -> Result<Config> {
     Ok(cfg)
 }
 
-/// Bind the socket, replacing a stale file but never a live daemon.
+/// Bind the socket, owner-only. An existing path is replaced only if it is
+/// itself a stale socket: never a live daemon, a symlink or any other file.
 pub fn bind(path: &Path) -> Result<UnixListener> {
-    if path.exists() {
-        if UnixStream::connect(path).is_ok() {
-            bail!("another daemon is listening on {}", path.display());
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("checking {}", path.display())),
+        Ok(meta) if !meta.file_type().is_socket() => {
+            bail!("{} exists and is not a socket", path.display())
         }
-        std::fs::remove_file(path).with_context(|| format!("removing stale {}", path.display()))?;
+        Ok(_) => {
+            if UnixStream::connect(path).is_ok() {
+                bail!("another daemon is listening on {}", path.display());
+            }
+            std::fs::remove_file(path)
+                .with_context(|| format!("removing stale {}", path.display()))?;
+        }
     }
-    UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))
+    let listener =
+        UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("restricting {}", path.display()))?;
+    Ok(listener)
 }
 
 type Writer = Arc<Mutex<UnixStream>>;
