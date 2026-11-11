@@ -226,6 +226,19 @@ fn add_reports_errors() {
 }
 
 #[test]
+fn play_past_the_queue_is_out_of_range() {
+    let s = Server::start(true);
+    s.album(1);
+    let mut c = s.connect();
+    c.ok(Command::Add {
+        paths: vec!["album".into()],
+    });
+    let e = c.err(Command::Play { index: Some(5) });
+    assert_eq!(e.code, ErrorCode::OutOfRange);
+    assert_eq!(e.message, "index 5 out of range: queue has 2 entries");
+}
+
+#[test]
 fn update_scans_and_search_finds() {
     let s = Server::start(true);
     s.album(1);

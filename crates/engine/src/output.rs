@@ -2,8 +2,9 @@ use std::time::{Duration, Instant};
 
 use alsa::pcm::{Access, Format, HwParams, PCM, State};
 use alsa::{Direction, ValueOr};
-use anyhow::{Context, Result, anyhow, bail};
 use lossless_proto::StreamFormat;
+
+use crate::{Error, Result};
 
 /// How long the DAC gets between closing one stream and opening the next
 /// with a different format. The DAWN PRO2 times out (and can wedge) when its
@@ -74,6 +75,13 @@ fn is_transient(e: &alsa::Error) -> bool {
     )
 }
 
+fn device_err(device: &str, reason: impl std::fmt::Display) -> Error {
+    Error::Device {
+        device: device.to_owned(),
+        reason: reason.to_string(),
+    }
+}
+
 fn open_once(device: &str, layout: Layout, rate: u32, channels: u16) -> alsa::Result<PCM> {
     let pcm = PCM::new(device, Direction::Playback, false)?;
     {
@@ -100,9 +108,15 @@ fn open_exact(device: &str, src: StreamFormat) -> Result<(PCM, Layout)> {
         loop {
             match open_once(device, layout, src.rate, src.channels) {
                 Ok(pcm) => {
-                    let got = pcm.hw_params_current()?.get_rate()?;
+                    let got = pcm
+                        .hw_params_current()
+                        .and_then(|p| p.get_rate())
+                        .map_err(|e| device_err(device, e))?;
                     if got != src.rate {
-                        bail!("{device} opened at {got} Hz instead of {} Hz", src.rate);
+                        return Err(device_err(
+                            device,
+                            format!("opened at {got} Hz instead of {} Hz", src.rate),
+                        ));
                     }
                     return Ok((pcm, layout));
                 }
@@ -111,7 +125,10 @@ fn open_exact(device: &str, src: StreamFormat) -> Result<(PCM, Layout)> {
                     attempt += 1;
                 }
                 Err(e) if is_transient(&e) => {
-                    bail!("{device} still failing after {RETRIES} retries: {e}")
+                    return Err(device_err(
+                        device,
+                        format!("still failing after {RETRIES} retries: {e}"),
+                    ));
                 }
                 Err(e) => {
                     errors.push(format!("{:?}: {e}", layout.alsa()));
@@ -120,12 +137,15 @@ fn open_exact(device: &str, src: StreamFormat) -> Result<(PCM, Layout)> {
             }
         }
     }
-    Err(anyhow!(
-        "{device} accepts no lossless layout for {}-bit/{} Hz/{}ch ({})",
-        src.bits,
-        src.rate,
-        src.channels,
-        errors.join("; ")
+    Err(device_err(
+        device,
+        format!(
+            "accepts no lossless layout for {}-bit/{} Hz/{}ch ({})",
+            src.bits,
+            src.rate,
+            src.channels,
+            errors.join("; ")
+        ),
     ))
 }
 
@@ -220,7 +240,7 @@ impl Sink for Output {
         let s = self
             .stream
             .as_ref()
-            .ok_or_else(|| anyhow!("output not open"))?;
+            .ok_or_else(|| device_err(&self.device, "output not open"))?;
         s.layout.pack(samples, &mut self.scratch);
         let frame_bytes = s.layout.bytes() * s.format.channels as usize;
         let io = s.pcm.io_bytes();
@@ -228,7 +248,10 @@ impl Sink for Output {
         while off < self.scratch.len() {
             match io.writei(&self.scratch[off..]) {
                 Ok(frames) => off += frames * frame_bytes,
-                Err(e) => s.pcm.try_recover(e, true).context("ALSA write")?,
+                Err(e) => s
+                    .pcm
+                    .try_recover(e, true)
+                    .map_err(|e| device_err(&self.device, format!("ALSA write: {e}")))?,
             }
         }
         Ok(())
@@ -246,9 +269,9 @@ impl Sink for Output {
     /// skip): no clock switch, so no settle delay.
     fn discard(&mut self) -> Result<()> {
         if let Some(s) = &self.stream {
-            s.pcm.drop()?;
+            s.pcm.drop().map_err(|e| device_err(&self.device, e))?;
             if s.pcm.state() != State::Prepared {
-                s.pcm.prepare()?;
+                s.pcm.prepare().map_err(|e| device_err(&self.device, e))?;
             }
         }
         Ok(())

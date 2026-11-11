@@ -4,12 +4,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use anyhow::Result;
 use flacenc::component::BitRepr;
 use flacenc::error::Verify;
 use lossless_proto::StreamFormat;
 
-use crate::Sink;
+use crate::{Result, Sink};
 
 /// A generated FLAC file and the samples a bit-perfect decoder must return
 /// for it: interleaved, shifted to full-scale i32 like symphonia does.

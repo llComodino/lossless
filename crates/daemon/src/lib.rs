@@ -148,9 +148,9 @@ impl State {
 
     fn handle(&self, cmd: Command, writer: &Writer) -> Outcome {
         let ok = |b| Outcome::Ok(b);
-        let play = |c| {
-            self.player.send(c);
-            Outcome::Ok(Body::Done)
+        let play = |c| match self.player.send(c) {
+            Ok(()) => Outcome::Ok(Body::Done),
+            Err(e) => Outcome::Err(e.to_wire()),
         };
         match cmd {
             Command::Status => {
@@ -190,8 +190,7 @@ impl State {
                 if tracks.is_empty() {
                     return fail(ErrorCode::NotFound, "no playable files");
                 }
-                self.player.send(PlayerCmd::Add(tracks));
-                ok(Body::Done)
+                play(PlayerCmd::Add(tracks))
             }
             Command::Subscribe => {
                 self.subscribers
