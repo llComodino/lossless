@@ -14,3 +14,5 @@ lossless-proto.workspace = true
 
 [dev-dependencies]
 proptest = "1.12.0"
+lossless-daemon = { path = "../daemon" }
+lossless-engine = { workspace = true, features = ["fixtures"] }
