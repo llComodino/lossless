@@ -257,6 +257,26 @@ fn serve(state: &State, stream: UnixStream) -> Result<()> {
     }
 }
 
+/// Load the config at `config`, bind its socket (or `default_socket`), open
+/// its device and serve until the listener fails.
+pub fn run(config: &Path, default_socket: PathBuf) -> Result<()> {
+    let cfg = load_config(config)?;
+    let socket = cfg.socket.unwrap_or(default_socket);
+    let listener = bind(&socket)?;
+    eprintln!(
+        "losslessd: device {} socket {}",
+        cfg.device,
+        socket.display()
+    );
+    let (player, events) = Player::spawn(cfg.device);
+    let daemon = Daemon::start(player, events, cfg.music_dir)?;
+    if let Err(e) = daemon.rescan() {
+        eprintln!("library: {e}");
+    }
+    daemon.serve(listener);
+    Ok(())
+}
+
 /// A running daemon: player, library and subscribers, ready to serve.
 pub struct Daemon {
     state: Arc<State>,
