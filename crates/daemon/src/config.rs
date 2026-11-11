@@ -52,7 +52,41 @@ pub fn parse_config(text: &str) -> Result<Config> {
     check_device(&cfg.device)?;
     cfg.music_dir = cfg.music_dir.map(|d| expand_tilde(&d));
     cfg.socket = cfg.socket.map(|s| expand_tilde(&s));
+    for (what, p) in [("music_dir", &cfg.music_dir), ("socket", &cfg.socket)] {
+        if let Some(p) = p {
+            check_path(what, p)?;
+        }
+    }
     Ok(cfg)
+}
+
+/// Longest accepted config path, in bytes (Linux PATH_MAX).
+const MAX_PATH: usize = 4096;
+
+/// A config path, after `~` expansion, must be absolute and spelled plainly:
+/// no `.` or `..` segments, no control or bidi characters (they would reach
+/// logs and terminals), valid UTF-8, at most `MAX_PATH` bytes.
+pub fn check_path(what: &str, p: &Path) -> Result<()> {
+    let Some(s) = p.to_str() else {
+        bail!("{what} is not valid UTF-8");
+    };
+    if s.chars().any(|c| c.is_control() || is_bidi(c)) {
+        bail!("{what} {s:?} contains control characters");
+    }
+    if s.len() > MAX_PATH {
+        bail!("{what} is longer than {MAX_PATH} bytes");
+    }
+    if !p.is_absolute() {
+        bail!("{what} {s:?} must be absolute or start with ~/");
+    }
+    if s.split('/').any(|seg| seg == "." || seg == "..") {
+        bail!("{what} {s:?} must not contain . or .. segments");
+    }
+    Ok(())
+}
+
+fn is_bidi(c: char) -> bool {
+    matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{200e}' | '\u{200f}')
 }
 
 /// Device names usable without a PCM definition of their own.
@@ -158,6 +192,70 @@ mod tests {
         ] {
             let err = check_device(bad).expect_err(bad).to_string();
             assert!(err.contains("not allowed"), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn plain_absolute_paths_are_accepted() {
+        for ok in [
+            "/",
+            "/home/me/Music",
+            "/run/user/1000/lossless.sock",
+            "/a//b/",
+            "/a/.hidden/b..c",
+        ] {
+            check_path("p", Path::new(ok)).unwrap_or_else(|e| panic!("{ok:?}: {e}"));
+        }
+    }
+
+    #[test]
+    fn odd_paths_are_refused() {
+        let long = format!("/{}", "a".repeat(MAX_PATH));
+        for (bad, why) in [
+            ("music", "absolute"),
+            ("", "absolute"),
+            ("./music", "absolute"),
+            ("~user/music", "absolute"),
+            ("/a/../etc", ".."),
+            ("/a/./b", ".."),
+            ("/a/..", ".."),
+            ("/a\u{1b}[2J", "control"),
+            ("/a\nb", "control"),
+            ("/a\u{0}b", "control"),
+            ("/a\u{7f}", "control"),
+            ("/a\u{202e}gpj.flac", "control"),
+            (long.as_str(), "longer"),
+        ] {
+            let err = check_path("p", Path::new(bad)).expect_err(bad).to_string();
+            assert!(err.contains(why), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn non_utf8_paths_are_refused() {
+        use std::os::unix::ffi::OsStrExt;
+        let p = Path::new(std::ffi::OsStr::from_bytes(b"/a\xffb"));
+        assert!(
+            check_path("p", p)
+                .unwrap_err()
+                .to_string()
+                .contains("UTF-8")
+        );
+    }
+
+    #[test]
+    fn config_paths_are_checked_after_tilde_expansion() {
+        let home = home();
+        let cfg = parse_config("music_dir = \"~\"\nsocket = \"~/x.sock\"").unwrap();
+        assert_eq!(cfg.music_dir, Some(home.clone()));
+        assert_eq!(cfg.socket, Some(home.join("x.sock")));
+        for bad in [
+            "music_dir = \"Music\"",
+            "music_dir = \"~/../../etc\"",
+            "socket = \"/tmp/\\u001b]0;pwned\\u0007.sock\"",
+            "socket = \"sock\"",
+        ] {
+            assert!(parse_config(bad).is_err(), "{bad}");
         }
     }
 
