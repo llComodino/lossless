@@ -9,6 +9,7 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::thread;
 
+use ::log::{debug, info, warn};
 use anyhow::{Context, Result, bail};
 use lossless_engine::{Command as PlayerCmd, Player};
 use lossless_library::{Library, collect, read_track};
@@ -18,12 +19,14 @@ use lossless_proto::{
 
 mod config;
 mod error;
+mod log;
 
 use config::expand_tilde;
 pub use config::{
-    Config, MAX_CONFIG, check_device, check_path, config_path, load_config, parse_config,
+    Config, LogLevel, MAX_CONFIG, check_device, check_path, config_path, load_config, parse_config,
 };
 pub use error::RequestError;
+pub use log::init_logging;
 
 /// Bind the socket, owner-only. An existing path is replaced only if it is
 /// itself a stale socket: never a live daemon, a symlink or any other file.
@@ -105,10 +108,10 @@ fn spawn_scan(
             Ok(lib) => {
                 let tracks = lib.len();
                 *library.write().unwrap_or_else(PoisonError::into_inner) = lib;
-                eprintln!("library: {tracks} tracks in {}", root.display());
+                info!("library: {tracks} tracks in {}", root.display());
                 broadcast(&subscribers, Event::LibraryChanged { tracks });
             }
-            Err(e) => eprintln!("library: scan failed: {e}"),
+            Err(e) => warn!("library: scan failed: {e}"),
         }
     }))
 }
@@ -250,13 +253,23 @@ fn serve(state: &State, stream: UnixStream) -> Result<()> {
             continue;
         }
         let reply = match decode::<Request>(line) {
-            Ok(req) => ServerMessage::Reply {
-                id: req.id,
-                result: match state.handle(req.command, &writer) {
+            Ok(req) => {
+                debug!("request {}: {:?}", req.id, req.command);
+                let result = match state.handle(req.command, &writer) {
                     Ok(body) => Outcome::Ok(body),
                     Err(e) => Outcome::Err(e.to_wire()),
-                },
-            },
+                };
+                debug!(
+                    "reply {}: {}",
+                    req.id,
+                    if matches!(result, Outcome::Ok(_)) {
+                        "ok"
+                    } else {
+                        "error"
+                    }
+                );
+                ServerMessage::Reply { id: req.id, result }
+            }
             Err(e) => bad(format!("bad request: {e}")),
         };
         send(&writer, &reply)?;
@@ -265,15 +278,12 @@ fn serve(state: &State, stream: UnixStream) -> Result<()> {
 
 /// Load the config at `config`, bind its socket (or `default_socket`), open
 /// its device and serve until the listener fails.
-pub fn run(config: &Path, default_socket: PathBuf) -> Result<()> {
+pub fn run(config: &Path, default_socket: PathBuf, log_override: Option<LogLevel>) -> Result<()> {
     let cfg = load_config(config)?;
+    init_logging(log_override.unwrap_or(cfg.log_level));
     let socket = cfg.socket.unwrap_or(default_socket);
     let listener = bind(&socket)?;
-    eprintln!(
-        "losslessd: device {} socket {}",
-        cfg.device,
-        socket.display()
-    );
+    info!("device {} socket {}", cfg.device, socket.display());
     let (player, events) = Player::spawn(cfg.device);
     let on_player_gone = Box::new(|| {
         eprintln!("losslessd: player thread died; exiting");
@@ -281,7 +291,7 @@ pub fn run(config: &Path, default_socket: PathBuf) -> Result<()> {
     });
     let daemon = Daemon::start(player, events, cfg.music_dir, on_player_gone)?;
     if let Err(e) = daemon.rescan() {
-        eprintln!("library: {e}");
+        warn!("library: {e}");
     }
     daemon.serve(listener);
     Ok(())
@@ -334,14 +344,14 @@ impl Daemon {
             let stream = match stream {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("accept: {e}");
+                    warn!("accept: {e}");
                     continue;
                 }
             };
             let state = Arc::clone(&self.state);
             thread::spawn(move || {
                 if let Err(e) = serve(&state, stream) {
-                    eprintln!("client: {e:#}");
+                    warn!("client: {e:#}");
                 }
             });
         }

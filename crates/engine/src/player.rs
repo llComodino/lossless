@@ -260,7 +260,7 @@ impl<S: Sink> Worker<S> {
 
     /// Tell clients about a failure the player recovered from on its own.
     fn fail(&mut self, err: &Error) {
-        eprintln!("{err}");
+        log::warn!("{err}");
         let wire = err.to_wire();
         self.last_error = Some(wire.clone());
         self.emit(Event::Error(wire));

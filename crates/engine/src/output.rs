@@ -121,6 +121,7 @@ fn open_exact(device: &str, src: StreamFormat) -> Result<(PCM, Layout)> {
                     return Ok((pcm, layout));
                 }
                 Err(e) if is_transient(&e) && attempt < RETRIES => {
+                    log::warn!("{device}: open failed ({e}), retrying");
                     std::thread::sleep(BACKOFF * 2u32.pow(attempt));
                     attempt += 1;
                 }
@@ -227,6 +228,13 @@ impl Sink for Output {
             layout,
             format,
         });
+        log::info!(
+            "{}: opened {} Hz {}-bit {}ch",
+            self.device,
+            format.rate,
+            format.bits,
+            format.channels
+        );
         Ok(format)
     }
 

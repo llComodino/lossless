@@ -412,6 +412,7 @@ name = "lossless-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "log",
  "lossless-engine",
  "lossless-library",
  "lossless-proto",
@@ -428,6 +429,7 @@ dependencies = [
  "alsa",
  "anyhow",
  "flacenc",
+ "log",
  "lossless-proto",
  "proptest",
  "symphonia",
