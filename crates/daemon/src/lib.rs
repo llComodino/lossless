@@ -19,7 +19,9 @@ use lossless_proto::{
 mod config;
 
 use config::expand_tilde;
-pub use config::{Config, config_path, load_config, parse_config};
+pub use config::{
+    Config, MAX_CONFIG, check_device, check_path, config_path, load_config, parse_config,
+};
 
 /// Bind the socket, owner-only. An existing path is replaced only if it is
 /// itself a stale socket: never a live daemon, a symlink or any other file.
