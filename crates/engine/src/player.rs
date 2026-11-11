@@ -180,6 +180,8 @@ struct Worker<S: Sink> {
     pending: Vec<Event>,
     /// The last recovery failure, until a track loads cleanly.
     last_error: Option<WireError>,
+    /// Set while recovering from a failure, so the load that follows keeps it.
+    keep_error: bool,
     shared: Arc<Mutex<Shared>>,
     dirty: bool,
     queue_dirty: bool,
@@ -201,6 +203,7 @@ impl<S: Sink> Worker<S> {
             events,
             pending: Vec::new(),
             last_error: None,
+            keep_error: false,
             shared: Arc::new(Mutex::new(Shared::new())),
             dirty: false,
             queue_dirty: false,
@@ -339,8 +342,10 @@ impl<S: Sink> Worker<S> {
             }
             Ok(None) => self.advance(),
             Err(e) => {
-                self.advance();
                 self.fail(&e);
+                self.keep_error = true;
+                self.advance();
+                self.keep_error = false;
             }
         }
     }
@@ -375,7 +380,7 @@ impl<S: Sink> Worker<S> {
             match Source::open(&self.queue[index]) {
                 Ok(source) => match self.output.ensure(source.format) {
                     Ok(_) => {
-                        if !skipped {
+                        if !skipped && !self.keep_error {
                             self.last_error = None;
                             self.dirty = true;
                         }
@@ -433,7 +438,7 @@ impl<S: Sink> Worker<S> {
         if let Some(source) = self.source.as_mut() {
             match source.seek(heard) {
                 Ok(at) => self.written = at,
-                Err(e) => eprintln!("{e}"),
+                Err(e) => self.fail(&e),
             }
         }
         let _ = self.output.discard();
@@ -534,7 +539,7 @@ impl<S: Sink> Worker<S> {
                         let ms = self.frames_to_ms(at);
                         self.anchor(ms, Instant::now());
                     }
-                    Err(e) => eprintln!("{e}"),
+                    Err(e) => return Err(e),
                 }
             }
             Command::Shutdown => {}
@@ -816,7 +821,7 @@ mod tests {
         assert_eq!(w.index, Some(1), "next at the end does nothing");
         let err = w.handle(Command::Play(Some(7))).unwrap_err();
         assert!(matches!(err, Error::OutOfRange { index: 7, len: 2 }));
-        assert_eq!(w.index, Some(1), "out-of-range jump is ignored");
+        assert_eq!(w.index, Some(1), "out-of-range jump leaves the queue alone");
         w.handle(Command::Play(Some(0))).unwrap();
         assert_eq!((w.index, w.state), (Some(0), PlayState::Playing));
         w.handle(Command::Pause).unwrap();
@@ -917,6 +922,52 @@ mod tests {
 
     fn last_error(w: &Worker<FakeSink>) -> Option<lossless_proto::WireError> {
         lock(&w.shared).at(Instant::now()).status.last_error
+    }
+
+    #[test]
+    fn decode_error_then_device_failure_reports_the_latest() {
+        let d = Dir::new();
+        let a = flac(&d, "a.flac", 44_100, 16, 2, 4 * BLOCK);
+        let b = flac(&d, "b.flac", 44_100, 16, 2, BLOCK);
+        let bytes = std::fs::read(&a.path).unwrap();
+        let cut = write_bytes(&d, "cut.flac", &bytes[..bytes.len() * 2 / 3]);
+        let (mut w, events) = worker(FakeSink::default());
+        w.handle(Command::Add(vec![cut, b.path.clone()])).unwrap();
+        w.handle(Command::Play(None)).unwrap();
+        w.output.fail_ensure = true;
+        drive(&mut w);
+        let codes: Vec<_> = errors(&events).iter().map(|e| e.code).collect();
+        assert_eq!(codes, [ErrorCode::Decode, ErrorCode::Device]);
+        assert_eq!(last_error(&w).map(|e| e.code), Some(ErrorCode::Device));
+    }
+
+    #[test]
+    fn a_clean_load_after_a_skipped_entry_clears_the_error() {
+        let d = Dir::new();
+        let junk = write_bytes(&d, "junk.flac", &[0x5a; 512]);
+        let a = flac(&d, "a.flac", 44_100, 16, 2, 2 * BLOCK);
+        let b = flac(&d, "b.flac", 44_100, 16, 2, BLOCK);
+        let (mut w, _events) = worker(FakeSink::default());
+        w.handle(Command::Add(vec![junk, a.path.clone(), b.path.clone()]))
+            .unwrap();
+        w.handle(Command::Play(None)).unwrap();
+        w.publish();
+        assert!(last_error(&w).is_some());
+        drive_to(&mut w, 2);
+        assert_eq!(last_error(&w), None);
+    }
+
+    #[test]
+    fn seek_failures_reach_the_caller() {
+        let d = Dir::new();
+        let a = flac(&d, "a.flac", 44_100, 16, 2, 4 * BLOCK);
+        let bytes = std::fs::read(&a.path).unwrap();
+        let cut = write_bytes(&d, "cut.flac", &bytes[..bytes.len() / 2]);
+        let (player, _events) = Player::spawn_with(FakeSink::default());
+        player.send(Command::Add(vec![cut])).unwrap();
+        player.send(Command::Play(None)).unwrap();
+        let err = player.send(Command::Seek { ms: 350 }).unwrap_err();
+        assert!(matches!(err, Error::Decode { .. }), "{err}");
     }
 
     #[test]
