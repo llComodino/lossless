@@ -297,11 +297,8 @@ mod tests {
     fn loading_reads_only_small_regular_files() {
         let t = Tmp::new("load");
         let p = t.0.join("config.toml");
-        assert_eq!(
-            load_config(&p).unwrap().device,
-            "default",
-            "missing means defaults"
-        );
+        // Missing means defaults.
+        assert_eq!(load_config(&p).unwrap().device, "default");
 
         std::fs::write(&p, "device = \"null\"\n").unwrap();
         assert_eq!(load_config(&p).unwrap().device, "null");

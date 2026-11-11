@@ -376,6 +376,28 @@ fn blank_lines_are_skipped() {
 }
 
 #[test]
+fn queued_library_tracks_come_from_the_index() {
+    let s = Server::start(true);
+    s.album(1);
+    let mut c = s.connect();
+    c.ok(Command::Subscribe);
+    c.ok(Command::Update);
+    c.wait_for(|e| matches!(e, Event::LibraryChanged { .. }));
+    let Body::Tracks(indexed) = c.ok(Command::Search {
+        query: "one".into(),
+    }) else {
+        panic!("not tracks")
+    };
+    c.ok(Command::Add {
+        paths: vec!["album/01 one.flac".into()],
+    });
+    let Body::Queue(queued) = c.ok(Command::Queue) else {
+        panic!("not a queue")
+    };
+    assert_eq!(queued, indexed);
+}
+
+#[test]
 fn tracks_outside_the_library_are_read_on_demand() {
     let s = Server::start(false);
     let files = s.album(1);
@@ -424,9 +446,28 @@ fn bind_never_removes_anything_but_a_socket() {
     assert!(bind(&dangling).is_err(), "replaced a dangling symlink");
     assert!(!dir.path("nowhere").exists());
 
+    let under_file = key.join("x.sock");
+    assert!(
+        bind(&under_file)
+            .unwrap_err()
+            .to_string()
+            .contains("checking")
+    );
+
     std::fs::create_dir(dir.path("d")).unwrap();
     assert!(bind(&dir.path("d")).is_err());
     assert!(dir.path("d").is_dir());
+
+    let long = dir.path(&"s".repeat(120));
+    assert!(bind(&long).unwrap_err().to_string().contains("binding"));
+
+    let locked = dir.path("locked");
+    std::fs::create_dir(&locked).unwrap();
+    drop(std::os::unix::net::UnixListener::bind(locked.join("stale.sock")).unwrap());
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let err = bind(&locked.join("stale.sock")).map(drop);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(err.unwrap_err().to_string().contains("removing stale"));
 
     let sock = dir.path("ok.sock");
     let _l = bind(&sock).unwrap();

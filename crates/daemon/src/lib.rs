@@ -349,7 +349,7 @@ mod tests {
     use lossless_engine::fixtures::{Dir, PacedSink};
     use lossless_library::Library;
 
-    use super::{ClearOnDrop, Daemon, spawn_scan};
+    use super::{ClearOnDrop, Daemon, MAX_REQUEST, serve, spawn_scan};
 
     fn scan(root: PathBuf, busy: bool) -> (Option<std::thread::JoinHandle<()>>, Arc<AtomicBool>) {
         let flag = Arc::new(AtomicBool::new(busy));
@@ -362,10 +362,8 @@ mod tests {
     fn no_second_scan_while_one_runs() {
         let (handle, flag) = scan(PathBuf::from("/nonexistent"), true);
         assert!(handle.is_none());
-        assert!(
-            flag.load(Ordering::SeqCst),
-            "the running scan still owns the flag"
-        );
+        // The running scan still owns the flag.
+        assert!(flag.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -374,6 +372,17 @@ mod tests {
         let (handle, flag) = scan(dir.path("missing"), false);
         handle.unwrap().join().unwrap();
         assert!(!flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_client_gone_before_its_error_reply_ends_only_its_session() {
+        let (player, events) = Player::spawn_with(PacedSink::default());
+        let daemon = Daemon::start(player, events, None).unwrap();
+        let (server, mut client) = UnixStream::pair().unwrap();
+        client.write_all(&vec![b'x'; MAX_REQUEST + 1]).unwrap();
+        drop(client);
+        let err = serve(&daemon.state, server).unwrap_err();
+        assert!(err.to_string().contains("pipe"), "{err}");
     }
 
     #[test]
