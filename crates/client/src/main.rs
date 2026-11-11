@@ -42,10 +42,13 @@ fn parse_time(s: &str) -> Result<u64> {
     let mut secs: f64 = 0.0;
     for part in s.split(':') {
         let v: f64 = part.parse().with_context(|| format!("bad time {s:?}"))?;
+        if !v.is_finite() || v.is_sign_negative() {
+            bail!("bad time {s:?}");
+        }
         secs = secs * 60.0 + v;
     }
-    if secs < 0.0 {
-        bail!("negative time");
+    if !secs.is_finite() {
+        bail!("bad time {s:?}");
     }
     Ok((secs * 1000.0) as u64)
 }
@@ -157,6 +160,8 @@ fn fit(s: &str, width: usize) -> String {
     let len = s.chars().count();
     if len <= width {
         format!("{s}{}", " ".repeat(width - len))
+    } else if width < 3 {
+        s.chars().take(width).collect()
     } else {
         let cut: String = s.chars().take(width - 3).collect();
         format!("{cut}...")
@@ -258,6 +263,9 @@ mod tests {
         assert_eq!(parse_time("1:30").unwrap(), 90_000);
         assert_eq!(parse_time("1:00:05.5").unwrap(), 3_605_500);
         assert!(parse_time("x").is_err());
+        for bad in ["inf", "-inf", "NaN", "1e400", "1:-5", "-0", "1::2", ""] {
+            assert!(parse_time(bad).is_err(), "{bad:?} accepted");
+        }
     }
 
     #[test]
@@ -265,6 +273,8 @@ mod tests {
         assert_eq!(fit("ab", 4), "ab  ");
         assert_eq!(fit("Earl\u{2019}s Court 2004", 10), "Earl\u{2019}s ...");
         assert_eq!(fit("Earl\u{2019}s Court 2004", 10).chars().count(), 10);
+        assert_eq!(fit("abcdef", 2), "ab", "too narrow for an ellipsis");
+        assert_eq!(fit("abcdef", 0), "");
     }
 
     #[test]
@@ -279,5 +289,36 @@ mod tests {
             parse(&args(&["play"])).unwrap(),
             Command::Play { index: None }
         );
+    }
+}
+
+#[cfg(test)]
+mod props {
+    use proptest::prelude::*;
+
+    use super::{fit, parse, parse_time};
+
+    proptest! {
+        #[test]
+        fn fit_is_always_exactly_the_width(s in ".{0,80}", width in 0usize..100) {
+            prop_assert_eq!(fit(&s, width).chars().count(), width);
+        }
+
+        #[test]
+        fn parse_time_reads_clock_times(h in 0u64..100, m in 0u64..60, s in 0u64..60) {
+            let ms = ((h * 60 + m) * 60 + s) * 1000;
+            prop_assert_eq!(parse_time(&format!("{h}:{m:02}:{s:02}")).unwrap(), ms);
+            prop_assert_eq!(parse_time(&format!("{}", h * 3600 + m * 60 + s)).unwrap(), ms);
+        }
+
+        #[test]
+        fn parse_time_never_panics(s in ".{0,30}") {
+            let _ = parse_time(&s);
+        }
+
+        #[test]
+        fn parsing_arguments_never_panics(args in proptest::collection::vec(".{0,12}", 0..5)) {
+            let _ = parse(&args);
+        }
     }
 }

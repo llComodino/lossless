@@ -26,6 +26,21 @@ pub enum Command {
     Shutdown,
 }
 
+/// A command and, for `Player::send`, who waits for it to take effect.
+struct Envelope {
+    cmd: Command,
+    done: Option<mpsc::SyncSender<()>>,
+}
+
+impl Envelope {
+    fn shutdown() -> Self {
+        Self {
+            cmd: Command::Shutdown,
+            done: None,
+        }
+    }
+}
+
 /// What the player looks like right now.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
@@ -44,7 +59,7 @@ struct Shared {
 
 /// Handle to the playback thread. Dropping it shuts the thread down.
 pub struct Player {
-    tx: Sender<Command>,
+    tx: Sender<Envelope>,
     shared: Arc<Mutex<Shared>>,
     thread: Option<JoinHandle<()>>,
 }
@@ -75,8 +90,19 @@ impl Player {
         )
     }
 
+    /// Run `cmd` and return once it has taken effect and the resulting
+    /// status is published, so a `snapshot` right after sees it. While
+    /// playing, commands are taken between decoded chunks: the wait is at
+    /// most about one chunk.
     pub fn send(&self, cmd: Command) {
-        let _ = self.tx.send(cmd);
+        let (done, wait) = mpsc::sync_channel(1);
+        let env = Envelope {
+            cmd,
+            done: Some(done),
+        };
+        if self.tx.send(env).is_ok() {
+            let _ = wait.recv();
+        }
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -120,7 +146,7 @@ impl Shared {
 
 impl Drop for Player {
     fn drop(&mut self) {
-        let _ = self.tx.send(Command::Shutdown);
+        let _ = self.tx.send(Envelope::shutdown());
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
@@ -143,7 +169,7 @@ struct Worker<S: Sink> {
     /// track change, while the previous track's tail is still buffered).
     anchor_ms: u64,
     anchor_at: Instant,
-    rx: Receiver<Command>,
+    rx: Receiver<Envelope>,
     events: Sender<Event>,
     /// Events of the current step, sent only after the snapshot is
     /// published, so a client reacting to one never reads stale status.
@@ -154,7 +180,7 @@ struct Worker<S: Sink> {
 }
 
 impl<S: Sink> Worker<S> {
-    fn new(output: S, rx: Receiver<Command>) -> (Self, Receiver<Event>) {
+    fn new(output: S, rx: Receiver<Envelope>) -> (Self, Receiver<Event>) {
         let (events, events_rx) = mpsc::channel();
         let worker = Self {
             output,
@@ -180,21 +206,27 @@ impl<S: Sink> Worker<S> {
             // Idle: block until a command arrives. Playing: take whatever is
             // queued without waiting; the device paces the loop because
             // writes block until it has room.
-            let cmd = if self.state == PlayState::Playing {
+            let msg = if self.state == PlayState::Playing {
                 match self.rx.try_recv() {
-                    Ok(cmd) => Some(cmd),
+                    Ok(msg) => Some(msg),
                     Err(TryRecvError::Empty) => None,
-                    Err(TryRecvError::Disconnected) => Some(Command::Shutdown),
+                    Err(TryRecvError::Disconnected) => Some(Envelope::shutdown()),
                 }
             } else {
-                Some(self.rx.recv().unwrap_or(Command::Shutdown))
+                Some(self.rx.recv().unwrap_or_else(|_| Envelope::shutdown()))
             };
-            if let Some(cmd) = cmd {
+            if let Some(Envelope { cmd, done }) = msg {
                 if cmd == Command::Shutdown {
                     self.output.close();
                     return;
                 }
                 self.handle(cmd);
+                if self.dirty {
+                    self.publish();
+                }
+                if let Some(done) = done {
+                    let _ = done.send(());
+                }
             }
             self.step();
         }
@@ -910,6 +942,27 @@ mod tests {
     }
 
     #[test]
+    fn commands_take_effect_before_send_returns() {
+        let d = Dir::new();
+        let a = flac(&d, "a.flac", 44_100, 16, 2, 20 * BLOCK);
+        let (player, _events) = Player::spawn_with(crate::fixtures::PacedSink::default());
+        let state = |p: &Player| {
+            let s = p.snapshot().status;
+            (s.state, s.index)
+        };
+        player.send(Command::Add(vec![a.path.clone()]));
+        assert_eq!(player.snapshot().queue.len(), 1);
+        player.send(Command::Play(None));
+        assert_eq!(state(&player), (PlayState::Playing, Some(0)));
+        player.send(Command::Pause);
+        assert_eq!(state(&player), (PlayState::Paused, Some(0)));
+        player.send(Command::Seek { ms: 1_000 });
+        assert_eq!(player.snapshot().status.position_ms, 1_000);
+        player.send(Command::Stop);
+        assert_eq!(state(&player).0, PlayState::Stopped);
+    }
+
+    #[test]
     fn thread_wiring_and_shutdown() {
         let d = Dir::new();
         let a = flac(&d, "a.flac", 44_100, 16, 2, BLOCK);
@@ -929,5 +982,43 @@ mod tests {
         assert_eq!(snap.status.index, None);
         assert_eq!(snap.queue.len(), 1);
         drop(player);
+    }
+}
+
+#[cfg(test)]
+mod props {
+    use std::time::{Duration, Instant};
+
+    use lossless_proto::PlayState;
+    use proptest::prelude::*;
+
+    use super::Shared;
+
+    proptest! {
+        /// The derived position never goes backwards and never passes the
+        /// duration, whatever the anchor and the clock say.
+        #[test]
+        fn position_is_monotonic_and_bounded(
+            base in any::<u64>(),
+            duration in proptest::option::of(any::<u64>()),
+            mut a in 0u64..1 << 40,
+            mut b in 0u64..1 << 40,
+        ) {
+            if a > b {
+                std::mem::swap(&mut a, &mut b);
+            }
+            let mut shared = Shared::new();
+            let t0 = Instant::now();
+            shared.status.state = PlayState::Playing;
+            shared.status.position_ms = base;
+            shared.status.duration_ms = duration;
+            shared.anchor = Some(t0);
+            let pa = shared.at(t0 + Duration::from_millis(a)).status.position_ms;
+            let pb = shared.at(t0 + Duration::from_millis(b)).status.position_ms;
+            prop_assert!(pa <= pb);
+            if let Some(d) = duration {
+                prop_assert!(pb <= d.max(base.min(d)));
+            }
+        }
     }
 }

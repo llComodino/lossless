@@ -1,10 +1,15 @@
-//! Test-only FLAC fixtures with known samples.
+//! Test-only FLAC fixtures with known samples (feature `fixtures`).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 
+use anyhow::Result;
 use flacenc::component::BitRepr;
 use flacenc::error::Verify;
+use lossless_proto::StreamFormat;
+
+use crate::Sink;
 
 /// A generated FLAC file and the samples a bit-perfect decoder must return
 /// for it: interleaved, shifted to full-scale i32 like symphonia does.
@@ -43,6 +48,12 @@ impl Dir {
     }
 }
 
+impl Default for Dir {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Drop for Dir {
     fn drop(&mut self) {
         if std::env::var_os("LOSSLESS_KEEP_FIXTURES").is_none() {
@@ -75,6 +86,11 @@ pub const BLOCK: usize = 4096;
 /// Encode `frames` frames of noise as FLAC at `dir/name`. flacenc only
 /// accepts rates up to 96 kHz.
 pub fn flac(dir: &Dir, name: &str, rate: u32, bits: u16, channels: u16, frames: usize) -> Fixture {
+    flac_at(&dir.path(name), rate, bits, channels, frames)
+}
+
+/// Like `flac`, at any path (parent directories must exist).
+pub fn flac_at(path: &Path, rate: u32, bits: u16, channels: u16, frames: usize) -> Fixture {
     assert_eq!(frames % BLOCK, 0, "fixtures must be whole blocks");
     let raw = noise(
         rate ^ u32::from(bits) ^ frames as u32,
@@ -94,10 +110,9 @@ pub fn flac(dir: &Dir, name: &str, rate: u32, bits: u16, channels: u16, frames: 
         .expect("encoding fixture");
     let mut sink = flacenc::bitsink::ByteSink::new();
     stream.write(&mut sink).expect("serialising fixture");
-    let path = dir.path(name);
-    std::fs::write(&path, sink.as_slice()).unwrap();
+    std::fs::write(path, sink.as_slice()).unwrap();
     Fixture {
-        path,
+        path: path.to_path_buf(),
         rate,
         bits,
         channels,
@@ -109,4 +124,43 @@ pub fn write_bytes(dir: &Dir, name: &str, bytes: &[u8]) -> PathBuf {
     let path = dir.path(name);
     std::fs::write(&path, bytes).unwrap();
     path
+}
+
+/// A sink that takes audio at real-time speed, like a DAC, and discards it:
+/// lets tests run the real player thread with realistic timing and no
+/// hardware.
+#[derive(Default)]
+pub struct PacedSink {
+    format: Option<StreamFormat>,
+}
+
+impl Sink for PacedSink {
+    fn ensure(&mut self, src: StreamFormat) -> Result<StreamFormat> {
+        self.format = Some(src);
+        Ok(src)
+    }
+    fn format(&self) -> Option<StreamFormat> {
+        self.format
+    }
+    fn write(&mut self, samples: &[i32]) -> Result<()> {
+        if let Some(f) = self.format {
+            let frames = samples.len() as u64 / u64::from(f.channels.max(1));
+            std::thread::sleep(Duration::from_micros(
+                frames * 1_000_000 / u64::from(f.rate.max(1)),
+            ));
+        }
+        Ok(())
+    }
+    fn delay(&self) -> u64 {
+        0
+    }
+    fn discard(&mut self) -> Result<()> {
+        Ok(())
+    }
+    fn close(&mut self) {
+        self.format = None;
+    }
+    fn stop(&mut self) {
+        self.format = None;
+    }
 }

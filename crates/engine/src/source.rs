@@ -11,6 +11,40 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::units::{TimeBase, Timestamp};
 
+fn ratio(tb: TimeBase) -> (u32, u32) {
+    (tb.numer.get(), tb.denom.get())
+}
+
+/// Frames at `rate` for timestamp `ts` in time base `numer/denom` seconds
+/// (no time base: the timestamp is already in frames). Saturates rather than
+/// wrapping; can't overflow in u128 (i64 * u32 * u32 < 2^128).
+fn ts_to_frames(ts: i64, time_base: Option<(u32, u32)>, rate: u32) -> u64 {
+    let ts = ts.max(0) as u128;
+    let frames = match time_base {
+        Some((numer, denom)) => {
+            ts * u128::from(numer) * u128::from(rate) / u128::from(denom.max(1))
+        }
+        None => ts,
+    };
+    u64::try_from(frames).unwrap_or(u64::MAX)
+}
+
+/// Inverse of `ts_to_frames`, rounding up so the timestamp is never before
+/// `frame`. Exact for FLAC/MP3, whose time base is 1/rate.
+fn frames_to_ts(frame: u64, time_base: Option<(u32, u32)>, rate: u32) -> Option<i64> {
+    let ts = match time_base {
+        Some((numer, denom)) => {
+            let per = u128::from(numer) * u128::from(rate);
+            if per == 0 {
+                return None;
+            }
+            (u128::from(frame) * u128::from(denom)).div_ceil(per)
+        }
+        None => u128::from(frame),
+    };
+    i64::try_from(ts).ok()
+}
+
 /// One decoded file: interleaved full-scale i32 chunks, seekable to the frame.
 pub struct Source {
     reader: Box<dyn FormatReader>,
@@ -27,9 +61,22 @@ pub struct Source {
 impl Source {
     pub fn open(path: &Path) -> Result<Self> {
         let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-        let mss = MediaSourceStream::new(Box::new(file), Default::default());
+        let ext = path.extension().and_then(|e| e.to_str());
+        Self::from_media(Box::new(file), ext).with_context(|| path.display().to_string())
+    }
+
+    /// Decode a file held in memory; `ext` is a format hint ("flac", "mp3").
+    pub fn from_bytes(bytes: Vec<u8>, ext: Option<&str>) -> Result<Self> {
+        Self::from_media(Box::new(std::io::Cursor::new(bytes)), ext)
+    }
+
+    fn from_media(
+        media: Box<dyn symphonia::core::io::MediaSource>,
+        ext: Option<&str>,
+    ) -> Result<Self> {
+        let mss = MediaSourceStream::new(media, Default::default());
         let mut hint = Hint::new();
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        if let Some(ext) = ext {
             hint.with_extension(ext);
         }
         let reader = symphonia::default::get_probe()
@@ -39,10 +86,10 @@ impl Source {
                 FormatOptions::default(),
                 MetadataOptions::default(),
             )
-            .with_context(|| format!("probing {}", path.display()))?;
+            .context("probing format")?;
         let track = reader
             .default_track(TrackType::Audio)
-            .ok_or_else(|| anyhow!("no audio track in {}", path.display()))?;
+            .ok_or_else(|| anyhow!("no audio track"))?;
         let track_id = track.id;
         let time_base = track.time_base;
         let total_frames = track.num_frames;
@@ -54,7 +101,8 @@ impl Source {
             .clone();
         let rate = params
             .sample_rate
-            .ok_or_else(|| anyhow!("unknown sample rate"))?;
+            .filter(|&r| r > 0)
+            .ok_or_else(|| anyhow!("unknown or zero sample rate"))?;
         let channels = params
             .channels
             .as_ref()
@@ -82,14 +130,7 @@ impl Source {
     }
 
     fn ts_to_frames(&self, ts: Timestamp) -> u64 {
-        let ts = ts.get().max(0) as u128;
-        match self.time_base {
-            Some(tb) => {
-                (ts * u128::from(tb.numer.get()) * u128::from(self.format.rate)
-                    / u128::from(tb.denom.get())) as u64
-            }
-            None => ts as u64,
-        }
+        ts_to_frames(ts.get(), self.time_base.map(ratio), self.format.rate)
     }
 
     /// Next chunk of interleaved samples, or `None` at the end of the file.
@@ -120,18 +161,8 @@ impl Source {
         }
     }
 
-    /// Inverse of `ts_to_frames`, rounding up so the timestamp is never
-    /// before `frame`. Exact for FLAC/MP3, whose time base is 1/rate.
     fn frames_to_ts(&self, frame: u64) -> Option<Timestamp> {
-        let ts = match self.time_base {
-            Some(tb) => {
-                let num = u128::from(frame) * u128::from(tb.denom.get());
-                let den = u128::from(tb.numer.get()) * u128::from(self.format.rate);
-                num.div_ceil(den)
-            }
-            None => u128::from(frame),
-        };
-        i64::try_from(ts).ok().map(Timestamp::from)
+        frames_to_ts(frame, self.time_base.map(ratio), self.format.rate).map(Timestamp::from)
     }
 
     /// Seek so the next chunk starts exactly at `frame`. Returns that frame.
@@ -228,6 +259,18 @@ mod tests {
     }
 
     #[test]
+    fn decodes_from_memory_exactly() {
+        let d = Dir::new();
+        let f = flac(&d, "a.flac", 44_100, 16, 2, 2 * BLOCK);
+        let bytes = std::fs::read(&f.path).unwrap();
+        for ext in [Some("flac"), None] {
+            let mut src = Source::from_bytes(bytes.clone(), ext).unwrap();
+            assert!(decode_all(&mut src) == f.expected);
+        }
+        assert!(Source::from_bytes(Vec::new(), Some("flac")).is_err());
+    }
+
+    #[test]
     fn seek_past_end_is_an_error_not_a_panic() {
         let d = Dir::new();
         let f = flac(&d, "a.flac", 44_100, 16, 2, BLOCK);
@@ -247,6 +290,84 @@ mod tests {
         // A truncated file opens and decodes what is there without panicking.
         if let Ok(mut src) = Source::open(&cut) {
             while let Ok(Some(_)) = src.next_chunk() {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod props {
+    use proptest::prelude::*;
+
+    use super::{frames_to_ts, ts_to_frames};
+
+    /// Random values with the boundaries mixed in: plain random sampling
+    /// almost never produces 0 or MAX.
+    fn edgy_u32() -> impl Strategy<Value = u32> {
+        prop_oneof![
+            Just(0),
+            Just(1),
+            Just(u32::MAX),
+            Just(u32::MAX - 1),
+            any::<u32>()
+        ]
+    }
+
+    fn edgy_i64() -> impl Strategy<Value = i64> {
+        prop_oneof![
+            Just(0),
+            Just(-1),
+            Just(i64::MAX),
+            Just(i64::MIN),
+            any::<i64>()
+        ]
+    }
+
+    proptest! {
+        /// More timestamp never means fewer frames (a wrapping cast would).
+        #[test]
+        fn ts_to_frames_is_monotonic(
+            a in edgy_i64(),
+            b in edgy_i64(),
+            numer in edgy_u32().prop_filter("nonzero", |n| *n > 0),
+            denom in edgy_u32().prop_filter("nonzero", |n| *n > 0),
+            rate in edgy_u32(),
+        ) {
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            let tb = Some((numer, denom));
+            prop_assert!(ts_to_frames(lo, tb, rate) <= ts_to_frames(hi, tb, rate));
+        }
+
+        /// FLAC/MP3 time base (1/rate): timestamps are frames, both ways.
+        #[test]
+        fn native_time_base_is_identity(frame in 0u64..=i64::MAX as u64, rate in 1u32..=768_000) {
+            let tb = Some((1, rate));
+            prop_assert_eq!(frames_to_ts(frame, tb, rate), Some(frame as i64));
+            prop_assert_eq!(ts_to_frames(frame as i64, tb, rate), frame);
+        }
+
+        /// A seek target converted to a timestamp and back never lands
+        /// before the requested frame, for any time base and rate.
+        #[test]
+        fn seek_timestamp_never_lands_early(
+            frame in any::<u64>(),
+            numer in edgy_u32().prop_filter("nonzero", |n| *n > 0),
+            denom in edgy_u32().prop_filter("nonzero", |n| *n > 0),
+            rate in edgy_u32(),
+        ) {
+            if let Some(ts) = frames_to_ts(frame, Some((numer, denom)), rate) {
+                prop_assert!(ts_to_frames(ts, Some((numer, denom)), rate) >= frame);
+            }
+        }
+
+        #[test]
+        fn conversions_never_panic(
+            ts in edgy_i64(),
+            frame in prop_oneof![Just(0), Just(u64::MAX), any::<u64>()],
+            tb in proptest::option::of((1u32.., 1u32..)),
+            rate in edgy_u32(),
+        ) {
+            let _ = ts_to_frames(ts, tb, rate);
+            let _ = frames_to_ts(frame, tb, rate);
         }
     }
 }

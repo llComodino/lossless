@@ -41,11 +41,46 @@ pub fn collect(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Parse with the parser the extension names, never by sniffing content:
+/// lofty's sniffer routes bytes that look like ADTS to its AAC parser, which
+/// can loop forever on crafted input, and only FLAC and MP3 are indexed.
+fn parse<R: std::io::Read + std::io::Seek>(
+    reader: &mut R,
+    path: &Path,
+) -> Option<lofty::file::TaggedFile> {
+    use lofty::config::ParseOptions;
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    let opts = ParseOptions::new();
+    match ext.as_str() {
+        "flac" => lofty::flac::FlacFile::read_from(reader, opts)
+            .ok()
+            .map(Into::into),
+        "mp3" => lofty::mpeg::MpegFile::read_from(reader, opts)
+            .ok()
+            .map(Into::into),
+        _ => None,
+    }
+}
+
 /// Tags and audio properties of one file. Unreadable tags leave the fields
 /// empty rather than failing: the file may still play.
 pub fn read_track(path: &Path) -> Track {
+    let file = std::fs::File::open(path)
+        .ok()
+        .and_then(|f| parse(&mut std::io::BufReader::new(f), path));
+    describe(path.display().to_string(), file)
+}
+
+/// Like `read_track`, for a file already in memory. `path` is recorded and
+/// its extension picks the parser.
+pub fn read_track_from(path: &str, bytes: &[u8]) -> Track {
+    let file = parse(&mut std::io::Cursor::new(bytes), Path::new(path));
+    describe(path.to_string(), file)
+}
+
+fn describe(path: String, file: Option<lofty::file::TaggedFile>) -> Track {
     let mut track = Track {
-        path: path.display().to_string(),
+        path,
         title: None,
         artist: None,
         album: None,
@@ -53,7 +88,7 @@ pub fn read_track(path: &Path) -> Track {
         duration_ms: None,
         format: None,
     };
-    let Ok(file) = lofty::read_from_path(path) else {
+    let Some(file) = file else {
         return track;
     };
     let props = file.properties();
@@ -186,6 +221,67 @@ mod tests {
     }
 
     #[test]
+    fn tags_from_disk_and_memory_agree() {
+        use lossless_engine::fixtures::{BLOCK, Dir, flac};
+        let d = Dir::new();
+        let f = flac(&d, "a.flac", 96_000, 24, 2, 2 * BLOCK);
+        let on_disk = read_track(&f.path);
+        let bytes = std::fs::read(&f.path).unwrap();
+        let in_memory = read_track_from(&f.path.display().to_string(), &bytes);
+        assert_eq!(on_disk, in_memory);
+        let fmt = on_disk.format.expect("format");
+        assert_eq!((fmt.rate, fmt.bits, fmt.channels), (96_000, 24, 2));
+        assert_eq!(on_disk.duration_ms, Some(2 * BLOCK as u64 * 1000 / 96_000));
+        let junk = read_track_from("junk", &[0x5a; 64]);
+        assert_eq!(
+            (junk.format, junk.duration_ms, junk.title),
+            (None, None, None)
+        );
+    }
+
+    /// Found by the `tags` fuzzer: lofty's content sniffing calls these
+    /// ADTS/AAC-looking bytes and its AAC parser never returns (0.24 and
+    /// 0.25.5). Named .flac or .mp3 they must fail fast; anything else isn't
+    /// parsed at all.
+    #[test]
+    fn adts_looking_bytes_do_not_hang() {
+        let inputs: [&[u8]; 2] = [
+            &[
+                0x00, 0x00, 0x00, 0xd9, 0xff, 0xd9, 0xff, 0xf8, 0xf9, 0x00, 0x00, 0x00, 0xd9, 0xff,
+                0xd9, 0xff, 0xf8, 0xf9, 0x00, 0x00,
+            ],
+            &[
+                0xff, 0xf9, 0x00, 0x00, 0x00, 0x4b, 0xf0, 0xff, 0xf9, 0x00, 0x00, 0x00, 0x4b, 0x04,
+                0xff, 0xf9, 0x00, 0x08, 0x00, 0x00, 0x00, 0xff, 0xf9, 0x00, 0x10, 0x00, 0x00, 0x00,
+                0xf0,
+            ],
+        ];
+        for bytes in inputs {
+            for name in ["x.flac", "x.mp3", "x.aac", "x"] {
+                let bytes = bytes.to_vec();
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || tx.send(read_track_from(name, &bytes)).unwrap());
+                let t = rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap_or_else(|_| panic!("tag reader hung on {name}"));
+                assert_eq!(t.format, None);
+            }
+        }
+    }
+
+    #[test]
+    fn other_extensions_are_not_parsed() {
+        use lossless_engine::fixtures::{BLOCK, Dir, flac};
+        let d = Dir::new();
+        let f = flac(&d, "a.flac", 44_100, 16, 2, BLOCK);
+        let bytes = std::fs::read(&f.path).unwrap();
+        assert!(read_track_from("a.flac", &bytes).format.is_some());
+        assert!(read_track_from("a.FLAC", &bytes).format.is_some());
+        assert!(read_track_from("a.ogg", &bytes).format.is_none());
+        assert!(read_track_from("a", &bytes).format.is_none());
+    }
+
+    #[test]
     fn collect_skips_hidden_and_non_audio() {
         let root = std::env::temp_dir().join(format!("lossless-collect-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -207,5 +303,68 @@ mod tests {
             .collect();
         assert_eq!(names, ["album/01.FLAC", "album/02.flac"]);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod props {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    fn library(entries: &[(String, String, String)]) -> Library {
+        let mut lib = Library::default();
+        for (i, (artist, album, title)) in entries.iter().enumerate() {
+            lib.insert(Track {
+                path: format!("/m/{i}.flac"),
+                title: Some(title.clone()),
+                artist: Some(artist.clone()),
+                album: Some(album.clone()),
+                track_number: None,
+                duration_ms: None,
+                format: None,
+            });
+        }
+        lib
+    }
+
+    fn entries() -> impl Strategy<Value = Vec<(String, String, String)>> {
+        proptest::collection::vec((".{0,12}", ".{0,12}", ".{0,12}"), 0..20)
+    }
+
+    proptest! {
+        /// Every hit contains every query word, and nothing outside the
+        /// library comes back.
+        #[test]
+        fn hits_contain_every_word(es in entries(), query in ".{0,20}") {
+            let lib = library(&es);
+            let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+            let hits = lib.search(&query);
+            prop_assert!(hits.len() <= lib.len());
+            for hit in hits {
+                let i = lib.by_path[&hit.path];
+                for w in &words {
+                    prop_assert!(lib.haystack[i].contains(w.as_str()));
+                }
+            }
+        }
+
+        /// Search finds every track whose fields contain the query.
+        #[test]
+        fn search_finds_what_is_there(es in entries(), pick in any::<prop::sample::Index>()) {
+            prop_assume!(!es.is_empty());
+            let lib = library(&es);
+            let (_, _, title) = &es[pick.index(es.len())];
+            prop_assume!(!title.trim().is_empty());
+            let path = format!("/m/{}.flac", pick.index(es.len()));
+            prop_assert!(lib.search(title).iter().any(|t| t.path == path));
+        }
+
+        #[test]
+        fn ascii_search_ignores_case(es in entries(), query in "[a-zA-Z ]{0,10}") {
+            let lib = library(&es);
+            let paths = |q: &str| lib.search(q).iter().map(|t| t.path.clone()).collect::<Vec<_>>();
+            prop_assert_eq!(paths(&query.to_uppercase()), paths(&query.to_lowercase()));
+        }
     }
 }
