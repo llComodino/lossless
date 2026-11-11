@@ -218,6 +218,11 @@ fn add_reports_errors() {
         (e.code, e.message.as_str()),
         (ErrorCode::NotFound, "no playable files")
     );
+    let e = c.err(Command::Add {
+        paths: vec!["album/cover.jpg".into()],
+    });
+    assert_eq!(e.code, ErrorCode::NotFound);
+    assert!(e.message.ends_with("cover.jpg: not a flac or mp3 file"));
     // A failing path rejects the whole request.
     c.err(Command::Add {
         paths: vec!["album".into(), "nope".into()],

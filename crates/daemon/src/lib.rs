@@ -101,7 +101,7 @@ fn spawn_scan(
                 eprintln!("library: {tracks} tracks in {}", root.display());
                 broadcast(&subscribers, Event::LibraryChanged { tracks });
             }
-            Err(e) => eprintln!("library: scan failed: {e:#}"),
+            Err(e) => eprintln!("library: scan failed: {e}"),
         }
     }))
 }
@@ -184,7 +184,7 @@ impl State {
                 let mut tracks = Vec::new();
                 for p in &paths {
                     if let Err(e) = collect(&self.resolve(p), &mut tracks) {
-                        return fail(ErrorCode::NotFound, format!("{e:#}"));
+                        return Outcome::Err(e.to_wire());
                     }
                 }
                 if tracks.is_empty() {

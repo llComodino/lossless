@@ -437,11 +437,11 @@ dependencies = [
 name = "lossless-library"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "lofty",
  "lossless-engine",
  "lossless-proto",
  "proptest",
+ "thiserror",
 ]
 
 [[package]]

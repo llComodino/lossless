@@ -3,9 +3,12 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
 use lofty::prelude::*;
 use lossless_proto::{StreamFormat, Track};
+
+mod error;
+
+pub use error::{Error, Result};
 
 pub const AUDIO_EXTENSIONS: &[&str] = &["flac", "mp3"];
 
@@ -24,21 +27,48 @@ fn is_hidden(path: &Path) -> bool {
 /// Expand files and directories (recursively, sorted, skipping dot entries)
 /// into playable files.
 pub fn collect(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    let meta = std::fs::metadata(path).with_context(|| path.display().to_string())?;
+    let io = |source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    let meta = std::fs::metadata(path).map_err(|source| {
+        if source.kind() == std::io::ErrorKind::NotFound {
+            Error::NotFound {
+                path: path.to_path_buf(),
+            }
+        } else {
+            io(source)
+        }
+    })?;
     if meta.is_dir() {
-        let mut entries: Vec<PathBuf> = std::fs::read_dir(path)
-            .with_context(|| path.display().to_string())?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| !is_hidden(p))
-            .collect();
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(path).map_err(io)? {
+            let p = entry.map_err(io)?.path();
+            if !is_hidden(&p) {
+                entries.push(p);
+            }
+        }
         entries.sort();
         for entry in entries {
-            collect(&entry, out)?;
+            collect_nested(&entry, out)?;
         }
     } else if is_audio(path) {
         out.push(path.to_path_buf());
+    } else {
+        return Err(Error::NotPlayable {
+            path: path.to_path_buf(),
+        });
     }
     Ok(())
+}
+
+/// Inside a directory, non-audio files are skipped rather than rejected.
+fn collect_nested(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    if path.is_dir() || is_audio(path) {
+        collect(path, out)
+    } else {
+        Ok(())
+    }
 }
 
 /// Parse with the parser the extension names, never by sniffing content:
@@ -302,6 +332,51 @@ mod tests {
             .map(|p| p.strip_prefix(&root).unwrap().display().to_string())
             .collect();
         assert_eq!(names, ["album/01.FLAC", "album/02.flac"]);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn collect_errors_name_the_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("lossless-errs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("locked")).unwrap();
+        std::fs::write(root.join("cover.jpg"), b"").unwrap();
+        let mut out = Vec::new();
+
+        let missing = root.join("nope");
+        let e = collect(&missing, &mut out).unwrap_err();
+        assert!(matches!(&e, Error::NotFound { path } if *path == missing));
+        assert_eq!(e.code(), lossless_proto::ErrorCode::NotFound);
+        assert_eq!(
+            e.to_string(),
+            format!("{}: no such file or folder", missing.display())
+        );
+
+        let cover = root.join("cover.jpg");
+        let e = collect(&cover, &mut out).unwrap_err();
+        assert!(matches!(&e, Error::NotPlayable { path } if *path == cover));
+        assert_eq!(e.code(), lossless_proto::ErrorCode::NotFound);
+        assert_eq!(
+            e.to_string(),
+            format!("{}: not a flac or mp3 file", cover.display())
+        );
+
+        let locked = root.join("locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let res = collect(&locked, &mut out);
+        let scan = Library::scan(&locked);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let e = res.unwrap_err();
+        assert!(matches!(&e, Error::Io { path, .. } if *path == locked));
+        assert_eq!(e.code(), lossless_proto::ErrorCode::Io);
+        assert!(
+            e.to_string()
+                .starts_with(&format!("{}: ", locked.display()))
+        );
+        assert_eq!(e.to_wire().message, e.to_string());
+        assert!(scan.is_err());
+        assert!(out.is_empty());
         std::fs::remove_dir_all(&root).unwrap();
     }
 }
