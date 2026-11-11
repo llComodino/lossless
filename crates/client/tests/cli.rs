@@ -25,7 +25,8 @@ impl Server {
         std::fs::create_dir_all(dir.path("music/album")).unwrap();
         let listener = bind(&dir.path("sock")).unwrap();
         let (player, events) = Player::spawn_with(PacedSink::default());
-        let daemon = Daemon::start(player, events, Some(dir.path("music"))).unwrap();
+        let daemon =
+            Daemon::start(player, events, Some(dir.path("music")), Box::new(|| {})).unwrap();
         thread::spawn(move || daemon.serve(listener));
         Self { dir }
     }

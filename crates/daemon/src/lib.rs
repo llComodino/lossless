@@ -13,16 +13,17 @@ use anyhow::{Context, Result, bail};
 use lossless_engine::{Command as PlayerCmd, Player};
 use lossless_library::{Library, collect, read_track};
 use lossless_proto::{
-    Body, Command, ErrorCode, Event, Outcome, Request, ServerMessage, Track, WireError, decode,
-    encode,
+    Body, Command, Event, Outcome, Request, ServerMessage, Track, decode, encode,
 };
 
 mod config;
+mod error;
 
 use config::expand_tilde;
 pub use config::{
     Config, MAX_CONFIG, check_device, check_path, config_path, load_config, parse_config,
 };
+use error::RequestError;
 
 /// Bind the socket, owner-only. An existing path is replaced only if it is
 /// itself a stale socket: never a live daemon, a symlink or any other file.
@@ -64,11 +65,17 @@ fn broadcast(subscribers: &Subscribers, event: Event) {
     subs.retain(|w| send(w, &msg).is_ok());
 }
 
-/// Forward player events to every subscribed client, dropping dead ones.
-fn fan_out(events: Receiver<Event>, subscribers: Subscribers) {
+/// Forward player events to every subscribed client, dropping dead ones. The
+/// stream ends only when the player thread is gone, so `on_player_gone` runs.
+fn fan_out(
+    events: Receiver<Event>,
+    subscribers: Subscribers,
+    on_player_gone: Box<dyn FnOnce() + Send>,
+) {
     for event in events {
         broadcast(&subscribers, event);
     }
+    on_player_gone();
 }
 
 /// Clears a flag when dropped, including while unwinding from a panic.
@@ -132,26 +139,21 @@ impl State {
         }
     }
 
-    /// Start a scan; `None` if one is already running.
-    fn rescan(&self) -> Result<Option<thread::JoinHandle<()>>, String> {
-        let root = self
-            .music_dir
-            .clone()
-            .ok_or_else(|| "no music_dir configured".to_string())?;
-        Ok(spawn_scan(
+    /// Start a scan; `ScanRunning` if one is already running.
+    fn rescan(&self) -> Result<thread::JoinHandle<()>, RequestError> {
+        let root = self.music_dir.clone().ok_or(RequestError::NoMusicDir)?;
+        spawn_scan(
             root,
             Arc::clone(&self.library),
             Arc::clone(&self.scanning),
             Arc::clone(&self.subscribers),
-        ))
+        )
+        .ok_or(RequestError::ScanRunning)
     }
 
-    fn handle(&self, cmd: Command, writer: &Writer) -> Outcome {
-        let ok = |b| Outcome::Ok(b);
-        let play = |c| match self.player.send(c) {
-            Ok(()) => Outcome::Ok(Body::Done),
-            Err(e) => Outcome::Err(e.to_wire()),
-        };
+    fn handle(&self, cmd: Command, writer: &Writer) -> Result<Body, RequestError> {
+        let ok = Ok;
+        let play = |c| Ok(self.player.send(c).map(|()| Body::Done)?);
         match cmd {
             Command::Status => {
                 let snap = self.player.snapshot();
@@ -176,19 +178,14 @@ impl State {
                     lib.search(&query).into_iter().cloned().collect(),
                 ))
             }
-            Command::Update => match self.rescan() {
-                Ok(_) => ok(Body::Done),
-                Err(e) => fail(ErrorCode::NoMusicDir, e),
-            },
+            Command::Update => self.rescan().map(|_| Body::Done),
             Command::Add { paths } => {
                 let mut tracks = Vec::new();
                 for p in &paths {
-                    if let Err(e) = collect(&self.resolve(p), &mut tracks) {
-                        return Outcome::Err(e.to_wire());
-                    }
+                    collect(&self.resolve(p), &mut tracks)?;
                 }
                 if tracks.is_empty() {
-                    return fail(ErrorCode::NotFound, "no playable files");
+                    return Err(RequestError::NoPlayableFiles);
                 }
                 play(PlayerCmd::Add(tracks))
             }
@@ -215,17 +212,10 @@ impl State {
 /// client from making the daemon buffer an endless line.
 pub const MAX_REQUEST: usize = 64 * 1024;
 
-fn fail(code: ErrorCode, message: impl Into<String>) -> Outcome {
-    Outcome::Err(WireError {
-        code,
-        message: message.into(),
-    })
-}
-
 fn bad(msg: String) -> ServerMessage {
     ServerMessage::Reply {
         id: 0,
-        result: fail(ErrorCode::BadRequest, msg),
+        result: Outcome::Err(RequestError::BadRequest(msg).to_wire()),
     }
 }
 
@@ -258,7 +248,10 @@ fn serve(state: &State, stream: UnixStream) -> Result<()> {
         let reply = match decode::<Request>(line) {
             Ok(req) => ServerMessage::Reply {
                 id: req.id,
-                result: state.handle(req.command, &writer),
+                result: match state.handle(req.command, &writer) {
+                    Ok(body) => Outcome::Ok(body),
+                    Err(e) => Outcome::Err(e.to_wire()),
+                },
             },
             Err(e) => bad(format!("bad request: {e}")),
         };
@@ -278,7 +271,11 @@ pub fn run(config: &Path, default_socket: PathBuf) -> Result<()> {
         socket.display()
     );
     let (player, events) = Player::spawn(cfg.device);
-    let daemon = Daemon::start(player, events, cfg.music_dir)?;
+    let on_player_gone = Box::new(|| {
+        eprintln!("losslessd: player thread died; exiting");
+        std::process::exit(70);
+    });
+    let daemon = Daemon::start(player, events, cfg.music_dir, on_player_gone)?;
     if let Err(e) = daemon.rescan() {
         eprintln!("library: {e}");
     }
@@ -297,13 +294,14 @@ impl Daemon {
         player: Player,
         events: Receiver<Event>,
         music_dir: Option<PathBuf>,
+        on_player_gone: Box<dyn FnOnce() + Send>,
     ) -> Result<Self> {
         let subscribers = Arc::new(Mutex::new(Vec::new()));
         {
             let subs = Arc::clone(&subscribers);
             thread::Builder::new()
                 .name("events".into())
-                .spawn(move || fan_out(events, subs))?;
+                .spawn(move || fan_out(events, subs, on_player_gone))?;
         }
         Ok(Self {
             state: Arc::new(State {
@@ -318,7 +316,7 @@ impl Daemon {
 
     /// Start a background scan of the music directory, if there is one.
     pub fn rescan(&self) -> Result<(), String> {
-        self.state.rescan().map(drop)
+        self.state.rescan().map(drop).map_err(|e| e.to_string())
     }
 
     /// Accept clients until the listener fails; one thread per client.
@@ -354,9 +352,9 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, RwLock};
 
-    use lossless_engine::Player;
-    use lossless_engine::fixtures::{Dir, PacedSink};
-    use lossless_library::Library;
+    use lossless_engine::fixtures::{Dir, PacedSink, flac};
+    use lossless_engine::{Command as PlayerCmd, Player};
+    use lossless_library::{Library, collect};
 
     use super::{ClearOnDrop, Daemon, MAX_REQUEST, serve, spawn_scan};
 
@@ -386,7 +384,7 @@ mod tests {
     #[test]
     fn a_client_gone_before_its_error_reply_ends_only_its_session() {
         let (player, events) = Player::spawn_with(PacedSink::default());
-        let daemon = Daemon::start(player, events, None).unwrap();
+        let daemon = Daemon::start(player, events, None, Box::new(|| {})).unwrap();
         let (server, mut client) = UnixStream::pair().unwrap();
         client.write_all(&vec![b'x'; MAX_REQUEST + 1]).unwrap();
         drop(client);
@@ -397,7 +395,7 @@ mod tests {
     #[test]
     fn a_failed_accept_does_not_stop_serving() {
         let (player, events) = Player::spawn_with(PacedSink::default());
-        let daemon = Daemon::start(player, events, None).unwrap();
+        let daemon = Daemon::start(player, events, None, Box::new(|| {})).unwrap();
         let (server, mut client) = UnixStream::pair().unwrap();
         daemon.accept([
             Err(std::io::Error::other("too many open files")),
@@ -409,6 +407,47 @@ mod tests {
         let mut line = String::new();
         BufReader::new(client).read_line(&mut line).unwrap();
         assert!(line.contains("\"id\":7"), "{line}");
+    }
+
+    fn reply_line(daemon: &Daemon, request: &str) -> String {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        client.write_all(request.as_bytes()).unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        serve(&daemon.state, server).unwrap();
+        let mut line = String::new();
+        BufReader::new(client).read_line(&mut line).unwrap();
+        line
+    }
+
+    #[test]
+    fn update_while_scanning_is_scan_running() {
+        let (player, events) = Player::spawn_with(PacedSink::default());
+        let dir = Dir::new();
+        let daemon =
+            Daemon::start(player, events, Some(dir.path("music")), Box::new(|| {})).unwrap();
+        daemon.state.scanning.store(true, Ordering::SeqCst);
+        let line = reply_line(&daemon, "{\"id\":3,\"cmd\":\"update\"}\n");
+        assert!(line.contains("\"id\":3"), "{line}");
+        assert!(line.contains("\"code\":\"scan_running\""), "{line}");
+        assert!(line.contains("a scan is already running"), "{line}");
+        assert_eq!(daemon.rescan().unwrap_err(), "a scan is already running");
+    }
+
+    #[test]
+    fn player_death_is_reported() {
+        let dir = Dir::new();
+        let fixture = flac(&dir, "a.flac", 44_100, 16, 2, 4096);
+        let mut sink = PacedSink::default();
+        sink.die = true;
+        let (player, events) = Player::spawn_with(sink);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let gone = Box::new(move || tx.send(()).unwrap());
+        let daemon = Daemon::start(player, events, None, gone).unwrap();
+        let mut tracks = Vec::new();
+        collect(&fixture.path, &mut tracks).unwrap();
+        daemon.state.player.send(PlayerCmd::Add(tracks)).unwrap();
+        let _ = daemon.state.player.send(PlayerCmd::Play(None));
+        rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
     }
 
     #[test]

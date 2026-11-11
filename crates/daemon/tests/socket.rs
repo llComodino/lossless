@@ -32,7 +32,8 @@ impl Server {
         }
         let listener = bind(&dir.path("sock")).unwrap();
         let (player, events) = Player::spawn_with(PacedSink::default());
-        let daemon = Daemon::start(player, events, with_music.then_some(music)).unwrap();
+        let daemon =
+            Daemon::start(player, events, with_music.then_some(music), Box::new(|| {})).unwrap();
         thread::spawn(move || daemon.serve(listener));
         Self { dir }
     }
@@ -241,6 +242,39 @@ fn play_past_the_queue_is_out_of_range() {
     let e = c.err(Command::Play { index: Some(5) });
     assert_eq!(e.code, ErrorCode::OutOfRange);
     assert_eq!(e.message, "index 5 out of range: queue has 2 entries");
+}
+
+#[test]
+fn error_codes_name_the_problem() {
+    let s = Server::start(true);
+    let mut c = s.connect();
+    for line in [&b"garbage\n"[..], b"\xff\xfe\n"] {
+        c.raw(line);
+        let (id, result) = c.reply();
+        assert_eq!(id, 0);
+        assert!(matches!(result, Outcome::Err(e) if e.code == ErrorCode::BadRequest));
+    }
+    let mut big = UnixStream::connect(s.socket()).unwrap();
+    big.set_read_timeout(Some(WAIT)).unwrap();
+    let _ = big.write_all(&vec![b'x'; MAX_REQUEST + 10]);
+    let mut out = Vec::new();
+    let _ = big.read_to_end(&mut out);
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        out.is_empty() || text.contains("\"code\":\"bad_request\""),
+        "{text}"
+    );
+
+    let e = c.err(Command::Add {
+        paths: vec!["nope".into()],
+    });
+    assert_eq!(e.code, ErrorCode::NotFound);
+    let e = c.err(Command::Play { index: Some(9) });
+    assert_eq!(e.code, ErrorCode::OutOfRange);
+    assert_eq!(e.message, "index 9 out of range: queue has 0 entries");
+    let none = Server::start(false);
+    let e = none.connect().err(Command::Update);
+    assert_eq!(e.code, ErrorCode::NoMusicDir);
 }
 
 #[test]

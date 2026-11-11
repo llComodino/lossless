@@ -131,6 +131,8 @@ pub fn write_bytes(dir: &Dir, name: &str, bytes: &[u8]) -> PathBuf {
 #[derive(Default)]
 pub struct PacedSink {
     format: Option<StreamFormat>,
+    /// Panic on the first write, to simulate a crashing player thread.
+    pub die: bool,
 }
 
 impl Sink for PacedSink {
@@ -142,6 +144,7 @@ impl Sink for PacedSink {
         self.format
     }
     fn write(&mut self, samples: &[i32]) -> Result<()> {
+        assert!(!self.die, "sink died");
         if let Some(f) = self.format {
             let frames = samples.len() as u64 / u64::from(f.channels.max(1));
             std::thread::sleep(Duration::from_micros(
