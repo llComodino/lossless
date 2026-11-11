@@ -62,7 +62,33 @@ pub enum ServerMessage {
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
     Ok(Body),
-    Err(String),
+    Err(WireError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCode {
+    BadRequest,
+    NotFound,
+    OutOfRange,
+    NoMixer,
+    NoMusicDir,
+    ScanRunning,
+    Device,
+    Decode,
+    Io,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireError {
+    pub code: ErrorCode,
+    pub message: String,
+}
+
+impl std::fmt::Display for WireError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -90,6 +116,7 @@ pub enum Event {
     LibraryChanged {
         tracks: usize,
     },
+    Error(WireError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +138,8 @@ pub struct Status {
     /// The current queue entry, with tags when the library knows it.
     #[serde(default)]
     pub track: Option<Track>,
+    #[serde(default)]
+    pub last_error: Option<WireError>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,14 +223,6 @@ mod tests {
             encode(&ok).unwrap(),
             "{\"type\":\"reply\",\"id\":7,\"ok\":{\"kind\":\"done\"}}\n"
         );
-        let err = ServerMessage::Reply {
-            id: 8,
-            result: Outcome::Err("no such file".into()),
-        };
-        assert_eq!(
-            encode(&err).unwrap(),
-            "{\"type\":\"reply\",\"id\":8,\"err\":\"no such file\"}\n"
-        );
         let ev = ServerMessage::Event {
             event: Event::State {
                 state: PlayState::Playing,
@@ -213,6 +234,42 @@ mod tests {
             "{\"type\":\"event\",\"event\":\"state\",\"state\":\"playing\",\"position_ms\":1500}\n"
         );
         assert_eq!(decode::<ServerMessage>(&encode(&ev).unwrap()).unwrap(), ev);
+    }
+
+    #[test]
+    fn errors_on_the_wire() {
+        let m = ServerMessage::Reply {
+            id: 3,
+            result: Outcome::Err(WireError {
+                code: ErrorCode::OutOfRange,
+                message: "index 14 out of range: queue has 12 entries".into(),
+            }),
+        };
+        assert_eq!(
+            encode(&m).unwrap(),
+            r#"{"type":"reply","id":3,"err":{"code":"out_of_range","message":"index 14 out of range: queue has 12 entries"}}"#.to_owned() + "\n"
+        );
+        let e = ServerMessage::Event {
+            event: Event::Error(WireError {
+                code: ErrorCode::Decode,
+                message: "x.flac: bad frame".into(),
+            }),
+        };
+        assert_eq!(
+            encode(&e).unwrap(),
+            r#"{"type":"event","event":"error","code":"decode","message":"x.flac: bad frame"}"#
+                .to_owned()
+                + "\n"
+        );
+        assert_eq!(decode::<ServerMessage>(&encode(&e).unwrap()).unwrap(), e);
+        assert_eq!(
+            WireError {
+                code: ErrorCode::Io,
+                message: "boom".into()
+            }
+            .to_string(),
+            "boom"
+        );
     }
 }
 
@@ -290,17 +347,34 @@ mod props {
             of(any::<u64>()),
             of(format()),
             of(track()),
+            of(wire_error()),
         )
             .prop_map(
-                |(state, index, position_ms, duration_ms, output, track)| Status {
+                |(state, index, position_ms, duration_ms, output, track, last_error)| Status {
                     state,
                     index,
                     position_ms,
                     duration_ms,
                     output,
                     track,
+                    last_error,
                 },
             )
+    }
+
+    fn wire_error() -> impl Strategy<Value = WireError> {
+        let code = prop_oneof![
+            Just(ErrorCode::BadRequest),
+            Just(ErrorCode::NotFound),
+            Just(ErrorCode::OutOfRange),
+            Just(ErrorCode::NoMixer),
+            Just(ErrorCode::NoMusicDir),
+            Just(ErrorCode::ScanRunning),
+            Just(ErrorCode::Device),
+            Just(ErrorCode::Decode),
+            Just(ErrorCode::Io),
+        ];
+        (code, any::<String>()).prop_map(|(code, message)| WireError { code, message })
     }
 
     fn event() -> impl Strategy<Value = Event> {
@@ -310,6 +384,7 @@ mod props {
             of(any::<usize>()).prop_map(|index| Event::TrackChanged { index }),
             Just(Event::QueueChanged),
             any::<usize>().prop_map(|tracks| Event::LibraryChanged { tracks }),
+            wire_error().prop_map(Event::Error),
         ]
     }
 
@@ -322,7 +397,7 @@ mod props {
         ];
         let outcome = prop_oneof![
             body.prop_map(Outcome::Ok),
-            any::<String>().prop_map(Outcome::Err)
+            wire_error().prop_map(Outcome::Err)
         ];
         prop_oneof![
             (any::<u64>(), outcome).prop_map(|(id, result)| ServerMessage::Reply { id, result }),

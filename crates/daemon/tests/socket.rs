@@ -12,7 +12,8 @@ use lossless_daemon::{Daemon, MAX_REQUEST, bind, parse_config};
 use lossless_engine::Player;
 use lossless_engine::fixtures::{BLOCK, Dir, PacedSink, flac_at};
 use lossless_proto::{
-    Body, Command, Event, Outcome, PlayState, Request, ServerMessage, decode, encode,
+    Body, Command, ErrorCode, Event, Outcome, PlayState, Request, ServerMessage, WireError, decode,
+    encode,
 };
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -128,7 +129,7 @@ impl Client {
         }
     }
 
-    fn err(&mut self, command: Command) -> String {
+    fn err(&mut self, command: Command) -> WireError {
         match self.call(command) {
             Outcome::Err(e) => e,
             Outcome::Ok(body) => panic!("unexpected success: {body:?}"),
@@ -202,15 +203,21 @@ fn add_reports_errors() {
         c.err(Command::Add {
             paths: vec!["nope".into()]
         })
+        .message
         .contains("nope")
     );
+    let e = c.err(Command::Add {
+        paths: vec!["empty".into()],
+    });
     assert_eq!(
-        c.err(Command::Add {
-            paths: vec!["empty".into()]
-        }),
-        "no playable files"
+        (e.code, e.message.as_str()),
+        (ErrorCode::NotFound, "no playable files")
     );
-    assert_eq!(c.err(Command::Add { paths: vec![] }), "no playable files");
+    let e = c.err(Command::Add { paths: vec![] });
+    assert_eq!(
+        (e.code, e.message.as_str()),
+        (ErrorCode::NotFound, "no playable files")
+    );
     // A failing path rejects the whole request.
     c.err(Command::Add {
         paths: vec!["album".into(), "nope".into()],
@@ -248,7 +255,11 @@ fn update_scans_and_search_finds() {
 fn update_without_music_dir_is_an_error() {
     let s = Server::start(false);
     let mut c = s.connect();
-    assert_eq!(c.err(Command::Update), "no music_dir configured");
+    let e = c.err(Command::Update);
+    assert_eq!(
+        (e.code, e.message.as_str()),
+        (ErrorCode::NoMusicDir, "no music_dir configured")
+    );
 }
 
 #[test]
@@ -327,7 +338,10 @@ fn bad_requests_get_errors_and_the_connection_survives() {
         c.raw(line);
         let (id, result) = c.reply();
         assert_eq!(id, 0);
-        assert!(matches!(result, Outcome::Err(_)), "{line:?} accepted");
+        match result {
+            Outcome::Err(e) => assert_eq!(e.code, ErrorCode::BadRequest, "{line:?}"),
+            Outcome::Ok(_) => panic!("{line:?} accepted"),
+        }
     }
     c.raw(b"\n   \n");
     assert_eq!(status(&mut c).state, PlayState::Stopped);

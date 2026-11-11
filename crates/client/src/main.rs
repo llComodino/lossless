@@ -185,6 +185,7 @@ fn print_event(e: &Event) {
         },
         Event::QueueChanged => out!("queue changed"),
         Event::LibraryChanged { tracks } => out!("library {tracks} tracks"),
+        Event::Error(e) => out!("error: {}", e.message),
     }
 }
 
@@ -218,7 +219,7 @@ fn main() -> Result<()> {
         }
         match decode::<ServerMessage>(&line)? {
             ServerMessage::Reply { id: 1, result } => match result {
-                Outcome::Err(e) => bail!("{e}"),
+                Outcome::Err(e) => bail!("{}", e.message),
                 Outcome::Ok(body) => {
                     if !json {
                         match body {

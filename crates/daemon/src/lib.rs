@@ -13,7 +13,8 @@ use anyhow::{Context, Result, bail};
 use lossless_engine::{Command as PlayerCmd, Player};
 use lossless_library::{Library, collect, read_track};
 use lossless_proto::{
-    Body, Command, Event, Outcome, Request, ServerMessage, Track, decode, encode,
+    Body, Command, ErrorCode, Event, Outcome, Request, ServerMessage, Track, WireError, decode,
+    encode,
 };
 
 mod config;
@@ -177,17 +178,17 @@ impl State {
             }
             Command::Update => match self.rescan() {
                 Ok(_) => ok(Body::Done),
-                Err(e) => Outcome::Err(e),
+                Err(e) => fail(ErrorCode::NoMusicDir, e),
             },
             Command::Add { paths } => {
                 let mut tracks = Vec::new();
                 for p in &paths {
                     if let Err(e) = collect(&self.resolve(p), &mut tracks) {
-                        return Outcome::Err(format!("{e:#}"));
+                        return fail(ErrorCode::NotFound, format!("{e:#}"));
                     }
                 }
                 if tracks.is_empty() {
-                    return Outcome::Err("no playable files".into());
+                    return fail(ErrorCode::NotFound, "no playable files");
                 }
                 self.player.send(PlayerCmd::Add(tracks));
                 ok(Body::Done)
@@ -215,10 +216,17 @@ impl State {
 /// client from making the daemon buffer an endless line.
 pub const MAX_REQUEST: usize = 64 * 1024;
 
+fn fail(code: ErrorCode, message: impl Into<String>) -> Outcome {
+    Outcome::Err(WireError {
+        code,
+        message: message.into(),
+    })
+}
+
 fn bad(msg: String) -> ServerMessage {
     ServerMessage::Reply {
         id: 0,
-        result: Outcome::Err(msg),
+        result: fail(ErrorCode::BadRequest, msg),
     }
 }
 

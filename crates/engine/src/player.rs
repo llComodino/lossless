@@ -120,6 +120,7 @@ impl Shared {
                 duration_ms: None,
                 output: None,
                 track: None,
+                last_error: None,
             },
             queue: Arc::from(Vec::new()),
             anchor: None,
@@ -293,6 +294,7 @@ impl<S: Sink> Worker<S> {
             duration_ms,
             output: self.output.format(),
             track: None,
+            last_error: None,
         };
         shared.anchor = (self.state == PlayState::Playing).then_some(self.anchor_at);
         if self.queue_dirty {
