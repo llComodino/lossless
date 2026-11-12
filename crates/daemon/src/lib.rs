@@ -314,6 +314,7 @@ fn serve(state: &State, stream: UnixStream) -> Result<()> {
     let mut buf = Vec::new();
     loop {
         buf.clear();
+        buf.shrink_to(64 * 1024);
         let n = (&mut reader)
             .take(MAX_REQUEST as u64 + 1)
             .read_until(b'\n', &mut buf)?;
