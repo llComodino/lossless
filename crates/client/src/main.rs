@@ -355,6 +355,7 @@ mod tests {
             artist: artist.map(Into::into),
             album: album.map(Into::into),
             track_number: None,
+            disc_number: None,
             duration_ms: None,
             format: None,
         }

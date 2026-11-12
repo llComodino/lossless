@@ -155,7 +155,7 @@ impl Client {
 
 fn status(c: &mut Client) -> lossless_proto::Status {
     match c.ok(Command::Status) {
-        Body::Status(s) => s,
+        Body::Status(s) => *s,
         other => panic!("not a status: {other:?}"),
     }
 }

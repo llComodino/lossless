@@ -180,7 +180,7 @@ impl State {
                     .index
                     .and_then(|i| snap.queue.get(i))
                     .map(|p| self.track(p));
-                Ok(Body::Status(status))
+                Ok(Body::Status(Box::new(status)))
             }
             Command::Queue => Ok(Body::Queue(
                 self.player

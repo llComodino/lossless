@@ -125,7 +125,7 @@ impl std::fmt::Display for WireError {
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum Body {
     Done,
-    Status(Status),
+    Status(Box<Status>),
     Queue(Vec<Track>),
     Tracks(Vec<Track>),
 }
@@ -195,6 +195,8 @@ pub struct Track {
     pub album: Option<String>,
     #[serde(default)]
     pub track_number: Option<u32>,
+    #[serde(default)]
+    pub disc_number: Option<u32>,
     pub duration_ms: Option<u64>,
     pub format: Option<StreamFormat>,
 }
@@ -398,18 +400,22 @@ mod props {
             of(any::<String>()),
             of(any::<String>()),
             of(any::<u32>()),
+            of(any::<u32>()),
             of(any::<u64>()),
             of(format()),
         )
             .prop_map(
-                |(path, title, artist, album, track_number, duration_ms, format)| Track {
-                    path,
-                    title,
-                    artist,
-                    album,
-                    track_number,
-                    duration_ms,
-                    format,
+                |(path, title, artist, album, track_number, disc_number, duration_ms, format)| {
+                    Track {
+                        path,
+                        title,
+                        artist,
+                        album,
+                        track_number,
+                        disc_number,
+                        duration_ms,
+                        format,
+                    }
                 },
             )
     }
@@ -525,7 +531,7 @@ mod props {
     fn message() -> impl Strategy<Value = ServerMessage> {
         let body = prop_oneof![
             Just(Body::Done),
-            status().prop_map(Body::Status),
+            status().prop_map(|s| Body::Status(Box::new(s))),
             proptest::collection::vec(track(), 0..3).prop_map(Body::Queue),
             proptest::collection::vec(track(), 0..3).prop_map(Body::Tracks),
         ];
