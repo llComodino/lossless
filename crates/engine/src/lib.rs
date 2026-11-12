@@ -5,6 +5,8 @@ mod error;
 pub mod fixtures;
 mod output;
 mod player;
+#[cfg_attr(not(test), allow(dead_code))]
+mod queue;
 mod source;
 
 pub use error::{Error, Result};
