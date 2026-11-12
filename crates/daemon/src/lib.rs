@@ -87,30 +87,42 @@ fn saved(snap: &Snapshot) -> state::Saved {
 }
 
 /// Forward player events to every subscribed client, dropping dead ones, and
-/// save the state on events that change it (before broadcasting, so a client
-/// that saw the event can rely on the file). The stream ends only when the
+/// save the state once per batch of queued events if any changes it (before
+/// broadcasting, so a client that saw the event can rely on the file). The stream ends only when the
 /// player thread is gone, so `on_player_gone` runs.
 fn fan_out(
     events: Receiver<Event>,
-    daemon: Weak<State>,
+    mut save: impl FnMut(),
     subscribers: Subscribers,
     on_player_gone: Box<dyn FnOnce() + Send>,
 ) {
-    for event in events {
-        if matches!(
-            event,
-            Event::QueueChanged
-                | Event::TrackChanged { .. }
-                | Event::State { .. }
-                | Event::Mode { .. }
-        ) && let Some(d) = daemon.upgrade()
-            && let Err(e) = state::save(&d.state_file, &saved(&d.player.snapshot()))
-        {
-            warn!("state: saving {}: {e}", d.state_file.display());
+    while let Ok(first) = events.recv() {
+        let batch: Vec<Event> = std::iter::once(first).chain(events.try_iter()).collect();
+        if batch.iter().any(|e| {
+            matches!(
+                e,
+                Event::QueueChanged
+                    | Event::TrackChanged { .. }
+                    | Event::State { .. }
+                    | Event::Mode { .. }
+            )
+        }) {
+            save();
         }
-        broadcast(&subscribers, event);
+        for event in batch {
+            broadcast(&subscribers, event);
+        }
     }
     on_player_gone();
+}
+
+/// Save the daemon's current state, if it is still running.
+fn save_state(daemon: &Weak<State>) {
+    if let Some(d) = daemon.upgrade()
+        && let Err(e) = state::save(&d.state_file, &saved(&d.player.snapshot()))
+    {
+        warn!("state: saving {}: {e}", d.state_file.display());
+    }
 }
 
 /// Clears a flag when dropped, including while unwinding from a panic.
@@ -428,7 +440,14 @@ impl Daemon {
         let weak = Arc::downgrade(&state);
         thread::Builder::new()
             .name("events".into())
-            .spawn(move || fan_out(events, weak, subscribers, on_player_gone))?;
+            .spawn(move || {
+                fan_out(
+                    events,
+                    move || save_state(&weak),
+                    subscribers,
+                    on_player_gone,
+                )
+            })?;
         Ok(Self { state })
     }
 
@@ -638,6 +657,42 @@ mod tests {
         assert_eq!(s.queue[1], PathBuf::from("/m/a.flac"));
         assert!(s.queue[0].to_str().is_some());
         assert_eq!(s.index, Some(1));
+    }
+
+    /// Saves made while fanning out the events `cmd` produced.
+    fn saves_for(cmd: PlayerCmd) -> usize {
+        let dir = Dir::new();
+        let a = flac(&dir, "a.flac", 44_100, 16, 2, 4 * 4096).path;
+        let (player, events) = Player::spawn_with(PacedSink::default());
+        player
+            .send(PlayerCmd::Add {
+                paths: vec![a.clone()],
+                at: None,
+            })
+            .unwrap();
+        while events.try_recv().is_ok() {}
+        player.send(cmd).unwrap();
+        drop(player);
+        let mut saves = 0;
+        let subs = Arc::new(Mutex::new(Vec::new()));
+        super::fan_out(events, || saves += 1, subs, Box::new(|| {}));
+        saves
+    }
+
+    #[test]
+    fn one_save_per_batch_of_events() {
+        assert_eq!(saves_for(PlayerCmd::Clear), 1);
+        let dir = Dir::new();
+        let a = flac(&dir, "a.flac", 44_100, 16, 2, 4 * 4096).path;
+        let restore = PlayerCmd::Restore {
+            queue: vec![a],
+            index: Some(0),
+            position_ms: 20,
+            repeat: Repeat::Off,
+            random: false,
+        };
+        assert_eq!(saves_for(restore), 1);
+        assert_eq!(saves_for(PlayerCmd::VolumeChanged(5)), 0);
     }
 
     #[test]
