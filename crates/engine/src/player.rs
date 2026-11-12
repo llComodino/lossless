@@ -4,10 +4,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use lossless_proto::{Event, PlayState, Status};
+use lossless_proto::{Event, PlayState, Status, WireError};
 
 use crate::output::{Output, Sink};
 use crate::source::Source;
+use crate::{Error, Result};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
@@ -29,7 +30,7 @@ pub enum Command {
 /// A command and, for `Player::send`, who waits for it to take effect.
 struct Envelope {
     cmd: Command,
-    done: Option<mpsc::SyncSender<()>>,
+    done: Option<mpsc::SyncSender<Result<()>>>,
 }
 
 impl Envelope {
@@ -93,15 +94,17 @@ impl Player {
     /// Run `cmd` and return once it has taken effect and the resulting
     /// status is published, so a `snapshot` right after sees it. While
     /// playing, commands are taken between decoded chunks: the wait is at
-    /// most about one chunk.
-    pub fn send(&self, cmd: Command) {
+    /// most about one chunk. Fails with what the command itself got wrong
+    /// (e.g. an index past the queue); playback problems arrive as events.
+    pub fn send(&self, cmd: Command) -> Result<()> {
         let (done, wait) = mpsc::sync_channel(1);
         let env = Envelope {
             cmd,
             done: Some(done),
         };
-        if self.tx.send(env).is_ok() {
-            let _ = wait.recv();
+        match self.tx.send(env) {
+            Ok(()) => wait.recv().unwrap_or(Ok(())),
+            Err(_) => Ok(()),
         }
     }
 
@@ -120,6 +123,7 @@ impl Shared {
                 duration_ms: None,
                 output: None,
                 track: None,
+                last_error: None,
             },
             queue: Arc::from(Vec::new()),
             anchor: None,
@@ -174,6 +178,10 @@ struct Worker<S: Sink> {
     /// Events of the current step, sent only after the snapshot is
     /// published, so a client reacting to one never reads stale status.
     pending: Vec<Event>,
+    /// The last recovery failure, until a track loads cleanly.
+    last_error: Option<WireError>,
+    /// Set while recovering from a failure, so the load that follows keeps it.
+    keep_error: bool,
     shared: Arc<Mutex<Shared>>,
     dirty: bool,
     queue_dirty: bool,
@@ -194,6 +202,8 @@ impl<S: Sink> Worker<S> {
             rx,
             events,
             pending: Vec::new(),
+            last_error: None,
+            keep_error: false,
             shared: Arc::new(Mutex::new(Shared::new())),
             dirty: false,
             queue_dirty: false,
@@ -220,12 +230,12 @@ impl<S: Sink> Worker<S> {
                     self.output.close();
                     return;
                 }
-                self.handle(cmd);
+                let result = self.handle(cmd);
                 if self.dirty {
                     self.publish();
                 }
                 if let Some(done) = done {
-                    let _ = done.send(());
+                    let _ = done.send(result);
                 }
             }
             self.step();
@@ -244,8 +254,17 @@ impl<S: Sink> Worker<S> {
     }
 
     fn emit(&mut self, event: Event) {
+        log::debug!("player: {event:?}");
         self.dirty = true;
         self.pending.push(event);
+    }
+
+    /// Tell clients about a failure the player recovered from on its own.
+    fn fail(&mut self, err: &Error) {
+        log::warn!("{err}");
+        let wire = err.to_wire();
+        self.last_error = Some(wire.clone());
+        self.emit(Event::Error(wire));
     }
 
     fn rate(&self) -> u64 {
@@ -293,6 +312,7 @@ impl<S: Sink> Worker<S> {
             duration_ms,
             output: self.output.format(),
             track: None,
+            last_error: self.last_error.clone(),
         };
         shared.anchor = (self.state == PlayState::Playing).then_some(self.anchor_at);
         if self.queue_dirty {
@@ -315,7 +335,7 @@ impl<S: Sink> Worker<S> {
             Ok(Some(chunk)) => {
                 let frames = chunk.len() as u64 / channels;
                 if let Err(e) = self.output.write(chunk) {
-                    eprintln!("output: {e:#}");
+                    self.fail(&e);
                     self.halt();
                     return;
                 }
@@ -323,8 +343,10 @@ impl<S: Sink> Worker<S> {
             }
             Ok(None) => self.advance(),
             Err(e) => {
-                eprintln!("decode: {e:#}");
+                self.fail(&e);
+                self.keep_error = true;
                 self.advance();
+                self.keep_error = false;
             }
         }
     }
@@ -354,10 +376,15 @@ impl<S: Sink> Worker<S> {
     /// Open queue entry `index` (heard from `starts_at`) and make the output
     /// ready for it, skipping entries that can't be opened.
     fn load(&mut self, mut index: usize, starts_at: Instant) {
+        let mut skipped = false;
         while index < self.queue.len() {
             match Source::open(&self.queue[index]) {
                 Ok(source) => match self.output.ensure(source.format) {
                     Ok(_) => {
+                        if !skipped && !self.keep_error {
+                            self.last_error = None;
+                            self.dirty = true;
+                        }
                         self.source = Some(source);
                         self.index = Some(index);
                         self.written = 0;
@@ -367,12 +394,13 @@ impl<S: Sink> Worker<S> {
                         return;
                     }
                     Err(e) => {
-                        eprintln!("output: {e:#}");
+                        self.fail(&e);
                         return self.halt();
                     }
                 },
                 Err(e) => {
-                    eprintln!("skipping {}: {e:#}", self.queue[index].display());
+                    self.fail(&e);
+                    skipped = true;
                     index += 1;
                 }
             }
@@ -411,14 +439,15 @@ impl<S: Sink> Worker<S> {
         if let Some(source) = self.source.as_mut() {
             match source.seek(heard) {
                 Ok(at) => self.written = at,
-                Err(e) => eprintln!("seek: {e:#}"),
+                Err(e) => self.fail(&e),
             }
         }
         let _ = self.output.discard();
         self.anchor_ms = self.frames_to_ms(self.written);
     }
 
-    fn handle(&mut self, cmd: Command) {
+    fn handle(&mut self, cmd: Command) -> Result<()> {
+        log::debug!("player: {cmd:?}");
         match cmd {
             Command::Add(paths) => {
                 self.queue.extend(paths);
@@ -438,7 +467,12 @@ impl<S: Sink> Worker<S> {
                 self.emit(Event::TrackChanged { index: None });
             }
             Command::Play(Some(i)) if i < self.queue.len() => self.jump(i, true),
-            Command::Play(Some(_)) => {}
+            Command::Play(Some(index)) => {
+                return Err(Error::OutOfRange {
+                    index,
+                    len: self.queue.len(),
+                });
+            }
             Command::Play(None) => match self.state {
                 PlayState::Playing => {}
                 PlayState::Paused => self.set_state(PlayState::Playing),
@@ -459,7 +493,7 @@ impl<S: Sink> Worker<S> {
                 } else {
                     Command::Play(None)
                 };
-                self.handle(next);
+                return self.handle(next);
             }
             Command::Stop => {
                 self.output.stop();
@@ -469,14 +503,16 @@ impl<S: Sink> Worker<S> {
                 self.anchor(0, Instant::now());
             }
             Command::Next | Command::Previous => {
-                let Some(i) = self.index else { return };
+                let Some(i) = self.index else {
+                    return Ok(());
+                };
                 let target = if cmd == Command::Next {
                     i + 1
                 } else {
                     i.saturating_sub(1)
                 };
                 if target >= self.queue.len() {
-                    return;
+                    return Ok(());
                 }
                 if self.state == PlayState::Stopped {
                     self.index = Some(target);
@@ -490,12 +526,13 @@ impl<S: Sink> Worker<S> {
             }
             Command::Seek { ms } => {
                 let Some(source) = self.source.as_mut() else {
-                    return;
+                    return Ok(());
                 };
                 let frame = ms.saturating_mul(u64::from(source.format.rate)) / 1000;
                 if source.total_frames.is_some_and(|total| frame >= total) {
                     let _ = self.output.discard();
-                    return self.advance();
+                    self.advance();
+                    return Ok(());
                 }
                 match source.seek(frame) {
                     Ok(at) => {
@@ -504,11 +541,12 @@ impl<S: Sink> Worker<S> {
                         let ms = self.frames_to_ms(at);
                         self.anchor(ms, Instant::now());
                     }
-                    Err(e) => eprintln!("seek: {e:#}"),
+                    Err(e) => return Err(e),
                 }
             }
             Command::Shutdown => {}
         }
+        Ok(())
     }
 }
 
@@ -517,12 +555,12 @@ mod tests {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    use anyhow::{Result, bail};
-    use lossless_proto::{Event, PlayState, StreamFormat};
+    use lossless_proto::{ErrorCode, Event, PlayState, StreamFormat};
 
-    use super::{Command, Player, Shared, Worker};
+    use super::{Command, Player, Shared, Worker, lock};
     use crate::fixtures::{BLOCK, Dir, Fixture, flac, write_bytes};
     use crate::output::Sink;
+    use crate::{Error, Result};
 
     /// Records what reaches the "speaker". The last `delay` frames written
     /// since the previous discard count as buffered: a discard or stop drops
@@ -553,7 +591,10 @@ mod tests {
     impl Sink for FakeSink {
         fn ensure(&mut self, src: StreamFormat) -> Result<StreamFormat> {
             if self.fail_ensure {
-                bail!("device gone");
+                return Err(Error::Device {
+                    device: "fake".into(),
+                    reason: "device gone".into(),
+                });
             }
             if self.open != Some(src) {
                 self.open = Some(src);
@@ -566,7 +607,10 @@ mod tests {
         }
         fn write(&mut self, samples: &[i32]) -> Result<()> {
             if self.fail_write {
-                bail!("write failed");
+                return Err(Error::Device {
+                    device: "fake".into(),
+                    reason: "write failed".into(),
+                });
             }
             let ch = self.open.expect("write while closed").channels as usize;
             self.heard.extend_from_slice(samples);
@@ -653,8 +697,9 @@ mod tests {
             b.path.clone(),
             c.path.clone(),
             e.path.clone(),
-        ]));
-        w.handle(Command::Play(None));
+        ]))
+        .unwrap();
+        w.handle(Command::Play(None)).unwrap();
         drive(&mut w);
         assert!(
             w.output.heard == concat(&[&a, &b, &c, &e]),
@@ -681,10 +726,10 @@ mod tests {
         let d = Dir::new();
         let a = flac(&d, "a.flac", 44_100, 16, 2, BLOCK);
         let (mut w, events) = worker(FakeSink::default());
-        w.handle(Command::Add(vec![a.path.clone()]));
+        w.handle(Command::Add(vec![a.path.clone()])).unwrap();
         w.publish();
         let _ = states(&events);
-        w.handle(Command::Play(None));
+        w.handle(Command::Play(None)).unwrap();
         assert!(states(&events).is_empty(), "nothing sent before publishing");
         w.publish();
         assert_eq!(states(&events), [(PlayState::Playing, 0)]);
@@ -698,13 +743,13 @@ mod tests {
             delay: 1_000,
             ..FakeSink::default()
         });
-        w.handle(Command::Add(vec![a.path.clone()]));
-        w.handle(Command::Play(None));
+        w.handle(Command::Add(vec![a.path.clone()])).unwrap();
+        w.handle(Command::Play(None)).unwrap();
         for _ in 0..3 {
             w.step();
         }
         let heard_frames = w.written - 1_000;
-        w.handle(Command::Pause);
+        w.handle(Command::Pause).unwrap();
         w.publish();
         assert_eq!(w.state, PlayState::Paused);
         assert_eq!(w.written, heard_frames, "decoder rewound to what was heard");
@@ -715,7 +760,7 @@ mod tests {
         );
         w.step();
         assert_eq!(w.written, heard_frames, "paused: nothing written");
-        w.handle(Command::Play(None));
+        w.handle(Command::Play(None)).unwrap();
         drive(&mut w);
         assert!(w.output.heard == a.expected, "pause/resume is not seamless");
     }
@@ -725,11 +770,11 @@ mod tests {
         let d = Dir::new();
         let a = flac(&d, "a.flac", 44_100, 16, 2, 4 * BLOCK);
         let (mut w, _events) = worker(FakeSink::default());
-        w.handle(Command::Add(vec![a.path.clone()]));
-        w.handle(Command::Play(None));
+        w.handle(Command::Add(vec![a.path.clone()])).unwrap();
+        w.handle(Command::Play(None)).unwrap();
         w.step();
         let before = w.output.heard.len();
-        w.handle(Command::Seek { ms: 250 });
+        w.handle(Command::Seek { ms: 250 }).unwrap();
         let frame = 250 * 44_100 / 1000;
         assert_eq!(w.anchor_ms, 250);
         drive(&mut w);
@@ -743,9 +788,10 @@ mod tests {
         let a = flac(&d, "a.flac", 44_100, 16, 2, BLOCK);
         let b = flac(&d, "b.flac", 44_100, 16, 2, BLOCK);
         let (mut w, _events) = worker(FakeSink::default());
-        w.handle(Command::Add(vec![a.path.clone(), b.path.clone()]));
-        w.handle(Command::Play(None));
-        w.handle(Command::Seek { ms: u64::MAX });
+        w.handle(Command::Add(vec![a.path.clone(), b.path.clone()]))
+            .unwrap();
+        w.handle(Command::Play(None)).unwrap();
+        w.handle(Command::Seek { ms: u64::MAX }).unwrap();
         assert_eq!(w.index, Some(1));
         drive(&mut w);
         assert!(w.output.heard == b.expected);
@@ -754,7 +800,7 @@ mod tests {
     #[test]
     fn seek_without_a_track_is_ignored() {
         let (mut w, _events) = worker(FakeSink::default());
-        w.handle(Command::Seek { ms: 1_000 });
+        w.handle(Command::Seek { ms: 1_000 }).unwrap();
         assert_eq!((w.state, w.index), (PlayState::Stopped, None));
     }
 
@@ -764,22 +810,24 @@ mod tests {
         let a = flac(&d, "a.flac", 44_100, 16, 2, BLOCK);
         let b = flac(&d, "b.flac", 44_100, 16, 2, BLOCK);
         let (mut w, _events) = worker(FakeSink::default());
-        w.handle(Command::Next);
+        w.handle(Command::Next).unwrap();
         assert_eq!(w.index, None, "next with nothing loaded");
-        w.handle(Command::Add(vec![a.path.clone(), b.path.clone()]));
-        w.handle(Command::Play(None));
-        w.handle(Command::Previous);
+        w.handle(Command::Add(vec![a.path.clone(), b.path.clone()]))
+            .unwrap();
+        w.handle(Command::Play(None)).unwrap();
+        w.handle(Command::Previous).unwrap();
         assert_eq!(w.index, Some(0), "previous at the start restarts");
-        w.handle(Command::Next);
+        w.handle(Command::Next).unwrap();
         assert_eq!(w.index, Some(1));
-        w.handle(Command::Next);
+        w.handle(Command::Next).unwrap();
         assert_eq!(w.index, Some(1), "next at the end does nothing");
-        w.handle(Command::Play(Some(7)));
-        assert_eq!(w.index, Some(1), "out-of-range jump is ignored");
-        w.handle(Command::Play(Some(0)));
+        let err = w.handle(Command::Play(Some(7))).unwrap_err();
+        assert!(matches!(err, Error::OutOfRange { index: 7, len: 2 }));
+        assert_eq!(w.index, Some(1), "out-of-range jump leaves the queue alone");
+        w.handle(Command::Play(Some(0))).unwrap();
         assert_eq!((w.index, w.state), (Some(0), PlayState::Playing));
-        w.handle(Command::Pause);
-        w.handle(Command::Next);
+        w.handle(Command::Pause).unwrap();
+        w.handle(Command::Next).unwrap();
         assert_eq!((w.index, w.state), (Some(1), PlayState::Paused));
     }
 
@@ -789,14 +837,15 @@ mod tests {
         let a = flac(&d, "a.flac", 44_100, 16, 2, BLOCK);
         let b = flac(&d, "b.flac", 44_100, 16, 2, BLOCK);
         let (mut w, _events) = worker(FakeSink::default());
-        w.handle(Command::Add(vec![a.path.clone(), b.path.clone()]));
-        w.handle(Command::Play(None));
-        w.handle(Command::Stop);
+        w.handle(Command::Add(vec![a.path.clone(), b.path.clone()]))
+            .unwrap();
+        w.handle(Command::Play(None)).unwrap();
+        w.handle(Command::Stop).unwrap();
         assert!(w.output.open.is_none(), "stop releases the device");
-        w.handle(Command::Next);
+        w.handle(Command::Next).unwrap();
         assert_eq!((w.index, w.state), (Some(1), PlayState::Stopped));
         assert!(w.source.is_none());
-        w.handle(Command::Play(None));
+        w.handle(Command::Play(None)).unwrap();
         drive(&mut w);
         assert!(w.output.heard.ends_with(&b.expected));
     }
@@ -806,17 +855,17 @@ mod tests {
         let d = Dir::new();
         let a = flac(&d, "a.flac", 44_100, 16, 2, BLOCK);
         let (mut w, _events) = worker(FakeSink::default());
-        w.handle(Command::Toggle);
+        w.handle(Command::Toggle).unwrap();
         assert_eq!(w.state, PlayState::Stopped, "toggle with an empty queue");
-        w.handle(Command::Add(vec![a.path.clone()]));
-        w.handle(Command::Toggle);
+        w.handle(Command::Add(vec![a.path.clone()])).unwrap();
+        w.handle(Command::Toggle).unwrap();
         assert_eq!(w.state, PlayState::Playing);
-        w.handle(Command::Toggle);
+        w.handle(Command::Toggle).unwrap();
         assert_eq!(w.state, PlayState::Paused);
-        w.handle(Command::Pause);
+        w.handle(Command::Pause).unwrap();
         assert_eq!(w.state, PlayState::Paused, "pause while paused");
-        w.handle(Command::Toggle);
-        w.handle(Command::Play(None));
+        w.handle(Command::Toggle).unwrap();
+        w.handle(Command::Play(None)).unwrap();
         assert_eq!(w.state, PlayState::Playing, "play while playing");
     }
 
@@ -825,22 +874,102 @@ mod tests {
         let d = Dir::new();
         let junk = write_bytes(&d, "junk.flac", &[0x5a; 512]);
         let a = flac(&d, "a.flac", 44_100, 16, 2, BLOCK);
-        let (mut w, _events) = worker(FakeSink::default());
+        let (mut w, events) = worker(FakeSink::default());
         w.handle(Command::Add(vec![
             junk.clone(),
             a.path.clone(),
             junk.clone(),
-        ]));
-        w.handle(Command::Play(None));
+        ]))
+        .unwrap();
+        w.handle(Command::Play(None)).unwrap();
         assert_eq!(w.index, Some(1));
+        w.publish();
+        let errs = errors(&events);
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].code, ErrorCode::Decode);
+        assert!(errs[0].message.contains("junk.flac"));
+        assert!(last_error(&w).is_some(), "kept after the entry that loaded");
         drive(&mut w);
         assert!(w.output.heard == a.expected);
         assert_eq!((w.state, w.index), (PlayState::Stopped, None));
 
         let (mut w, _events) = worker(FakeSink::default());
-        w.handle(Command::Add(vec![junk]));
-        w.handle(Command::Play(None));
+        w.handle(Command::Add(vec![junk])).unwrap();
+        w.handle(Command::Play(None)).unwrap();
         assert_eq!((w.state, w.index), (PlayState::Stopped, None));
+    }
+
+    #[test]
+    fn play_out_of_range_is_an_error() {
+        let d = Dir::new();
+        let a = flac(&d, "a.flac", 44_100, 16, 2, BLOCK);
+        let (player, _events) = Player::spawn_with(FakeSink::default());
+        player
+            .send(Command::Add(vec![a.path.clone(), a.path.clone()]))
+            .unwrap();
+        let err = player.send(Command::Play(Some(5))).unwrap_err();
+        assert!(matches!(err, Error::OutOfRange { index: 5, len: 2 }));
+        assert_eq!(player.snapshot().status.state, PlayState::Stopped);
+    }
+
+    fn errors(events: &mpsc::Receiver<Event>) -> Vec<lossless_proto::WireError> {
+        events
+            .try_iter()
+            .filter_map(|e| match e {
+                Event::Error(e) => Some(e),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn last_error(w: &Worker<FakeSink>) -> Option<lossless_proto::WireError> {
+        lock(&w.shared).at(Instant::now()).status.last_error
+    }
+
+    #[test]
+    fn decode_error_then_device_failure_reports_the_latest() {
+        let d = Dir::new();
+        let a = flac(&d, "a.flac", 44_100, 16, 2, 4 * BLOCK);
+        let b = flac(&d, "b.flac", 44_100, 16, 2, BLOCK);
+        let bytes = std::fs::read(&a.path).unwrap();
+        let cut = write_bytes(&d, "cut.flac", &bytes[..bytes.len() * 2 / 3]);
+        let (mut w, events) = worker(FakeSink::default());
+        w.handle(Command::Add(vec![cut, b.path.clone()])).unwrap();
+        w.handle(Command::Play(None)).unwrap();
+        w.output.fail_ensure = true;
+        drive(&mut w);
+        let codes: Vec<_> = errors(&events).iter().map(|e| e.code).collect();
+        assert_eq!(codes, [ErrorCode::Decode, ErrorCode::Device]);
+        assert_eq!(last_error(&w).map(|e| e.code), Some(ErrorCode::Device));
+    }
+
+    #[test]
+    fn a_clean_load_after_a_skipped_entry_clears_the_error() {
+        let d = Dir::new();
+        let junk = write_bytes(&d, "junk.flac", &[0x5a; 512]);
+        let a = flac(&d, "a.flac", 44_100, 16, 2, 2 * BLOCK);
+        let b = flac(&d, "b.flac", 44_100, 16, 2, BLOCK);
+        let (mut w, _events) = worker(FakeSink::default());
+        w.handle(Command::Add(vec![junk, a.path.clone(), b.path.clone()]))
+            .unwrap();
+        w.handle(Command::Play(None)).unwrap();
+        w.publish();
+        assert!(last_error(&w).is_some());
+        drive_to(&mut w, 2);
+        assert_eq!(last_error(&w), None);
+    }
+
+    #[test]
+    fn seek_failures_reach_the_caller() {
+        let d = Dir::new();
+        let a = flac(&d, "a.flac", 44_100, 16, 2, 4 * BLOCK);
+        let bytes = std::fs::read(&a.path).unwrap();
+        let cut = write_bytes(&d, "cut.flac", &bytes[..bytes.len() / 2]);
+        let (player, _events) = Player::spawn_with(FakeSink::default());
+        player.send(Command::Add(vec![cut])).unwrap();
+        player.send(Command::Play(None)).unwrap();
+        let err = player.send(Command::Seek { ms: 350 }).unwrap_err();
+        assert!(matches!(err, Error::Decode { .. }), "{err}");
     }
 
     #[test]
@@ -848,15 +977,26 @@ mod tests {
         let d = Dir::new();
         let a = flac(&d, "a.flac", 44_100, 16, 2, 4 * BLOCK);
         let b = flac(&d, "b.flac", 44_100, 16, 2, BLOCK);
+        let c = flac(&d, "c.flac", 44_100, 16, 2, BLOCK);
         let bytes = std::fs::read(&a.path).unwrap();
         let cut = write_bytes(&d, "cut.flac", &bytes[..bytes.len() * 2 / 3]);
-        let (mut w, _events) = worker(FakeSink::default());
-        w.handle(Command::Add(vec![cut, b.path.clone()]));
-        w.handle(Command::Play(None));
+        let (mut w, events) = worker(FakeSink::default());
+        w.handle(Command::Add(vec![cut, b.path.clone(), c.path.clone()]))
+            .unwrap();
+        w.handle(Command::Play(None)).unwrap();
+        drive_to(&mut w, 1);
+        let errs = errors(&events);
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].code, ErrorCode::Decode);
+        assert!(errs[0].message.contains("cut.flac"), "{}", errs[0].message);
+        assert_eq!(last_error(&w), Some(errs[0].clone()));
+        drive_to(&mut w, 2);
+        assert_eq!(last_error(&w), None, "cleared once a track loads");
         drive(&mut w);
         let heard = &w.output.heard;
-        assert!(heard.ends_with(&b.expected), "next track played in full");
-        let partial = &heard[..heard.len() - b.expected.len()];
+        let tail = concat(&[&b, &c]);
+        assert!(heard.ends_with(&tail), "next tracks played in full");
+        let partial = &heard[..heard.len() - tail.len()];
         assert!(
             a.expected.starts_with(partial),
             "what played of the cut file is exact"
@@ -867,24 +1007,34 @@ mod tests {
     fn output_failures_stop_playback() {
         let d = Dir::new();
         let a = flac(&d, "a.flac", 44_100, 16, 2, BLOCK);
-        let (mut w, _events) = worker(FakeSink {
+        let (mut w, events) = worker(FakeSink {
             fail_ensure: true,
             ..FakeSink::default()
         });
-        w.handle(Command::Add(vec![a.path.clone()]));
-        w.handle(Command::Play(None));
+        w.handle(Command::Add(vec![a.path.clone()])).unwrap();
+        w.handle(Command::Play(None)).unwrap();
         assert_eq!(w.state, PlayState::Stopped);
         assert_eq!(w.output.stops, 1);
+        assert_eq!(w.queue.len(), 1);
+        w.publish();
+        let errs = errors(&events);
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].code, ErrorCode::Device);
+        assert_eq!(last_error(&w), Some(errs[0].clone()));
 
-        let (mut w, _events) = worker(FakeSink {
+        let (mut w, events) = worker(FakeSink {
             fail_write: true,
             ..FakeSink::default()
         });
-        w.handle(Command::Add(vec![a.path.clone()]));
-        w.handle(Command::Play(None));
+        w.handle(Command::Add(vec![a.path.clone()])).unwrap();
+        w.handle(Command::Play(None)).unwrap();
         w.step();
         assert_eq!(w.state, PlayState::Stopped);
         assert!(w.source.is_none());
+        assert_eq!(w.queue.len(), 1);
+        let errs = errors(&events);
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].code, ErrorCode::Device);
     }
 
     #[test]
@@ -892,12 +1042,12 @@ mod tests {
         let d = Dir::new();
         let a = flac(&d, "a.flac", 44_100, 16, 2, BLOCK);
         let (mut w, _events) = worker(FakeSink::default());
-        w.handle(Command::Add(vec![a.path.clone()]));
-        w.handle(Command::Play(None));
-        w.handle(Command::Clear);
+        w.handle(Command::Add(vec![a.path.clone()])).unwrap();
+        w.handle(Command::Play(None)).unwrap();
+        w.handle(Command::Clear).unwrap();
         assert!(w.queue.is_empty());
         assert_eq!((w.state, w.index), (PlayState::Stopped, None));
-        w.handle(Command::Play(None));
+        w.handle(Command::Play(None)).unwrap();
         assert_eq!(w.state, PlayState::Stopped, "play with an empty queue");
     }
 
@@ -910,8 +1060,9 @@ mod tests {
             delay: 44_100,
             ..FakeSink::default()
         });
-        w.handle(Command::Add(vec![a.path.clone(), b.path.clone()]));
-        w.handle(Command::Play(None));
+        w.handle(Command::Add(vec![a.path.clone(), b.path.clone()]))
+            .unwrap();
+        w.handle(Command::Play(None)).unwrap();
         let before = Instant::now();
         drive_to(&mut w, 1);
         assert_eq!(w.anchor_ms, 0);
@@ -950,15 +1101,15 @@ mod tests {
             let s = p.snapshot().status;
             (s.state, s.index)
         };
-        player.send(Command::Add(vec![a.path.clone()]));
+        player.send(Command::Add(vec![a.path.clone()])).unwrap();
         assert_eq!(player.snapshot().queue.len(), 1);
-        player.send(Command::Play(None));
+        player.send(Command::Play(None)).unwrap();
         assert_eq!(state(&player), (PlayState::Playing, Some(0)));
-        player.send(Command::Pause);
+        player.send(Command::Pause).unwrap();
         assert_eq!(state(&player), (PlayState::Paused, Some(0)));
-        player.send(Command::Seek { ms: 1_000 });
+        player.send(Command::Seek { ms: 1_000 }).unwrap();
         assert_eq!(player.snapshot().status.position_ms, 1_000);
-        player.send(Command::Stop);
+        player.send(Command::Stop).unwrap();
         assert_eq!(state(&player).0, PlayState::Stopped);
     }
 
@@ -967,8 +1118,8 @@ mod tests {
         let d = Dir::new();
         let a = flac(&d, "a.flac", 44_100, 16, 2, BLOCK);
         let (player, events) = Player::spawn_with(FakeSink::default());
-        player.send(Command::Add(vec![a.path.clone()]));
-        player.send(Command::Play(None));
+        player.send(Command::Add(vec![a.path.clone()])).unwrap();
+        player.send(Command::Play(None)).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             match events.recv_timeout(Duration::from_secs(10)).expect("event") {

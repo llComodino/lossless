@@ -1,7 +1,6 @@
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow};
 use lossless_proto::StreamFormat;
 use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
@@ -10,6 +9,8 @@ use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, Tr
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::units::{TimeBase, Timestamp};
+
+use crate::{Error, Result};
 
 fn ratio(tb: TimeBase) -> (u32, u32) {
     (tb.numer.get(), tb.denom.get())
@@ -47,6 +48,7 @@ fn frames_to_ts(frame: u64, time_base: Option<(u32, u32)>, rate: u32) -> Option<
 
 /// One decoded file: interleaved full-scale i32 chunks, seekable to the frame.
 pub struct Source {
+    path: PathBuf,
     reader: Box<dyn FormatReader>,
     decoder: Box<dyn AudioDecoder>,
     track_id: u32,
@@ -60,20 +62,33 @@ pub struct Source {
 
 impl Source {
     pub fn open(path: &Path) -> Result<Self> {
-        let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let file = File::open(path).map_err(|e| Error::Open {
+            path: path.to_owned(),
+            reason: e.to_string(),
+            missing: e.kind() == std::io::ErrorKind::NotFound,
+        })?;
         let ext = path.extension().and_then(|e| e.to_str());
-        Self::from_media(Box::new(file), ext).with_context(|| path.display().to_string())
+        Self::from_media(Box::new(file), ext, path)
     }
 
     /// Decode a file held in memory; `ext` is a format hint ("flac", "mp3").
     pub fn from_bytes(bytes: Vec<u8>, ext: Option<&str>) -> Result<Self> {
-        Self::from_media(Box::new(std::io::Cursor::new(bytes)), ext)
+        Self::from_media(
+            Box::new(std::io::Cursor::new(bytes)),
+            ext,
+            Path::new("<memory>"),
+        )
     }
 
     fn from_media(
         media: Box<dyn symphonia::core::io::MediaSource>,
         ext: Option<&str>,
+        path: &Path,
     ) -> Result<Self> {
+        let decode = |reason: String| Error::Decode {
+            path: path.to_owned(),
+            reason,
+        };
         let mss = MediaSourceStream::new(media, Default::default());
         let mut hint = Hint::new();
         if let Some(ext) = ext {
@@ -86,10 +101,10 @@ impl Source {
                 FormatOptions::default(),
                 MetadataOptions::default(),
             )
-            .context("probing format")?;
+            .map_err(|e| decode(format!("probing format: {e}")))?;
         let track = reader
             .default_track(TrackType::Audio)
-            .ok_or_else(|| anyhow!("no audio track"))?;
+            .ok_or_else(|| decode("no audio track".into()))?;
         let track_id = track.id;
         let time_base = track.time_base;
         let total_frames = track.num_frames;
@@ -97,23 +112,24 @@ impl Source {
             .codec_params
             .as_ref()
             .and_then(|p| p.audio())
-            .ok_or_else(|| anyhow!("no audio codec parameters"))?
+            .ok_or_else(|| decode("no audio codec parameters".into()))?
             .clone();
         let rate = params
             .sample_rate
             .filter(|&r| r > 0)
-            .ok_or_else(|| anyhow!("unknown or zero sample rate"))?;
+            .ok_or_else(|| decode("unknown or zero sample rate".into()))?;
         let channels = params
             .channels
             .as_ref()
             .map(|c| c.count() as u16)
-            .ok_or_else(|| anyhow!("unknown channel count"))?;
+            .ok_or_else(|| decode("unknown channel count".into()))?;
         // Lossy codecs (MP3) have no native depth: send them at 32-bit.
         let bits = params.bits_per_sample.unwrap_or(32) as u16;
         let decoder = symphonia::default::get_codecs()
             .make_audio_decoder(&params, &AudioDecoderOptions::default())
-            .context("creating decoder")?;
+            .map_err(|e| decode(format!("creating decoder: {e}")))?;
         Ok(Self {
+            path: path.to_owned(),
             reader,
             decoder,
             track_id,
@@ -129,6 +145,13 @@ impl Source {
         })
     }
 
+    fn decode_err(&self, what: &str, e: impl std::fmt::Display) -> Error {
+        Error::Decode {
+            path: self.path.clone(),
+            reason: format!("{what}: {e}"),
+        }
+    }
+
     fn ts_to_frames(&self, ts: Timestamp) -> u64 {
         ts_to_frames(ts.get(), self.time_base.map(ratio), self.format.rate)
     }
@@ -137,7 +160,11 @@ impl Source {
     pub fn next_chunk(&mut self) -> Result<Option<&[i32]>> {
         let channels = self.format.channels as usize;
         loop {
-            let Some(packet) = self.reader.next_packet().context("reading packet")? else {
+            let packet = self
+                .reader
+                .next_packet()
+                .map_err(|e| self.decode_err("reading packet", e))?;
+            let Some(packet) = packet else {
                 return Ok(None);
             };
             if packet.track_id != self.track_id {
@@ -146,7 +173,7 @@ impl Source {
             let buf = match self.decoder.decode(&packet) {
                 Ok(buf) => buf,
                 Err(SymphoniaError::DecodeError(_)) => continue,
-                Err(e) => return Err(e).context("decoding"),
+                Err(e) => return Err(self.decode_err("decoding", e)),
             };
             self.buf.resize(buf.samples_interleaved(), 0);
             buf.copy_to_slice_interleaved(&mut self.buf);
@@ -171,7 +198,7 @@ impl Source {
     pub fn seek(&mut self, frame: u64) -> Result<u64> {
         let ts = self
             .frames_to_ts(frame)
-            .ok_or_else(|| anyhow!("seek target out of range"))?;
+            .ok_or_else(|| self.decode_err("seeking", "target out of range"))?;
         let seeked = self
             .reader
             .seek(
@@ -181,7 +208,7 @@ impl Source {
                     track_id: self.track_id,
                 },
             )
-            .context("seeking")?;
+            .map_err(|e| self.decode_err("seeking", e))?;
         self.decoder.reset();
         let required = self.ts_to_frames(seeked.required_ts);
         let actual = self.ts_to_frames(seeked.actual_ts);

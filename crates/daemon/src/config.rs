@@ -14,6 +14,43 @@ pub struct Config {
     /// Relative paths in `add` resolve against this.
     pub music_dir: Option<PathBuf>,
     pub socket: Option<PathBuf>,
+    #[serde(default)]
+    pub log_level: LogLevel,
+}
+
+/// How much the daemon writes to stderr; nothing by default.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub enum LogLevel {
+    #[default]
+    Off,
+    Warn,
+    Info,
+    Debug,
+}
+
+impl std::str::FromStr for LogLevel {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "off" => Ok(Self::Off),
+            "warn" => Ok(Self::Warn),
+            "info" => Ok(Self::Info),
+            "debug" => Ok(Self::Debug),
+            _ => Err(format!(
+                "log level {s:?} must be one of off, warn, info, debug"
+            )),
+        }
+    }
+}
+
+impl TryFrom<String> for LogLevel {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Self, String> {
+        s.parse()
+    }
 }
 
 fn default_device() -> String {
@@ -338,6 +375,17 @@ mod tests {
         )
         .unwrap();
         assert!(format!("{:#}", denied.unwrap_err()).contains("reading"));
+    }
+
+    #[test]
+    fn log_level_values() {
+        assert_eq!(parse_config("").unwrap().log_level, LogLevel::Off);
+        assert_eq!(
+            parse_config("log_level = \"warn\"").unwrap().log_level,
+            LogLevel::Warn
+        );
+        let err = parse_config("log_level = \"verbose\"").unwrap_err();
+        assert!(err.to_string().contains("off, warn, info, debug"), "{err}");
     }
 
     #[test]

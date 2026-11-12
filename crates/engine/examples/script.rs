@@ -24,11 +24,11 @@ fn main() -> anyhow::Result<()> {
         );
     };
     let step = |cmd: Command, wait: u64, label: &str| {
-        player.send(cmd);
+        player.send(cmd).expect("command failed");
         sleep(Duration::from_millis(wait));
         show(label);
     };
-    player.send(Command::Add(files));
+    player.send(Command::Add(files))?;
     step(Command::Play(None), 3000, "play 3s");
     step(Command::Pause, 1500, "pause 1.5s");
     step(Command::Play(None), 2000, "resume 2s");

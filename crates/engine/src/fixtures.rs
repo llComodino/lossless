@@ -4,12 +4,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use anyhow::Result;
 use flacenc::component::BitRepr;
 use flacenc::error::Verify;
 use lossless_proto::StreamFormat;
 
-use crate::Sink;
+use crate::{Result, Sink};
 
 /// A generated FLAC file and the samples a bit-perfect decoder must return
 /// for it: interleaved, shifted to full-scale i32 like symphonia does.
@@ -132,6 +131,8 @@ pub fn write_bytes(dir: &Dir, name: &str, bytes: &[u8]) -> PathBuf {
 #[derive(Default)]
 pub struct PacedSink {
     format: Option<StreamFormat>,
+    /// Panic on the first write, to simulate a crashing player thread.
+    pub die: bool,
 }
 
 impl Sink for PacedSink {
@@ -143,6 +144,7 @@ impl Sink for PacedSink {
         self.format
     }
     fn write(&mut self, samples: &[i32]) -> Result<()> {
+        assert!(!self.die, "sink died");
         if let Some(f) = self.format {
             let frames = samples.len() as u64 / u64::from(f.channels.max(1));
             std::thread::sleep(Duration::from_micros(

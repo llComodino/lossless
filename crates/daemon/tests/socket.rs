@@ -12,7 +12,8 @@ use lossless_daemon::{Daemon, MAX_REQUEST, bind, parse_config};
 use lossless_engine::Player;
 use lossless_engine::fixtures::{BLOCK, Dir, PacedSink, flac_at};
 use lossless_proto::{
-    Body, Command, Event, Outcome, PlayState, Request, ServerMessage, decode, encode,
+    Body, Command, ErrorCode, Event, Outcome, PlayState, Request, ServerMessage, WireError, decode,
+    encode,
 };
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -31,7 +32,8 @@ impl Server {
         }
         let listener = bind(&dir.path("sock")).unwrap();
         let (player, events) = Player::spawn_with(PacedSink::default());
-        let daemon = Daemon::start(player, events, with_music.then_some(music)).unwrap();
+        let daemon =
+            Daemon::start(player, events, with_music.then_some(music), Box::new(|| {})).unwrap();
         thread::spawn(move || daemon.serve(listener));
         Self { dir }
     }
@@ -128,7 +130,7 @@ impl Client {
         }
     }
 
-    fn err(&mut self, command: Command) -> String {
+    fn err(&mut self, command: Command) -> WireError {
         match self.call(command) {
             Outcome::Err(e) => e,
             Outcome::Ok(body) => panic!("unexpected success: {body:?}"),
@@ -202,20 +204,64 @@ fn add_reports_errors() {
         c.err(Command::Add {
             paths: vec!["nope".into()]
         })
+        .message
         .contains("nope")
     );
+    let e = c.err(Command::Add {
+        paths: vec!["empty".into(), "empty".into()],
+    });
+    assert_eq!(e.code, ErrorCode::NotFound);
+    assert_eq!(e.message, "no playable files in empty, empty");
+    let e = c.err(Command::Add { paths: vec![] });
     assert_eq!(
-        c.err(Command::Add {
-            paths: vec!["empty".into()]
-        }),
-        "no playable files"
+        (e.code, e.message.as_str()),
+        (ErrorCode::NotFound, "no playable files")
     );
-    assert_eq!(c.err(Command::Add { paths: vec![] }), "no playable files");
+    let e = c.err(Command::Add {
+        paths: vec!["album/cover.jpg".into()],
+    });
+    assert_eq!(e.code, ErrorCode::NotFound);
+    assert!(e.message.ends_with("cover.jpg: not a flac or mp3 file"));
     // A failing path rejects the whole request.
     c.err(Command::Add {
         paths: vec!["album".into(), "nope".into()],
     });
     assert!(queue(&mut c).is_empty());
+}
+
+#[test]
+fn play_past_the_queue_is_out_of_range() {
+    let s = Server::start(true);
+    s.album(1);
+    let mut c = s.connect();
+    c.ok(Command::Add {
+        paths: vec!["album".into()],
+    });
+    let e = c.err(Command::Play { index: Some(5) });
+    assert_eq!(e.code, ErrorCode::OutOfRange);
+    assert_eq!(e.message, "index 5 out of range: queue has 2 entries");
+}
+
+#[test]
+fn error_codes_name_the_problem() {
+    let s = Server::start(true);
+    let mut c = s.connect();
+    for line in [&b"garbage\n"[..], b"\xff\xfe\n"] {
+        c.raw(line);
+        let (id, result) = c.reply();
+        assert_eq!(id, 0);
+        assert!(matches!(result, Outcome::Err(e) if e.code == ErrorCode::BadRequest));
+    }
+    let e = c.err(Command::Add {
+        paths: vec!["nope".into()],
+    });
+    assert_eq!(e.code, ErrorCode::NotFound);
+    let e = c.err(Command::Play { index: Some(9) });
+    assert_eq!(e.code, ErrorCode::OutOfRange);
+    assert_eq!(e.message, "index 9 out of range: queue has 0 entries");
+    let none = Server::start(false);
+    let e = none.connect().err(Command::Update);
+    assert_eq!(e.code, ErrorCode::NoMusicDir);
 }
 
 #[test]
@@ -248,7 +294,11 @@ fn update_scans_and_search_finds() {
 fn update_without_music_dir_is_an_error() {
     let s = Server::start(false);
     let mut c = s.connect();
-    assert_eq!(c.err(Command::Update), "no music_dir configured");
+    let e = c.err(Command::Update);
+    assert_eq!(
+        (e.code, e.message.as_str()),
+        (ErrorCode::NoMusicDir, "no music_dir configured")
+    );
 }
 
 #[test]
@@ -327,7 +377,10 @@ fn bad_requests_get_errors_and_the_connection_survives() {
         c.raw(line);
         let (id, result) = c.reply();
         assert_eq!(id, 0);
-        assert!(matches!(result, Outcome::Err(_)), "{line:?} accepted");
+        match result {
+            Outcome::Err(e) => assert_eq!(e.code, ErrorCode::BadRequest, "{line:?}"),
+            Outcome::Ok(_) => panic!("{line:?} accepted"),
+        }
     }
     c.raw(b"\n   \n");
     assert_eq!(status(&mut c).state, PlayState::Stopped);
@@ -338,12 +391,12 @@ fn oversized_request_closes_only_that_connection() {
     let s = Server::start(true);
     let mut big = UnixStream::connect(s.socket()).unwrap();
     big.set_read_timeout(Some(WAIT)).unwrap();
-    let _ = big.write_all(&vec![b'x'; MAX_REQUEST + 10]);
+    big.write_all(&vec![b'x'; MAX_REQUEST + 1]).unwrap();
     let mut out = Vec::new();
-    // The daemon answers and hangs up; a reset is fine too.
-    let _ = big.read_to_end(&mut out);
+    big.read_to_end(&mut out).unwrap();
     let text = String::from_utf8_lossy(&out);
-    assert!(out.is_empty() || text.contains("longer than"), "{text}");
+    assert!(text.contains("\"code\":\"bad_request\""), "{text}");
+    assert!(text.contains("longer than"), "{text}");
     assert_eq!(status(&mut s.connect()).state, PlayState::Stopped);
 }
 
