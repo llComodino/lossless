@@ -262,6 +262,7 @@ name = "lossless-library"
 version = "0.1.0"
 dependencies = [
  "lofty",
+ "log",
  "lossless-proto",
  "thiserror",
 ]

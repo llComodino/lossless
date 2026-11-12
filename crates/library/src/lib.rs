@@ -29,6 +29,12 @@ fn is_hidden(path: &Path) -> bool {
 /// Expand files and directories (recursively, sorted, skipping dot entries)
 /// into playable files.
 pub fn collect(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    walk(path, out, &mut None)
+}
+
+/// With `skipped`, a nested entry that fails is counted and passed over
+/// instead of failing the whole walk; `path` itself is always strict.
+fn walk(path: &Path, out: &mut Vec<PathBuf>, skipped: &mut Option<usize>) -> Result<()> {
     let io = |source| Error::Io {
         path: path.to_path_buf(),
         source,
@@ -52,7 +58,13 @@ pub fn collect(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
         }
         entries.sort();
         for entry in entries {
-            collect_nested(&entry, out)?;
+            match (collect_nested(&entry, out, skipped), skipped.as_mut()) {
+                (Err(e), Some(n)) => {
+                    log::warn!("library: {e}; skipped");
+                    *n += 1;
+                }
+                (r, _) => r?,
+            }
         }
     } else if is_audio(path) {
         out.push(path.to_path_buf());
@@ -65,9 +77,9 @@ pub fn collect(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 }
 
 /// Inside a directory, non-audio files are skipped rather than rejected.
-fn collect_nested(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+fn collect_nested(path: &Path, out: &mut Vec<PathBuf>, skipped: &mut Option<usize>) -> Result<()> {
     if path.is_dir() || is_audio(path) {
-        collect(path, out)
+        walk(path, out, skipped)
     } else {
         Ok(())
     }
@@ -160,7 +172,11 @@ pub struct Library {
 impl Library {
     pub fn scan(root: &Path) -> Result<Self> {
         let mut files = Vec::new();
-        collect(root, &mut files)?;
+        let mut skipped = Some(0);
+        walk(root, &mut files, &mut skipped)?;
+        if let Some(n) = skipped.filter(|&n| n > 0) {
+            log::warn!("library: {n} unreadable entries skipped");
+        }
         Ok(Self::from_tracks(
             root,
             files.iter().map(|path| read_track(path)),
@@ -422,6 +438,34 @@ mod tests {
         assert_eq!(e.to_wire().message, e.to_string());
         assert!(scan.is_err());
         assert!(out.is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_scan_skips_unreadable_entries() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("lossless-skip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("locked")).unwrap();
+        std::fs::write(root.join("a/01.flac"), b"").unwrap();
+        std::fs::write(root.join("locked/x.flac"), b"").unwrap();
+        std::os::unix::fs::symlink(root.join("gone.flac"), root.join("a/02.flac")).unwrap();
+        let locked = root.join("locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let as_root = std::fs::read_dir(&locked).is_ok();
+        let scan = Library::scan(&root);
+        let strict = collect(&root, &mut Vec::new());
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let lib = scan.unwrap();
+        let paths: Vec<_> = lib.tracks.iter().map(|t| t.path.as_str()).collect();
+        let first = root.join("a/01.flac").display().to_string();
+        if as_root {
+            assert_eq!(paths.len(), 2, "{paths:?}");
+        } else {
+            assert_eq!(paths, [first.as_str()]);
+        }
+        assert!(strict.is_err(), "add stays strict");
         std::fs::remove_dir_all(&root).unwrap();
     }
 }
