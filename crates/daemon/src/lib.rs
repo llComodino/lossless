@@ -1,12 +1,14 @@
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::net::Shutdown;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
-use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock, Weak};
 use std::thread;
 
 use anyhow::{Context, Result, bail};
@@ -420,6 +422,48 @@ fn restore(player: &Player, path: &Path) -> Result<()> {
 /// A running daemon: player, library and subscribers, ready to serve.
 pub struct Daemon {
     state: Arc<State>,
+    sessions: Arc<Sessions>,
+}
+
+/// Live client connections, so `shutdown` can close them.
+#[derive(Default)]
+struct Sessions {
+    live: Mutex<Live>,
+    ended: Condvar,
+}
+
+#[derive(Default)]
+struct Live {
+    stopping: bool,
+    next: u64,
+    streams: HashMap<u64, UnixStream>,
+    /// Where `serve` listens, to wake its `accept` on shutdown.
+    addr: Option<PathBuf>,
+}
+
+impl Sessions {
+    fn lock(&self) -> MutexGuard<'_, Live> {
+        self.live.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Track `stream` until `end`; `None` once shutting down.
+    fn register(&self, stream: &UnixStream) -> Option<u64> {
+        let mut live = self.lock();
+        if live.stopping {
+            return None;
+        }
+        let id = live.next;
+        live.next += 1;
+        if let Ok(clone) = stream.try_clone() {
+            live.streams.insert(id, clone);
+        }
+        Some(id)
+    }
+
+    fn end(&self, id: u64) {
+        self.lock().streams.remove(&id);
+        self.ended.notify_all();
+    }
 }
 
 impl Daemon {
@@ -455,7 +499,10 @@ impl Daemon {
                     on_player_gone,
                 )
             })?;
-        Ok(Self { state })
+        Ok(Self {
+            state,
+            sessions: Arc::default(),
+        })
     }
 
     /// Start a background scan of the music directory, if there is one.
@@ -463,9 +510,35 @@ impl Daemon {
         self.state.rescan().map(drop)
     }
 
-    /// Accept clients until the listener fails; one thread per client.
+    /// Accept clients until the listener fails or `shutdown`; one thread
+    /// per client.
     pub fn serve(&self, listener: UnixListener) {
+        self.sessions.lock().addr = listener
+            .local_addr()
+            .ok()
+            .and_then(|a| a.as_pathname().map(Path::to_path_buf));
         self.accept(listener.incoming());
+    }
+
+    /// Stop accepting, close every client connection and wait until their
+    /// sessions have ended. Clients see EOF, as if the daemon had exited.
+    pub fn shutdown(&self) {
+        let mut live = self.sessions.lock();
+        live.stopping = true;
+        for stream in live.streams.values() {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+        let addr = live.addr.take();
+        drop(live);
+        if let Some(addr) = addr {
+            let _ = UnixStream::connect(addr);
+        }
+        let live = self.sessions.lock();
+        let _live = self
+            .sessions
+            .ended
+            .wait_while(live, |l| !l.streams.is_empty())
+            .unwrap_or_else(PoisonError::into_inner);
     }
 
     /// Serve each connection; a failed accept is logged and skipped.
@@ -478,11 +551,16 @@ impl Daemon {
                     continue;
                 }
             };
+            let Some(id) = self.sessions.register(&stream) else {
+                return;
+            };
             let state = Arc::clone(&self.state);
+            let sessions = Arc::clone(&self.sessions);
             thread::spawn(move || {
                 if let Err(e) = serve(&state, stream) {
                     warn!("client: {e:#}");
                 }
+                sessions.end(id);
             });
         }
     }

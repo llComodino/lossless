@@ -494,6 +494,35 @@ fn requests_past_64_kib_are_accepted() {
 }
 
 #[test]
+fn shutdown_closes_live_connections() {
+    let dir = Dir::new();
+    let sock = dir.path("sock");
+    let listener = bind(&sock).unwrap();
+    let (player, events) = Player::spawn_with(PacedSink::default());
+    let daemon = Daemon::start(player, events, None, dir.path("s.json"), Box::new(|| {})).unwrap();
+    let daemon = std::sync::Arc::new(daemon);
+    let serving = {
+        let d = std::sync::Arc::clone(&daemon);
+        thread::spawn(move || d.serve(listener))
+    };
+    let mut c = Client::connect(&sock);
+    c.ok(Command::Subscribe);
+    let mut idle = UnixStream::connect(&sock).unwrap();
+    idle.set_read_timeout(Some(WAIT)).unwrap();
+    assert_eq!(status(&mut c).state, PlayState::Stopped);
+    daemon.shutdown();
+    serving.join().unwrap();
+    assert_eq!(
+        c.lines.recv_timeout(WAIT),
+        Err(mpsc::RecvTimeoutError::Disconnected),
+        "EOF"
+    );
+    assert_eq!(idle.read(&mut [0; 16]).unwrap(), 0, "EOF");
+    assert!(UnixStream::connect(&sock).is_err(), "no longer accepting");
+    daemon.shutdown();
+}
+
+#[test]
 fn a_dead_subscriber_does_not_stop_the_others() {
     let s = Server::start(true);
     s.album(1);
