@@ -258,3 +258,37 @@ fn closed_stdout_exits_quietly() {
     drop(child.stdout.take());
     assert!(child.wait().unwrap().success());
 }
+
+#[test]
+fn queue_editing_commands() {
+    let s = Server::start();
+    s.album();
+    let names = |s: &Server| -> Vec<String> {
+        s.ok(&["queue"])
+            .lines()
+            .map(|l| l.trim().split("  ").nth(1).unwrap().to_string())
+            .collect()
+    };
+    s.ok(&["add", "album/02 two.flac"]);
+    s.ok(&["add", "--at", "1", "album/01 one.flac"]);
+    assert_eq!(names(&s), ["01 one.flac", "02 two.flac"]);
+    s.ok(&["move", "1", "2"]);
+    assert_eq!(names(&s), ["02 two.flac", "01 one.flac"]);
+    s.ok(&["remove", "2"]);
+    assert_eq!(names(&s), ["02 two.flac"]);
+    s.ok(&["replace", "album"]);
+    assert_eq!(names(&s), ["01 one.flac", "02 two.flac"]);
+    for args in [
+        &["add", "--at", "0", "album"][..],
+        &["remove", "0"],
+        &["remove", "1", "0"],
+        &["move", "0", "1"],
+        &["move", "1", "0"],
+    ] {
+        assert_eq!(
+            s.err(args).trim(),
+            "Error: positions start at 1",
+            "{args:?}"
+        );
+    }
+}

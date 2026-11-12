@@ -152,6 +152,10 @@ and drive it with the client:
 lossless update                  # scan music_dir
 lossless search radiohead ok     # tracks matching every word
 lossless add "Radiohead/OK Computer"
+lossless add --at 1 song.flac    # insert at position 1 (default: append)
+lossless replace "Radiohead/OK Computer"   # swap the queue, stops playback
+lossless remove 2 3              # 1-based queue positions
+lossless move 3 1
 lossless play                    # or: play 3 (1-based queue entry)
 lossless status
 lossless seek 2:30

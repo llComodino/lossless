@@ -20,6 +20,8 @@ First development version, not yet tagged.
   with backoff.
 - Queue with play, pause, toggle, stop, next, previous, jump, clear and
   sample-accurate seek.
+- Queue editing: `add --at`, `replace`, `remove` and `move`, with the playing
+  track keeping its place.
 - Library scan with tags (artist, album, title, track number, duration,
   format) and word search; rescan on demand.
 - Newline-delimited JSON protocol over a unix socket, with request ids and

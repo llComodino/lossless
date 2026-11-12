@@ -28,7 +28,10 @@ const USAGE: &str = "usage: lossless [--json] [--socket PATH] <command>
 
   status                 state, position, output format
   queue                  list the queue
-  add <path>...          add files or folders (relative to music_dir)
+  add [--at N] <path>... add files or folders (relative to music_dir)
+  replace <path>...      replace the queue and stop
+  remove <N>...          remove queue entries (1-based)
+  move <from> <to>       move a queue entry
   play [N]               start/resume, or jump to queue entry N (1-based)
   pause | toggle | stop
   next | prev
@@ -51,6 +54,13 @@ fn parse_time(s: &str) -> Result<u64> {
         bail!("bad time {s:?}");
     }
     Ok((secs * 1000.0) as u64)
+}
+
+/// A 1-based queue position as a wire index.
+fn position(s: &str) -> Result<usize> {
+    let n: usize = s.parse().with_context(|| format!("bad position {s:?}"))?;
+    n.checked_sub(1)
+        .ok_or_else(|| anyhow!("positions start at 1"))
 }
 
 fn parse(args: &[String]) -> Result<Command> {
@@ -76,9 +86,32 @@ fn parse(args: &[String]) -> Result<Command> {
         "search" if !rest.is_empty() => Ok(Command::Search {
             query: rest.join(" "),
         }),
-        "add" if !rest.is_empty() => Ok(Command::Add {
+        "add" => {
+            let (at, paths) = match rest {
+                [flag, n, paths @ ..] if flag == "--at" => (Some(position(n)?), paths),
+                _ => (None, rest),
+            };
+            if paths.is_empty() {
+                bail!(USAGE);
+            }
+            Ok(Command::Add {
+                paths: paths.to_vec(),
+                at,
+            })
+        }
+        "replace" if !rest.is_empty() => Ok(Command::Replace {
             paths: rest.to_vec(),
         }),
+        "remove" if !rest.is_empty() => Ok(Command::Remove {
+            indices: rest.iter().map(|n| position(n)).collect::<Result<_>>()?,
+        }),
+        "move" => match rest {
+            [from, to] => Ok(Command::Move {
+                from: position(from)?,
+                to: position(to)?,
+            }),
+            _ => bail!("move takes two positions"),
+        },
         "play" => match rest {
             [] => Ok(Command::Play { index: None }),
             [n] => {
@@ -362,14 +395,45 @@ mod tests {
         assert_eq!(
             ok(&["add", "x", "y"]),
             Command::Add {
-                paths: vec!["x".into(), "y".into()]
+                paths: vec!["x".into(), "y".into()],
+                at: None
             }
         );
+        assert_eq!(
+            ok(&["add", "--at", "1", "x"]),
+            Command::Add {
+                paths: vec!["x".into()],
+                at: Some(0)
+            }
+        );
+        assert_eq!(
+            ok(&["replace", "x"]),
+            Command::Replace {
+                paths: vec!["x".into()]
+            }
+        );
+        assert_eq!(
+            ok(&["remove", "2", "1"]),
+            Command::Remove {
+                indices: vec![1, 0]
+            }
+        );
+        assert_eq!(ok(&["move", "1", "3"]), Command::Move { from: 0, to: 2 });
+        assert_eq!(err(&["move", "1"]), "move takes two positions");
+        assert!(err(&["remove", "x"]).contains("bad position"));
         assert_eq!(err(&["status", "x"]), "status takes no arguments");
         assert_eq!(err(&["seek"]), "seek takes one time");
         assert_eq!(err(&["play", "1", "2"]), "play takes at most one index");
         assert!(err(&["play", "x"]).contains("bad index"));
-        for usage in [&[][..], &["add"], &["search"], &["bogus"]] {
+        for usage in [
+            &[][..],
+            &["add"],
+            &["add", "--at", "1"],
+            &["replace"],
+            &["remove"],
+            &["search"],
+            &["bogus"],
+        ] {
             assert_eq!(err(usage), USAGE, "{usage:?}");
         }
     }
