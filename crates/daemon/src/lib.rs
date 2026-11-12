@@ -6,12 +6,12 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
 use std::thread;
 
 use anyhow::{Context, Result, bail};
 use log::{debug, info, warn};
-use lossless_engine::{Command as PlayerCmd, Output, Player, choose};
+use lossless_engine::{Command as PlayerCmd, Output, Player, Snapshot, choose};
 use lossless_library::{Library, collect, read_track};
 use lossless_proto::{
     Body, Command, Event, Outcome, Request, ServerMessage, Track, decode, encode,
@@ -20,6 +20,7 @@ use lossless_proto::{
 mod config;
 mod error;
 mod logger;
+pub mod state;
 
 use config::expand_tilde;
 pub use config::{
@@ -68,14 +69,45 @@ fn broadcast(subscribers: &Subscribers, event: Event) {
     subs.retain(|w| send(w, &msg).is_ok());
 }
 
-/// Forward player events to every subscribed client, dropping dead ones. The
-/// stream ends only when the player thread is gone, so `on_player_gone` runs.
+/// What to persist from `snap`. Paths go through UTF-8 (JSON can't carry
+/// anything else); one that isn't valid is saved mangled and dropped as
+/// missing on restore, so the rest of the queue still survives.
+fn saved(snap: &Snapshot) -> state::Saved {
+    state::Saved {
+        queue: snap
+            .queue
+            .iter()
+            .map(|p| PathBuf::from(p.to_string_lossy().into_owned()))
+            .collect(),
+        index: snap.status.index,
+        position_ms: snap.status.position_ms,
+        repeat: snap.status.repeat,
+        random: snap.status.random,
+    }
+}
+
+/// Forward player events to every subscribed client, dropping dead ones, and
+/// save the state on events that change it (before broadcasting, so a client
+/// that saw the event can rely on the file). The stream ends only when the
+/// player thread is gone, so `on_player_gone` runs.
 fn fan_out(
     events: Receiver<Event>,
+    daemon: Weak<State>,
     subscribers: Subscribers,
     on_player_gone: Box<dyn FnOnce() + Send>,
 ) {
     for event in events {
+        if matches!(
+            event,
+            Event::QueueChanged
+                | Event::TrackChanged { .. }
+                | Event::State { .. }
+                | Event::Mode { .. }
+        ) && let Some(d) = daemon.upgrade()
+            && let Err(e) = state::save(&d.state_file, &saved(&d.player.snapshot()))
+        {
+            warn!("state: saving {}: {e}", d.state_file.display());
+        }
         broadcast(&subscribers, event);
     }
     on_player_gone();
@@ -118,6 +150,7 @@ fn spawn_scan(
 
 struct State {
     player: Player,
+    state_file: PathBuf,
     music_dir: Option<PathBuf>,
     subscribers: Subscribers,
     library: Arc<RwLock<Library>>,
@@ -308,8 +341,14 @@ fn serve(state: &State, stream: UnixStream) -> Result<()> {
 }
 
 /// Load the config at `config`, bind its socket (or `default_socket`), open
-/// its device and serve until the listener fails.
-pub fn run(config: &Path, default_socket: PathBuf, log_override: Option<LogLevel>) -> Result<()> {
+/// its device, restore the session saved at `state` and serve until the
+/// listener fails.
+pub fn run(
+    config: &Path,
+    default_socket: PathBuf,
+    state: PathBuf,
+    log_override: Option<LogLevel>,
+) -> Result<()> {
     let cfg = load_config(config)?;
     init_logging(log_override.unwrap_or(cfg.log_level));
     let socket = cfg.socket.unwrap_or(default_socket);
@@ -321,11 +360,39 @@ pub fn run(config: &Path, default_socket: PathBuf, log_override: Option<LogLevel
         eprintln!("losslessd: player thread died; exiting");
         std::process::exit(70);
     });
-    let daemon = Daemon::start(player, events, cfg.music_dir, on_player_gone)?;
+    let daemon = Daemon::start(player, events, cfg.music_dir, state, on_player_gone)?;
     if let Err(e) = daemon.rescan() {
         warn!("library: {e}");
     }
     daemon.serve(listener);
+    Ok(())
+}
+
+/// Put back the session saved at `path`, minus entries whose files are gone.
+fn restore(player: &Player, path: &Path) -> Result<()> {
+    let saved = match state::load(path) {
+        Ok(Some(s)) => s,
+        Ok(None) => return Ok(()),
+        Err(e) => {
+            warn!("state: {e}; starting with an empty queue");
+            return Ok(());
+        }
+    };
+    let (s, dropped) = saved.prune();
+    if dropped > 0 {
+        warn!("state: dropped {dropped} missing entries");
+    }
+    if s.queue.is_empty() {
+        return Ok(());
+    }
+    info!("state: restored {} entries", s.queue.len());
+    player.send(PlayerCmd::Restore {
+        queue: s.queue,
+        index: s.index,
+        position_ms: s.position_ms,
+        repeat: s.repeat,
+        random: s.random,
+    })?;
     Ok(())
 }
 
@@ -335,29 +402,34 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    /// Wire a player (and its event stream) to a new daemon.
+    /// Wire a player (and its event stream) to a new daemon, restoring the
+    /// session saved at `state_file`. Its directory must be creatable; the
+    /// file itself may be missing or broken (then the queue starts empty).
     pub fn start(
         player: Player,
         events: Receiver<Event>,
         music_dir: Option<PathBuf>,
+        state_file: PathBuf,
         on_player_gone: Box<dyn FnOnce() + Send>,
     ) -> Result<Self> {
+        let dir = state_file.parent().unwrap_or(Path::new("/"));
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("creating state directory {}", dir.display()))?;
+        restore(&player, &state_file)?;
         let subscribers = Arc::new(Mutex::new(Vec::new()));
-        {
-            let subs = Arc::clone(&subscribers);
-            thread::Builder::new()
-                .name("events".into())
-                .spawn(move || fan_out(events, subs, on_player_gone))?;
-        }
-        Ok(Self {
-            state: Arc::new(State {
-                player,
-                music_dir,
-                subscribers,
-                library: Arc::new(RwLock::new(Library::default())),
-                scanning: Arc::new(AtomicBool::new(false)),
-            }),
-        })
+        let state = Arc::new(State {
+            player,
+            state_file,
+            music_dir,
+            subscribers: Arc::clone(&subscribers),
+            library: Arc::new(RwLock::new(Library::default())),
+            scanning: Arc::new(AtomicBool::new(false)),
+        });
+        let weak = Arc::downgrade(&state);
+        thread::Builder::new()
+            .name("events".into())
+            .spawn(move || fan_out(events, weak, subscribers, on_player_gone))?;
+        Ok(Self { state })
     }
 
     /// Start a background scan of the music directory, if there is one.
@@ -401,8 +473,9 @@ mod tests {
     use lossless_engine::fixtures::{Dir, PacedSink, flac};
     use lossless_engine::{Command as PlayerCmd, Player};
     use lossless_library::{Library, collect};
+    use lossless_proto::{PlayState, Repeat};
 
-    use super::{ClearOnDrop, Daemon, MAX_REQUEST, serve, spawn_scan};
+    use super::{ClearOnDrop, Daemon, MAX_REQUEST, saved, serve, spawn_scan};
 
     fn scan(root: PathBuf, busy: bool) -> (Option<std::thread::JoinHandle<()>>, Arc<AtomicBool>) {
         let flag = Arc::new(AtomicBool::new(busy));
@@ -429,8 +502,10 @@ mod tests {
 
     #[test]
     fn a_client_gone_before_its_error_reply_ends_only_its_session() {
+        let dir = Dir::new();
         let (player, events) = Player::spawn_with(PacedSink::default());
-        let daemon = Daemon::start(player, events, None, Box::new(|| {})).unwrap();
+        let daemon =
+            Daemon::start(player, events, None, dir.path("s.json"), Box::new(|| {})).unwrap();
         let (server, mut client) = UnixStream::pair().unwrap();
         client.write_all(&vec![b'x'; MAX_REQUEST + 1]).unwrap();
         drop(client);
@@ -440,8 +515,10 @@ mod tests {
 
     #[test]
     fn a_failed_accept_does_not_stop_serving() {
+        let dir = Dir::new();
         let (player, events) = Player::spawn_with(PacedSink::default());
-        let daemon = Daemon::start(player, events, None, Box::new(|| {})).unwrap();
+        let daemon =
+            Daemon::start(player, events, None, dir.path("s.json"), Box::new(|| {})).unwrap();
         let (server, mut client) = UnixStream::pair().unwrap();
         daemon.accept([
             Err(std::io::Error::other("too many open files")),
@@ -469,8 +546,14 @@ mod tests {
     fn update_while_scanning_is_scan_running() {
         let (player, events) = Player::spawn_with(PacedSink::default());
         let dir = Dir::new();
-        let daemon =
-            Daemon::start(player, events, Some(dir.path("music")), Box::new(|| {})).unwrap();
+        let daemon = Daemon::start(
+            player,
+            events,
+            Some(dir.path("music")),
+            dir.path("s.json"),
+            Box::new(|| {}),
+        )
+        .unwrap();
         daemon.state.scanning.store(true, Ordering::SeqCst);
         let line = reply_line(&daemon, "{\"id\":3,\"cmd\":\"update\"}\n");
         assert!(line.contains("\"id\":3"), "{line}");
@@ -491,7 +574,7 @@ mod tests {
         let (player, events) = Player::spawn_with(sink);
         let (tx, rx) = std::sync::mpsc::channel();
         let gone = Box::new(move || tx.send(()).unwrap());
-        let daemon = Daemon::start(player, events, None, gone).unwrap();
+        let daemon = Daemon::start(player, events, None, dir.path("s.json"), gone).unwrap();
         let mut tracks = Vec::new();
         collect(&fixture.path, &mut tracks).unwrap();
         daemon
@@ -504,6 +587,57 @@ mod tests {
             .unwrap();
         daemon.state.player.send(PlayerCmd::Play(None)).unwrap();
         rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    }
+
+    fn restored(dir: &Dir, text: &str) -> lossless_engine::Snapshot {
+        let state = dir.path("state.json");
+        std::fs::write(&state, text).unwrap();
+        let (player, events) = Player::spawn_with(PacedSink::default());
+        let daemon = Daemon::start(player, events, None, state, Box::new(|| {})).unwrap();
+        daemon.state.player.snapshot()
+    }
+
+    #[test]
+    fn restore_drops_gone_paths_and_survives_corrupt_state() {
+        let dir = Dir::new();
+        let a = flac(&dir, "a.flac", 44_100, 16, 2, 4 * 4096).path;
+        let text = format!(
+            r#"{{"queue":["/gone.flac","{}"],"index":1,"position_ms":20,"repeat":"one","random":false}}"#,
+            a.display()
+        );
+        let snap = restored(&dir, &text);
+        assert_eq!(&*snap.queue, [a]);
+        assert_eq!(
+            (
+                snap.status.state,
+                snap.status.index,
+                snap.status.position_ms
+            ),
+            (PlayState::Paused, Some(0), 20)
+        );
+        assert_eq!(snap.status.repeat, Repeat::One);
+        for text in [
+            r#"{"queue":["/gone.flac"],"index":0,"position_ms":0,"repeat":"off","random":false}"#,
+            r#"{"queue":"#,
+        ] {
+            let snap = restored(&dir, text);
+            assert!(snap.queue.is_empty());
+            assert_eq!(snap.status.state, PlayState::Stopped);
+        }
+    }
+
+    #[test]
+    fn non_utf8_paths_are_saved_lossily() {
+        use std::os::unix::ffi::OsStrExt;
+        let odd = PathBuf::from(std::ffi::OsStr::from_bytes(b"/m/\xff.flac"));
+        let (player, _events) = Player::spawn_with(PacedSink::default());
+        let mut snap = player.snapshot();
+        snap.queue = vec![odd, PathBuf::from("/m/a.flac")].into();
+        snap.status.index = Some(1);
+        let s = saved(&snap);
+        assert_eq!(s.queue[1], PathBuf::from("/m/a.flac"));
+        assert!(s.queue[0].to_str().is_some());
+        assert_eq!(s.index, Some(1));
     }
 
     #[test]

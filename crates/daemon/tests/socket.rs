@@ -34,12 +34,18 @@ impl Server {
         for d in ["album", ".incomplete", "empty"] {
             std::fs::create_dir_all(music.join(d)).unwrap();
         }
-        let listener = bind(&dir.path("sock")).unwrap();
+        let s = Self { dir };
+        s.serve("sock", with_music.then_some(music), mixer);
+        s
+    }
+
+    /// Another daemon on the same state file, as after a restart.
+    fn serve(&self, socket: &str, music: Option<PathBuf>, mixer: Option<Box<dyn Mixer>>) {
+        let listener = bind(&self.dir.path(socket)).unwrap();
         let (player, events) = Player::spawn_with_mixer(PacedSink::default(), mixer);
-        let daemon =
-            Daemon::start(player, events, with_music.then_some(music), Box::new(|| {})).unwrap();
+        let state = self.dir.path("state/state.json");
+        let daemon = Daemon::start(player, events, music, state, Box::new(|| {})).unwrap();
         thread::spawn(move || daemon.serve(listener));
-        Self { dir }
     }
 
     fn music(&self) -> PathBuf {
@@ -721,4 +727,46 @@ fn volume_over_the_socket() {
         (e.code, e.message.as_str()),
         (ErrorCode::NoMixer, "no hardware mixer")
     );
+}
+
+#[test]
+fn restart_restores_queue_paused_at_position() {
+    let s = Server::start(true);
+    let track = flac_at(&s.music().join("long.flac"), 8_000, 16, 2, 120 * BLOCK).path;
+    let mut c = s.connect();
+    c.ok(Command::Subscribe);
+    c.ok(Command::Add {
+        paths: vec![track.display().to_string(); 2],
+        at: None,
+    });
+    c.ok(Command::SetMode {
+        repeat: Some(Repeat::Queue),
+        random: Some(true),
+    });
+    c.ok(Command::Play { index: Some(1) });
+    c.ok(Command::Seek { ms: 60_000 });
+    c.ok(Command::Pause);
+    c.wait_for(|e| {
+        matches!(
+            e,
+            Event::State {
+                state: PlayState::Paused,
+                ..
+            }
+        )
+    });
+    let before = status(&mut c);
+    assert!((60_000..61_000).contains(&before.position_ms), "{before:?}");
+
+    s.serve("sock2", Some(s.music()), None);
+    let mut c = Client::connect(&s.dir.path("sock2"));
+    let st = status(&mut c);
+    assert_eq!(
+        (st.state, st.index, st.repeat, st.random, st.output),
+        (PlayState::Paused, Some(1), Repeat::Queue, true, None)
+    );
+    assert!(st.position_ms.abs_diff(before.position_ms) <= 1, "{st:?}");
+    assert_eq!(queue(&mut c), vec![track.display().to_string(); 2]);
+    c.ok(Command::Toggle);
+    assert_eq!(status(&mut c).state, PlayState::Playing);
 }
