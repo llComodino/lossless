@@ -19,9 +19,9 @@ pub trait Mixer: Send {
         None
     }
 
-    /// Start a thread that reports changes made outside the daemon. Only a
-    /// hardware mixer has any.
-    fn watch(&self, _on_change: Box<dyn Fn(u8) + Send>) -> Result<Option<JoinHandle<()>>> {
+    /// Start a thread that reports changes made outside the daemon, until
+    /// `on_change` returns false. Only a hardware mixer has any.
+    fn watch(&self, _on_change: Box<dyn Fn(u8) -> bool + Send>) -> Result<Option<JoinHandle<()>>> {
         Ok(None)
     }
 
@@ -230,7 +230,7 @@ impl Mixer for HardwareMixer {
         .map_err(|e| device_error(&self.device, e))
     }
 
-    fn watch(&self, on_change: Box<dyn Fn(u8) + Send>) -> Result<Option<JoinHandle<()>>> {
+    fn watch(&self, on_change: Box<dyn Fn(u8) -> bool + Send>) -> Result<Option<JoinHandle<()>>> {
         watch(&self.card, &self.control, on_change).map(Some)
     }
 
@@ -240,12 +240,13 @@ impl Mixer for HardwareMixer {
     }
 }
 
-/// Report every change of `control` on `card` until the card goes away.
-/// The thread sleeps in `poll` with no timeout: nothing runs between events.
+/// Report every change of `control` on `card` until the card goes away or
+/// `on_change` returns false (nobody listens any more). The thread sleeps in
+/// `poll` with no timeout: nothing runs between events.
 pub fn watch(
     card: &str,
     control: &str,
-    on_change: impl Fn(u8) + Send + 'static,
+    on_change: impl Fn(u8) -> bool + Send + 'static,
 ) -> Result<JoinHandle<()>> {
     let m = HardwareMixer::new(card, control)?;
     let mut fds = m.mixer.get().map_err(|e| device_error(&m.device, e))?;
@@ -257,10 +258,11 @@ pub fn watch(
 
 /// Pass each level read to `on_change`; the first error ends the watch. The
 /// player starts a new one on its next successful `ensure`.
-fn relay(mut next: impl FnMut() -> Result<u8>, on_change: impl Fn(u8)) {
+fn relay(mut next: impl FnMut() -> Result<u8>, mut on_change: impl FnMut(u8) -> bool) {
     loop {
         match next() {
-            Ok(p) => on_change(p),
+            Ok(p) if on_change(p) => {}
+            Ok(_) => return,
             Err(e) => {
                 log::warn!("mixer: {e}; watcher stopped");
                 return;
@@ -532,7 +534,7 @@ mod tests {
         let err = HardwareMixer::new("NoSuchCard9", "PCM").err().unwrap();
         assert_eq!(err.code(), lossless_proto::ErrorCode::Device);
         assert!(err.to_string().starts_with("hw:NoSuchCard9: "), "{err}");
-        assert!(watch("NoSuchCard9", "PCM", |_| {}).is_err());
+        assert!(watch("NoSuchCard9", "PCM", |_| true).is_err());
         let kind = MixerKind::Hardware {
             card: "NoSuchCard9".into(),
             control: "PCM".into(),
@@ -542,7 +544,7 @@ mod tests {
         let mut soft = MixerKind::Software.open().unwrap();
         assert!(soft.gain().is_some());
         soft.set(10).unwrap();
-        assert!(soft.watch(Box::new(|_| {})).unwrap().is_none());
+        assert!(soft.watch(Box::new(|_| true)).unwrap().is_none());
         soft.reopen().unwrap();
     }
 
@@ -575,7 +577,13 @@ mod tests {
             Ok(30),
         ];
         let seen = Mutex::new(Vec::new());
-        relay(|| reads.pop().unwrap(), |p| seen.lock().unwrap().push(p));
+        relay(
+            || reads.pop().unwrap(),
+            |p| {
+                seen.lock().unwrap().push(p);
+                true
+            },
+        );
         assert_eq!(*seen.lock().unwrap(), [30, 40]);
         let log = LOG.lock().unwrap();
         assert!(
@@ -583,6 +591,24 @@ mod tests {
                 .any(|l| l == "mixer: hw:Gone: No such device; watcher stopped"),
             "{log:?}"
         );
+    }
+
+    #[test]
+    fn the_watcher_ends_with_the_player() {
+        let mut reads = 0;
+        let mut calls = 0;
+        let on_change = |p: u8| p < 2;
+        relay(
+            || {
+                reads += 1;
+                Ok(reads)
+            },
+            |p| {
+                calls += 1;
+                on_change(p)
+            },
+        );
+        assert_eq!((reads, calls), (2, 2), "stops once nobody listens");
     }
 
     /// Restores the control to raw 120 (0 dB on the PRO2), even if an
@@ -607,10 +633,7 @@ mod tests {
         let got = m.get().unwrap();
         assert!(got.abs_diff(50) <= 1, "read back {got}");
         let (tx, rx) = std::sync::mpsc::channel();
-        let _w = watch(&card, "PCM", move |p| {
-            let _ = tx.send(p);
-        })
-        .unwrap();
+        let _w = watch(&card, "PCM", move |p| tx.send(p).is_ok()).unwrap();
         let ok = std::process::Command::new("amixer")
             .args(["-q", "-c", &card, "sset", "PCM", "100"])
             .status()

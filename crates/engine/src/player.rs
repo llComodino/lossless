@@ -335,10 +335,11 @@ impl<S: Sink> Worker<S> {
         let Some(m) = &self.mixer else { return };
         let tx = self.tx.clone();
         let report = Box::new(move |p| {
-            let _ = tx.send(Envelope {
+            tx.send(Envelope {
                 cmd: Command::VolumeChanged(p),
                 done: None,
-            });
+            })
+            .is_ok()
         });
         match m.watch(report) {
             Ok(w) => self.watcher = w,
@@ -914,7 +915,7 @@ mod tests {
         assert_eq!(w.output.heard.len(), concat(&[&a]).len());
     }
 
-    type Watch = (Box<dyn Fn(u8) + Send>, Option<mpsc::Sender<()>>);
+    type Watch = (Box<dyn Fn(u8) -> bool + Send>, Option<mpsc::Sender<()>>);
 
     /// A mixer whose watchers run until the test ends them.
     struct FakeMixer {
@@ -950,7 +951,10 @@ mod tests {
             self.level = percent;
             Ok(())
         }
-        fn watch(&self, on_change: Box<dyn Fn(u8) + Send>) -> Result<Option<JoinHandle<()>>> {
+        fn watch(
+            &self,
+            on_change: Box<dyn Fn(u8) -> bool + Send>,
+        ) -> Result<Option<JoinHandle<()>>> {
             let (end, ended) = mpsc::channel::<()>();
             self.watches.lock().unwrap().push((on_change, Some(end)));
             Ok(Some(thread::spawn(move || {
@@ -1094,13 +1098,16 @@ mod tests {
             let w = watches.lock().unwrap();
             assert_eq!(w.len(), 1, "armed when the player starts");
             for p in [100, 70, 70] {
-                (w[0].0)(p);
+                assert!((w[0].0)(p));
             }
         }
         player.send(Command::Stop).unwrap();
         assert_eq!(player.snapshot().status.volume, Some(70));
         assert_eq!(volumes(&events), [70]);
-        watches.lock().unwrap()[0].1.take();
+        drop(player);
+        let mut w = watches.lock().unwrap();
+        assert!(!(w[0].0)(50), "the watcher learns the player is gone");
+        w[0].1.take();
     }
 
     #[test]
