@@ -12,8 +12,8 @@ use lossless_daemon::{Daemon, MAX_REQUEST, bind, parse_config};
 use lossless_engine::Player;
 use lossless_engine::fixtures::{BLOCK, Dir, PacedSink, flac_at};
 use lossless_proto::{
-    Body, Command, ErrorCode, Event, Outcome, PlayState, Repeat, Request, ServerMessage, WireError,
-    decode, encode,
+    Body, Command, Entry, ErrorCode, Event, Outcome, PlayState, Repeat, Request, ServerMessage,
+    WireError, decode, encode,
 };
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -299,6 +299,65 @@ fn update_scans_and_search_finds() {
         Body::Tracks(t) => assert!(t.is_empty()),
         other => panic!("{other:?}"),
     }
+}
+
+#[test]
+fn listings_over_the_socket() {
+    let s = Server::start(true);
+    s.album(1);
+    let mut c = s.connect();
+    c.ok(Command::Subscribe);
+    c.ok(Command::Update);
+    c.wait_for(|e| matches!(e, Event::LibraryChanged { .. }));
+    let Body::Entries(top) = c.ok(Command::Browse { path: "".into() }) else {
+        panic!("not entries")
+    };
+    assert_eq!(
+        top,
+        vec![Entry::Dir {
+            name: "album".into(),
+            path: "album".into()
+        }]
+    );
+    let Body::Entries(inner) = c.ok(Command::Browse {
+        path: "album".into(),
+    }) else {
+        panic!("not entries")
+    };
+    assert_eq!(inner.len(), 2);
+    assert!(matches!(&inner[0], Entry::Track(t) if t.path.ends_with("01 one.flac")));
+    let e = c.err(Command::Browse {
+        path: "nope".into(),
+    });
+    assert_eq!(e.code, ErrorCode::NotFound);
+    assert_eq!(c.ok(Command::Artists), Body::Names(vec!["Unknown".into()]));
+    assert_eq!(
+        c.ok(Command::Albums { artist: None }),
+        Body::Names(vec!["Unknown".into()])
+    );
+    let Body::Tracks(all) = c.ok(Command::Find {
+        artist: None,
+        album: None,
+    }) else {
+        panic!("not tracks")
+    };
+    assert_eq!(all.len(), 2);
+    let Body::Tracks(none) = c.ok(Command::Find {
+        artist: Some("Nobody".into()),
+        album: None,
+    }) else {
+        panic!("not tracks")
+    };
+    assert!(none.is_empty());
+}
+
+#[test]
+fn listings_without_music_dir() {
+    let s = Server::start(false);
+    let mut c = s.connect();
+    let e = c.err(Command::Browse { path: "".into() });
+    assert_eq!(e.code, ErrorCode::NoMusicDir);
+    assert_eq!(c.ok(Command::Artists), Body::Names(vec![]));
 }
 
 #[test]

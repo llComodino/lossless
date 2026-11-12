@@ -196,6 +196,30 @@ impl State {
                     lib.search(&query).into_iter().cloned().collect(),
                 ))
             }
+            Command::Browse { path } => {
+                if self.music_dir.is_none() {
+                    return Err(RequestError::NoMusicDir);
+                }
+                let lib = self.library.read().unwrap_or_else(PoisonError::into_inner);
+                Ok(Body::Entries(lib.browse(&path)?))
+            }
+            Command::Artists => {
+                let lib = self.library.read().unwrap_or_else(PoisonError::into_inner);
+                Ok(Body::Names(lib.artists()))
+            }
+            Command::Albums { artist } => {
+                let lib = self.library.read().unwrap_or_else(PoisonError::into_inner);
+                Ok(Body::Names(lib.albums(artist.as_deref())))
+            }
+            Command::Find { artist, album } => {
+                let lib = self.library.read().unwrap_or_else(PoisonError::into_inner);
+                Ok(Body::Tracks(
+                    lib.find(artist.as_deref(), album.as_deref())
+                        .into_iter()
+                        .cloned()
+                        .collect(),
+                ))
+            }
             Command::Update => self.rescan().map(|_| Body::Done),
             Command::Add { paths, at } => play(PlayerCmd::Add {
                 paths: self.tracks(&paths)?,

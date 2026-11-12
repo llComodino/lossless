@@ -27,6 +27,8 @@ First development version, not yet tagged.
   one stays gapless; random plays each entry once per cycle.
 - Library scan with tags (artist, album, title, track number, duration,
   format) and word search; rescan on demand.
+- Library listings: `browse` by folder, `artists`, `albums` and `find`, over
+  the socket and in `lossless`.
 - Newline-delimited JSON protocol over a unix socket, with request ids and
   events (`state`, `track_changed`, `queue_changed`, `library_changed`) for
   subscribed clients.
