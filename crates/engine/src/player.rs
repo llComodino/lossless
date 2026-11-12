@@ -1054,15 +1054,14 @@ mod tests {
         let a = flac(&d, "a.flac", 44_100, 16, 2, 4 * BLOCK);
         let bytes = std::fs::read(&a.path).unwrap();
         let cut = write_bytes(&d, "cut.flac", &bytes[..bytes.len() / 2]);
-        let (player, _events) = Player::spawn_with(FakeSink::default());
-        player
-            .send(Command::Add {
-                paths: vec![cut],
-                at: None,
-            })
-            .unwrap();
-        player.send(Command::Play(None)).unwrap();
-        let err = player.send(Command::Seek { ms: 350 }).unwrap_err();
+        let (mut w, _events) = worker(FakeSink::default());
+        w.handle(Command::Add {
+            paths: vec![cut],
+            at: None,
+        })
+        .unwrap();
+        w.handle(Command::Play(None)).unwrap();
+        let err = w.handle(Command::Seek { ms: 350 }).unwrap_err();
         assert!(matches!(err, Error::Decode { .. }), "{err}");
     }
 
