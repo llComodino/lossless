@@ -10,7 +10,7 @@ mod queue;
 mod source;
 
 pub use error::{Error, Result};
-pub use mixer::{Mixer, MixerKind, MixerSetting, SoftwareMixer, choose};
+pub use mixer::{HardwareMixer, Mixer, MixerKind, MixerSetting, SoftwareMixer, choose, watch};
 pub use output::{Output, Sink};
 pub use player::{Command, Player, Snapshot};
 pub use source::Source;

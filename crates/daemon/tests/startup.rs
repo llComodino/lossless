@@ -74,6 +74,52 @@ fn run_falls_back_to_the_default_socket() {
 }
 
 #[test]
+fn a_missing_mixer_card_runs_without_volume() {
+    let dir = Dir::new();
+    let sock = dir.path("s.sock");
+    let cfg = write_config(
+        &dir,
+        &format!(
+            "device = \"hw:CARD=NoSuchCard9,DEV=0\"\nmixer = \"hardware\"\nsocket = \"{}\"\n",
+            sock.display()
+        ),
+    );
+    thread::spawn(move || run(&cfg, PathBuf::from("/nonexistent"), None));
+    let c = connect(&sock);
+    let reply = call(&c, r#"{"id":1,"cmd":"set_volume","percent":50}"#);
+    assert!(reply.contains(r#""code":"no_mixer""#), "{reply}");
+    assert!(call(&c, r#"{"id":2,"cmd":"status"}"#).contains(r#""volume":null"#));
+}
+
+#[test]
+fn a_missing_mixer_card_is_logged() {
+    let dir = Dir::new();
+    xdg_config(
+        &dir,
+        &format!(
+            "device = \"hw:CARD=NoSuchCard9,DEV=0\"\nsocket = \"{}\"\n",
+            dir.path("s.sock").display()
+        ),
+    );
+    let mut child = spawn_with(&dir, &["--log-level", "warn"]);
+    let stderr = child.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if line.starts_with("WARN") && line.contains("hw:NoSuchCard9") {
+                let _ = tx.send(line);
+                return;
+            }
+        }
+    });
+    let got = rx.recv_timeout(Duration::from_secs(10));
+    let _ = child.kill();
+    let _ = child.wait();
+    let line = got.expect("no mixer warning on stderr");
+    assert!(line.ends_with("; no volume control"), "{line}");
+}
+
+#[test]
 fn run_stops_on_a_bad_config_or_socket() {
     let dir = Dir::new();
     let bad = write_config(&dir, "device = \"file:'|id'\"\n");

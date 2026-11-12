@@ -71,7 +71,7 @@ is the only thing the playback path knows how to do.
 | Queue: insert at position, remove, move, play now | yes | the playing track keeps its place |
 | Repeat (queue / one), random | yes | repeat one stays gapless; next skips past it |
 | Browse by folder, artist, album | yes | `browse`, `artists`, `albums`, `find` |
-| Volume: DAC hardware mixer, or software gain on the PipeWire path | planned | the bit-perfect path never scales samples |
+| Volume: DAC hardware mixer, or software gain on the PipeWire path | yes | the bit-perfect path never scales samples; changes from `alsamixer` are reported |
 | Queue and position restored after restart | planned | |
 | Terminal UI (`losslessd-tui`) | planned | |
 | MPRIS (media keys, bars) | planned | |
@@ -119,6 +119,9 @@ music_dir = "~/Music"
 # mixer = "auto"
 
 # ALSA mixer control the hardware mixer drives (1 to 44 of A-Za-z0-9 _-).
+# Percent is linear over its dB range (raw range without dB information).
+# A card or control that can't be opened is logged as a warning and the
+# daemon runs without volume (`no_mixer`).
 # mixer_control = "PCM"
 ```
 
@@ -174,6 +177,8 @@ lossless status
 lossless seek 2:30
 lossless repeat queue            # off | queue | one
 lossless random on               # on | off
+lossless volume                  # print the level, or "no mixer"
+lossless volume 40               # or: volume +5, volume -10 (clamped 0-100)
 lossless pause | toggle | stop | next | prev
 lossless queue
 lossless clear
@@ -181,8 +186,9 @@ lossless watch                   # print events until interrupted
 lossless --json status           # raw protocol replies
 ```
 
-`status` shows what the device was actually opened with, then the modes,
-e.g. `playing  #1  0:12/4:31  output 24-bit/96 kHz/2ch repeat:off random:off`.
+`status` shows what the device was actually opened with, then the modes and
+the volume when there is a mixer, e.g.
+`playing  #1  0:12/4:31  output 24-bit/96 kHz/2ch repeat:off random:off vol 80%`.
 To check from the kernel
 side that nothing converted the stream, read the device's hardware
 parameters while playing:

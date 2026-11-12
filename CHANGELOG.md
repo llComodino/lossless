@@ -35,6 +35,9 @@ First development version, not yet tagged.
 - Event-driven position: no ticks, zero wakeups while idle; clients derive
   the position from the last state event.
 - Volume mixer config (`mixer`, `mixer_control`) and software gain.
+- Volume end to end: the DAC's hardware mixer (changes made outside the
+  daemon reported too), `set_volume` and the `volume` event, `volume` in
+  status, and `lossless volume [N|+N|-N]`.
 - TOML config (`device`, `music_dir`, `socket`) with strict validation.
 - `lossless`: command line client (`status`, `queue`, `add`, `play`,
   `pause`, `toggle`, `stop`, `next`, `prev`, `seek`, `clear`, `search`,

@@ -91,6 +91,10 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         album: Option<String>,
     },
+    /// 0 to 100; `no_mixer` when the device has none.
+    SetVolume {
+        percent: u8,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -178,6 +182,10 @@ pub enum Event {
     LibraryChanged {
         tracks: usize,
     },
+    /// Sent on every `set_volume` and on changes made outside the daemon.
+    Volume {
+        percent: u8,
+    },
     Error(WireError),
 }
 
@@ -206,6 +214,9 @@ pub struct Status {
     pub repeat: Repeat,
     #[serde(default)]
     pub random: bool,
+    /// `None` without a mixer.
+    #[serde(default)]
+    pub volume: Option<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -394,6 +405,28 @@ mod tests {
     }
 
     #[test]
+    fn volume_on_the_wire() {
+        let req = Request {
+            id: 6,
+            command: Command::SetVolume { percent: 40 },
+        };
+        assert_eq!(
+            encode(&req).unwrap(),
+            "{\"id\":6,\"cmd\":\"set_volume\",\"percent\":40}\n"
+        );
+        let ev = ServerMessage::Event {
+            event: Event::Volume { percent: 40 },
+        };
+        assert_eq!(
+            encode(&ev).unwrap(),
+            "{\"type\":\"event\",\"event\":\"volume\",\"percent\":40}\n"
+        );
+        let old =
+            r#"{"state":"stopped","index":null,"position_ms":0,"duration_ms":null,"output":null}"#;
+        assert_eq!(decode::<Status>(old).unwrap().volume, None);
+    }
+
+    #[test]
     fn reply_and_event_wire_format() {
         let ok = ServerMessage::Reply {
             id: 7,
@@ -546,6 +579,7 @@ mod props {
             of(any::<String>()).prop_map(|artist| Command::Albums { artist }),
             (of(any::<String>()), of(any::<String>()))
                 .prop_map(|(artist, album)| Command::Find { artist, album }),
+            any::<u8>().prop_map(|percent| Command::SetVolume { percent }),
         ]
     }
 
@@ -560,6 +594,7 @@ mod props {
             of(wire_error()),
             repeat(),
             any::<bool>(),
+            of(any::<u8>()),
         )
             .prop_map(
                 |(
@@ -572,6 +607,7 @@ mod props {
                     last_error,
                     repeat,
                     random,
+                    volume,
                 )| {
                     Status {
                         state,
@@ -583,6 +619,7 @@ mod props {
                         last_error,
                         repeat,
                         random,
+                        volume,
                     }
                 },
             )
@@ -611,6 +648,7 @@ mod props {
             Just(Event::QueueChanged),
             (repeat(), any::<bool>()).prop_map(|(repeat, random)| Event::Mode { repeat, random }),
             any::<usize>().prop_map(|tracks| Event::LibraryChanged { tracks }),
+            any::<u8>().prop_map(|percent| Event::Volume { percent }),
             wire_error().prop_map(Event::Error),
         ]
     }

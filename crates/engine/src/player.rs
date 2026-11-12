@@ -45,6 +45,8 @@ pub enum Command {
     },
     /// Percent, 0 to 100.
     SetVolume(u8),
+    /// The level the mixer watcher read after a change on the card.
+    VolumeChanged(u8),
     Shutdown,
 }
 
@@ -105,7 +107,7 @@ impl Player {
         mixer: Option<Box<dyn Mixer>>,
     ) -> (Self, Receiver<Event>) {
         let (tx, rx) = mpsc::channel();
-        let (worker, events_rx) = Worker::new(sink, rx, mixer);
+        let (worker, events_rx) = Worker::new(sink, tx.clone(), rx, mixer);
         let shared = Arc::clone(&worker.shared);
         let thread = thread::Builder::new()
             .name("player".into())
@@ -156,6 +158,7 @@ impl Shared {
                 last_error: None,
                 repeat: Repeat::Off,
                 random: false,
+                volume: None,
             },
             queue: Arc::from(Vec::new()),
             anchor: None,
@@ -204,6 +207,8 @@ struct Worker<S: Sink> {
     /// track change, while the previous track's tail is still buffered).
     anchor_ms: u64,
     anchor_at: Instant,
+    /// For the mixer watcher's reports.
+    tx: Sender<Envelope>,
     rx: Receiver<Envelope>,
     events: Sender<Event>,
     /// Events of the current step, sent only after the snapshot is
@@ -218,16 +223,25 @@ struct Worker<S: Sink> {
     queue_dirty: bool,
     mixer: Option<Box<dyn Mixer>>,
     gain: Option<Arc<AtomicU8>>,
+    /// The last level published.
+    volume: Option<u8>,
+    watcher: Option<JoinHandle<()>>,
+    /// A watcher ended, so the card went away: reopen the mixer before use.
+    stale: bool,
     scratch: Vec<i32>,
 }
 
 impl<S: Sink> Worker<S> {
     fn new(
         output: S,
+        tx: Sender<Envelope>,
         rx: Receiver<Envelope>,
         mixer: Option<Box<dyn Mixer>>,
     ) -> (Self, Receiver<Event>) {
         let (events, events_rx) = mpsc::channel();
+        let volume = mixer.as_ref().and_then(|m| m.get().ok());
+        let mut shared = Shared::new();
+        shared.status.volume = volume;
         let worker = Self {
             output,
             queue: Queue::default(),
@@ -236,22 +250,27 @@ impl<S: Sink> Worker<S> {
             written: 0,
             anchor_ms: 0,
             anchor_at: Instant::now(),
+            tx,
             rx,
             events,
             pending: Vec::new(),
             last_error: None,
             keep_error: false,
-            shared: Arc::new(Mutex::new(Shared::new())),
+            shared: Arc::new(Mutex::new(shared)),
             dirty: false,
             queue_dirty: false,
             gain: mixer.as_ref().and_then(|m| m.gain()),
             mixer,
+            volume,
+            watcher: None,
+            stale: false,
             scratch: Vec::new(),
         };
         (worker, events_rx)
     }
 
     fn run(mut self) {
+        self.arm();
         loop {
             // Idle: block until a command arrives. Playing: take whatever is
             // queued without waiting; the device paces the loop because
@@ -290,6 +309,49 @@ impl<S: Sink> Worker<S> {
         }
         if self.dirty {
             self.publish();
+        }
+    }
+
+    /// Start the mixer watcher unless one is running. A watcher ends when
+    /// its card goes away; the next successful `ensure` comes back here.
+    fn arm(&mut self) {
+        if self.watcher.as_ref().is_some_and(JoinHandle::is_finished) {
+            self.watcher = None;
+            self.stale = true;
+        }
+        if self.watcher.is_some() {
+            return;
+        }
+        let Some(m) = self.mixer.as_mut() else { return };
+        if self.stale {
+            if let Err(e) = m.reopen() {
+                return log::warn!("mixer: {e}");
+            }
+            self.stale = false;
+            if let Ok(p) = m.get() {
+                self.volume_seen(p);
+            }
+        }
+        let Some(m) = &self.mixer else { return };
+        let tx = self.tx.clone();
+        let report = Box::new(move |p| {
+            let _ = tx.send(Envelope {
+                cmd: Command::VolumeChanged(p),
+                done: None,
+            });
+        });
+        match m.watch(report) {
+            Ok(w) => self.watcher = w,
+            Err(e) => log::warn!("mixer: {e}"),
+        }
+    }
+
+    /// A level read from the mixer: published only if it changed, so the
+    /// watcher's echo of our own `SetVolume` is not reported twice.
+    fn volume_seen(&mut self, percent: u8) {
+        if self.volume != Some(percent) {
+            self.volume = Some(percent);
+            self.emit(Event::Volume { percent });
         }
     }
 
@@ -355,6 +417,7 @@ impl<S: Sink> Worker<S> {
             last_error: self.last_error.clone(),
             repeat: self.queue.repeat(),
             random: self.queue.random(),
+            volume: self.volume,
         };
         shared.anchor = (self.state == PlayState::Playing).then_some(self.anchor_at);
         if self.queue_dirty {
@@ -462,6 +525,7 @@ impl<S: Sink> Worker<S> {
                             self.anchor_ms = 0;
                             self.anchor_at = starts_at;
                             self.emit(Event::TrackChanged { index: Some(index) });
+                            self.arm();
                             return;
                         }
                         Err(e) => {
@@ -668,10 +732,14 @@ impl<S: Sink> Worker<S> {
                     "volume {percent} out of range 0 to 100"
                 )));
             }
-            Command::SetVolume(percent) => match self.mixer.as_mut() {
-                Some(m) => m.set(percent)?,
-                None => return Err(Error::NoMixer),
-            },
+            Command::SetVolume(percent) => {
+                let m = self.mixer.as_mut().ok_or(Error::NoMixer)?;
+                m.set(percent)?;
+                let now = m.get().unwrap_or(percent);
+                self.volume = Some(now);
+                self.emit(Event::Volume { percent: now });
+            }
+            Command::VolumeChanged(percent) => self.volume_seen(percent),
             Command::Shutdown => {}
         }
         Ok(())
@@ -680,7 +748,8 @@ impl<S: Sink> Worker<S> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
 
     use lossless_proto::{ErrorCode, Event, PlayState, Repeat, StreamFormat};
@@ -767,15 +836,15 @@ mod tests {
     }
 
     fn worker(sink: FakeSink) -> (Worker<FakeSink>, mpsc::Receiver<Event>) {
-        let (_tx, rx) = mpsc::channel();
-        Worker::new(sink, rx, None)
+        let (tx, rx) = mpsc::channel();
+        Worker::new(sink, tx, rx, None)
     }
 
     fn mixed_worker(sink: FakeSink, p: u8) -> Worker<FakeSink> {
-        let (_tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::channel();
         let mut m = SoftwareMixer::new();
         m.set(p).unwrap();
-        Worker::new(sink, rx, Some(Box::new(m))).0
+        Worker::new(sink, tx, rx, Some(Box::new(m))).0
     }
 
     /// Run until playback stops (bounded so a bug can't hang the test).
@@ -845,16 +914,193 @@ mod tests {
         assert_eq!(w.output.heard.len(), concat(&[&a]).len());
     }
 
+    type Watch = (Box<dyn Fn(u8) + Send>, Option<mpsc::Sender<()>>);
+
+    /// A mixer whose watchers run until the test ends them.
+    struct FakeMixer {
+        level: u8,
+        fail_set: bool,
+        /// Reopens that fail before the card is back.
+        absent: usize,
+        watches: Arc<Mutex<Vec<Watch>>>,
+    }
+
+    impl FakeMixer {
+        fn new(level: u8) -> Self {
+            Self {
+                level,
+                fail_set: false,
+                absent: 0,
+                watches: Arc::default(),
+            }
+        }
+    }
+
+    impl Mixer for FakeMixer {
+        fn get(&self) -> Result<u8> {
+            Ok(self.level)
+        }
+        fn set(&mut self, percent: u8) -> Result<()> {
+            if self.fail_set {
+                return Err(Error::Device {
+                    device: "hw:Fake".into(),
+                    reason: "No such device".into(),
+                });
+            }
+            self.level = percent;
+            Ok(())
+        }
+        fn watch(&self, on_change: Box<dyn Fn(u8) + Send>) -> Result<Option<JoinHandle<()>>> {
+            let (end, ended) = mpsc::channel::<()>();
+            self.watches.lock().unwrap().push((on_change, Some(end)));
+            Ok(Some(thread::spawn(move || {
+                let _ = ended.recv();
+            })))
+        }
+        /// The card is back, at its power-on level.
+        fn reopen(&mut self) -> Result<()> {
+            if self.absent > 0 {
+                self.absent -= 1;
+                return Err(Error::Device {
+                    device: "hw:Fake".into(),
+                    reason: "No such device".into(),
+                });
+            }
+            self.fail_set = false;
+            self.level = 25;
+            Ok(())
+        }
+    }
+
+    fn faked(sink: FakeSink, m: FakeMixer) -> (Worker<FakeSink>, mpsc::Receiver<Event>) {
+        let (tx, rx) = mpsc::channel();
+        Worker::new(sink, tx, rx, Some(Box::new(m)))
+    }
+
+    fn volumes(events: &mpsc::Receiver<Event>) -> Vec<u8> {
+        events
+            .try_iter()
+            .filter_map(|e| match e {
+                Event::Volume { percent } => Some(percent),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn volume(w: &Worker<FakeSink>) -> Option<u8> {
+        lock(&w.shared).at(Instant::now()).status.volume
+    }
+
     #[test]
-    fn set_volume_validates_and_needs_a_mixer() {
-        let (mut w, _e) = worker(FakeSink::default());
-        let err = w.handle(Command::SetVolume(50)).unwrap_err();
-        assert_eq!(err.code(), ErrorCode::NoMixer);
-        let mut w = mixed_worker(FakeSink::default(), 100);
+    fn set_volume_emits_one_event() {
+        let (mut w, events) = faked(FakeSink::default(), FakeMixer::new(100));
+        assert_eq!(volume(&w), Some(100), "read from the mixer at start");
+        w.handle(Command::SetVolume(40)).unwrap();
+        w.publish();
+        assert_eq!(volumes(&events), [40]);
+        assert_eq!(volume(&w), Some(40));
+        w.handle(Command::SetVolume(40)).unwrap();
+        w.publish();
+        assert_eq!(volumes(&events), [40], "every set reports");
+        w.handle(Command::VolumeChanged(40)).unwrap();
+        w.publish();
+        assert!(
+            volumes(&events).is_empty(),
+            "the watcher's echo of our own set"
+        );
+        w.handle(Command::VolumeChanged(70)).unwrap();
+        w.publish();
+        assert_eq!(volumes(&events), [70]);
+        assert_eq!(volume(&w), Some(70));
         let err = w.handle(Command::SetVolume(101)).unwrap_err();
         assert_eq!(err.code(), ErrorCode::BadRequest);
+        assert_eq!(w.mixer.as_ref().unwrap().get().unwrap(), 40);
+    }
+
+    #[test]
+    fn no_mixer_is_an_error() {
+        let (mut w, events) = worker(FakeSink::default());
+        let err = w.handle(Command::SetVolume(50)).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::NoMixer);
+        w.publish();
+        assert_eq!(volume(&w), None);
+        assert!(volumes(&events).is_empty());
+        w.arm();
+        assert!(w.watcher.is_none());
+    }
+
+    /// Wait for a fake watcher thread to finish (bounded).
+    fn finished(w: &Worker<FakeSink>) {
+        for _ in 0..10_000 {
+            if w.watcher.as_ref().is_none_or(JoinHandle::is_finished) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!("watcher never finished");
+    }
+
+    #[test]
+    fn mixer_survives_the_device_going_away() {
+        let d = Dir::new();
+        let a = flac(&d, "a.flac", 44_100, 16, 2, 4 * BLOCK);
+        let mut m = FakeMixer::new(100);
+        m.fail_set = true;
+        m.absent = 1;
+        let watches = Arc::clone(&m.watches);
+        let (mut w, events) = faked(FakeSink::default(), m);
+        w.handle(Command::Add {
+            paths: vec![a.path.clone()],
+            at: None,
+        })
+        .unwrap();
+        w.handle(Command::Play(None)).unwrap();
+        assert_eq!(watches.lock().unwrap().len(), 1, "armed on ensure");
+        w.step();
+        let err = w.handle(Command::SetVolume(30)).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Device);
+        w.publish();
+        assert!(volumes(&events).is_empty());
+        assert_eq!(volume(&w), Some(100));
+        assert_eq!(w.state, PlayState::Playing);
+        w.handle(Command::Play(Some(0))).unwrap();
+        assert_eq!(watches.lock().unwrap().len(), 1, "a live watcher is kept");
+        watches.lock().unwrap()[0].1.take();
+        finished(&w);
+        w.handle(Command::Play(Some(0))).unwrap();
+        assert_eq!(watches.lock().unwrap().len(), 1, "the card is not back");
+        w.handle(Command::Play(Some(0))).unwrap();
+        assert_eq!(watches.lock().unwrap().len(), 2, "re-armed on ensure");
+        w.publish();
+        assert_eq!(volumes(&events), [25], "the reopened card's level");
         w.handle(Command::SetVolume(30)).unwrap();
-        assert_eq!(w.mixer.as_ref().unwrap().get().unwrap(), 30);
+        w.publish();
+        assert_eq!(volumes(&events), [30]);
+        drive(&mut w);
+        assert!(w.output.heard.ends_with(&concat(&[&a])), "playback went on");
+        for (_, end) in watches.lock().unwrap().iter_mut() {
+            end.take();
+        }
+    }
+
+    #[test]
+    fn external_volume_changes_are_published_once() {
+        let m = FakeMixer::new(100);
+        let watches = Arc::clone(&m.watches);
+        let (player, events) = Player::spawn_with_mixer(FakeSink::default(), Some(Box::new(m)));
+        assert_eq!(player.snapshot().status.volume, Some(100));
+        player.send(Command::Stop).unwrap();
+        {
+            let w = watches.lock().unwrap();
+            assert_eq!(w.len(), 1, "armed when the player starts");
+            for p in [100, 70, 70] {
+                (w[0].0)(p);
+            }
+        }
+        player.send(Command::Stop).unwrap();
+        assert_eq!(player.snapshot().status.volume, Some(70));
+        assert_eq!(volumes(&events), [70]);
+        watches.lock().unwrap()[0].1.take();
     }
 
     #[test]

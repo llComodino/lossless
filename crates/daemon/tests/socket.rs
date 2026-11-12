@@ -9,8 +9,8 @@ use std::thread;
 use std::time::Duration;
 
 use lossless_daemon::{Daemon, MAX_REQUEST, bind, parse_config};
-use lossless_engine::Player;
 use lossless_engine::fixtures::{BLOCK, Dir, PacedSink, flac_at};
+use lossless_engine::{Mixer, Player, SoftwareMixer};
 use lossless_proto::{
     Body, Command, Entry, ErrorCode, Event, Outcome, PlayState, Repeat, Request, ServerMessage,
     WireError, decode, encode,
@@ -25,13 +25,17 @@ struct Server {
 
 impl Server {
     fn start(with_music: bool) -> Self {
+        Self::start_with(with_music, None)
+    }
+
+    fn start_with(with_music: bool, mixer: Option<Box<dyn Mixer>>) -> Self {
         let dir = Dir::new();
         let music = dir.path("music");
         for d in ["album", ".incomplete", "empty"] {
             std::fs::create_dir_all(music.join(d)).unwrap();
         }
         let listener = bind(&dir.path("sock")).unwrap();
-        let (player, events) = Player::spawn_with(PacedSink::default());
+        let (player, events) = Player::spawn_with_mixer(PacedSink::default(), mixer);
         let daemon =
             Daemon::start(player, events, with_music.then_some(music), Box::new(|| {})).unwrap();
         thread::spawn(move || daemon.serve(listener));
@@ -692,5 +696,29 @@ fn modes_over_the_socket() {
         !c.events.iter().any(|e| matches!(e, Event::Mode { .. })),
         "one mode event per set_mode: {:?}",
         c.events
+    );
+}
+
+#[test]
+fn volume_over_the_socket() {
+    let s = Server::start_with(false, Some(Box::new(SoftwareMixer::new())));
+    let mut c = s.connect();
+    assert_eq!(status(&mut c).volume, Some(100));
+    c.ok(Command::Subscribe);
+    c.ok(Command::SetVolume { percent: 40 });
+    assert_eq!(status(&mut c).volume, Some(40));
+    let ev = c.wait_for(|e| matches!(e, Event::Volume { .. }));
+    assert_eq!(ev, Event::Volume { percent: 40 });
+    let e = c.err(Command::SetVolume { percent: 101 });
+    assert_eq!(e.code, ErrorCode::BadRequest);
+    assert_eq!(status(&mut c).volume, Some(40));
+
+    let s = Server::start(false);
+    let mut c = s.connect();
+    assert_eq!(status(&mut c).volume, None);
+    let e = c.err(Command::SetVolume { percent: 50 });
+    assert_eq!(
+        (e.code, e.message.as_str()),
+        (ErrorCode::NoMixer, "no hardware mixer")
     );
 }
