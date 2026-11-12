@@ -102,12 +102,8 @@ fn card(device: &str) -> Option<&str> {
         return None;
     }
     let first = args.split(',').next()?;
-    let card = match first.strip_prefix("CARD=") {
-        Some(c) => c,
-        None if plugin == "hw" || plugin == "plughw" => first,
-        None => return None,
-    };
-    (!card.is_empty()).then_some(card)
+    let card = first.strip_prefix("CARD=").unwrap_or(first);
+    (!card.is_empty() && !card.contains('=')).then_some(card)
 }
 
 /// Pick the mixer for `device`. A hardware mixer needs a card to open, so a
@@ -196,6 +192,10 @@ mod tests {
         assert_eq!(auto("plughw:CARD=X"), hw("X"));
         assert_eq!(auto("front:CARD=X,DEV=0"), hw("X"));
         assert_eq!(auto("sysdefault:CARD=X"), hw("X"));
+        assert_eq!(auto("front:X,0"), hw("X"));
+        assert_eq!(auto("front:X"), hw("X"));
+        assert_eq!(auto("sysdefault:X,0"), hw("X"));
+        assert_eq!(auto("sysdefault:X"), hw("X"));
         assert_eq!(auto("hw"), MixerKind::None);
         assert_eq!(auto("sysdefault"), MixerKind::None);
         assert_eq!(auto("hw:"), MixerKind::None);
