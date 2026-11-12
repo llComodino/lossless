@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use lossless_proto::{Event, PlayState, Status, WireError};
+use lossless_proto::{Event, PlayState, Repeat, Status, WireError};
 
 use crate::output::{Output, Sink};
 use crate::queue::{Queue, Removal};
@@ -35,6 +35,11 @@ pub enum Command {
     Previous,
     Seek {
         ms: u64,
+    },
+    /// `None` leaves that mode as it is.
+    SetMode {
+        repeat: Option<Repeat>,
+        random: Option<bool>,
     },
     Shutdown,
 }
@@ -136,6 +141,8 @@ impl Shared {
                 output: None,
                 track: None,
                 last_error: None,
+                repeat: Repeat::Off,
+                random: false,
             },
             queue: Arc::from(Vec::new()),
             anchor: None,
@@ -323,6 +330,8 @@ impl<S: Sink> Worker<S> {
             output: self.output.format(),
             track: None,
             last_error: self.last_error.clone(),
+            repeat: self.queue.repeat(),
+            random: self.queue.random(),
         };
         shared.anchor = (self.state == PlayState::Playing).then_some(self.anchor_at);
         if self.queue_dirty {
@@ -361,63 +370,80 @@ impl<S: Sink> Worker<S> {
         }
     }
 
-    /// Continue with the next queue entry without discarding buffered audio,
-    /// so same-format tracks join gaplessly.
+    /// Continue with the next queue entry for the mode without discarding
+    /// buffered audio, so same-format tracks join gaplessly. A track that
+    /// failed is skipped even under repeat one.
     fn advance(&mut self) {
-        let next = self.queue.current().map_or(0, |i| i + 1);
-        if next < self.queue.entries().len() {
-            // The new track starts once the old tail has played out.
-            let tail = Duration::from_millis(self.frames_to_ms(self.output.delay()));
-            self.load(next, Instant::now() + tail);
-            if self.state == PlayState::Playing && self.source.is_some() {
-                self.anchor(0, self.anchor_at);
-            }
+        let next = if self.keep_error {
+            self.queue.skip()
         } else {
-            self.output.close();
-            self.source = None;
-            self.queue.set_current(None);
-            self.written = 0;
-            self.state = PlayState::Stopped;
-            self.anchor(0, Instant::now());
-            self.emit(Event::TrackChanged { index: None });
+            self.queue.next()
+        };
+        match next {
+            Some(next) => {
+                // The new track starts once the old tail has played out.
+                let tail = Duration::from_millis(self.frames_to_ms(self.output.delay()));
+                self.load(next, Instant::now() + tail);
+                if self.state == PlayState::Playing && self.source.is_some() {
+                    self.anchor(0, self.anchor_at);
+                }
+            }
+            None => self.finish(),
         }
     }
 
+    /// The queue ran out: release the device and stop.
+    fn finish(&mut self) {
+        self.output.close();
+        self.source = None;
+        self.queue.set_current(None);
+        self.written = 0;
+        self.state = PlayState::Stopped;
+        self.anchor(0, Instant::now());
+        self.emit(Event::TrackChanged { index: None });
+    }
+
     /// Open queue entry `index` (heard from `starts_at`) and make the output
-    /// ready for it, skipping entries that can't be opened.
-    fn load(&mut self, mut index: usize, starts_at: Instant) {
+    /// ready for it, skipping entries that can't be opened. Each entry is
+    /// tried once per load, so a queue of broken files ends even under repeat.
+    fn load(&mut self, index: usize, starts_at: Instant) {
         let mut skipped = false;
-        while index < self.queue.entries().len() {
-            match Source::open(&self.queue.entries()[index]) {
-                Ok(source) => match self.output.ensure(source.format) {
-                    Ok(_) => {
-                        if !skipped && !self.keep_error {
-                            self.last_error = None;
-                            self.dirty = true;
+        let mut tried = vec![false; self.queue.entries().len()];
+        let mut left = tried.len();
+        let mut next = Some(index);
+        while let Some(index) = next.filter(|_| left > 0) {
+            if !std::mem::replace(&mut tried[index], true) {
+                left -= 1;
+                match Source::open(&self.queue.entries()[index]) {
+                    Ok(source) => match self.output.ensure(source.format) {
+                        Ok(_) => {
+                            if !skipped && !self.keep_error {
+                                self.last_error = None;
+                                self.dirty = true;
+                            }
+                            self.source = Some(source);
+                            self.queue.set_current(Some(index));
+                            self.written = 0;
+                            self.anchor_ms = 0;
+                            self.anchor_at = starts_at;
+                            self.emit(Event::TrackChanged { index: Some(index) });
+                            return;
                         }
-                        self.source = Some(source);
-                        self.queue.set_current(Some(index));
-                        self.written = 0;
-                        self.anchor_ms = 0;
-                        self.anchor_at = starts_at;
-                        self.emit(Event::TrackChanged { index: Some(index) });
-                        return;
-                    }
+                        Err(e) => {
+                            self.fail(&e);
+                            return self.halt();
+                        }
+                    },
                     Err(e) => {
                         self.fail(&e);
-                        return self.halt();
+                        skipped = true;
                     }
-                },
-                Err(e) => {
-                    self.fail(&e);
-                    skipped = true;
-                    index += 1;
                 }
             }
+            self.queue.set_current(Some(index));
+            next = self.queue.skip();
         }
-        self.queue
-            .set_current(self.queue.entries().len().checked_sub(1));
-        self.advance();
+        self.finish();
     }
 
     /// Stop after an output failure; the device is released.
@@ -486,8 +512,11 @@ impl<S: Sink> Worker<S> {
                 let was = self.queue.current();
                 match self.queue.remove(&indices)? {
                     Removal::Kept => self.queue_edited(was),
-                    Removal::CurrentRemoved { next } => {
+                    Removal::CurrentRemoved { mut next } => {
                         self.queue_edited(None);
+                        if self.queue.random() {
+                            next = self.queue.next();
+                        }
                         match next {
                             Some(n) if self.state != PlayState::Stopped => {
                                 let play = self.state == PlayState::Playing;
@@ -527,7 +556,11 @@ impl<S: Sink> Worker<S> {
                 PlayState::Playing => {}
                 PlayState::Paused => self.set_state(PlayState::Playing),
                 PlayState::Stopped if !self.queue.entries().is_empty() => {
-                    self.jump(self.queue.current().unwrap_or(0), true)
+                    let first = self.queue.current().or_else(|| {
+                        self.queue.restart_cycle();
+                        self.queue.next()
+                    });
+                    self.jump(first.unwrap_or(0), true)
                 }
                 PlayState::Stopped => {}
             },
@@ -551,13 +584,13 @@ impl<S: Sink> Worker<S> {
                     return Ok(());
                 };
                 let target = if cmd == Command::Next {
-                    i + 1
+                    match self.queue.skip() {
+                        Some(t) => t,
+                        None => return Ok(()),
+                    }
                 } else {
-                    i.saturating_sub(1)
+                    self.queue.previous().unwrap_or(i)
                 };
-                if target >= self.queue.entries().len() {
-                    return Ok(());
-                }
                 if self.state == PlayState::Stopped {
                     self.queue.set_current(Some(target));
                     self.emit(Event::TrackChanged {
@@ -588,6 +621,13 @@ impl<S: Sink> Worker<S> {
                     Err(e) => return Err(e),
                 }
             }
+            Command::SetMode { repeat, random } => {
+                self.queue.set_mode(repeat, random);
+                self.emit(Event::Mode {
+                    repeat: self.queue.repeat(),
+                    random: self.queue.random(),
+                });
+            }
             Command::Shutdown => {}
         }
         Ok(())
@@ -599,11 +639,12 @@ mod tests {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    use lossless_proto::{ErrorCode, Event, PlayState, StreamFormat};
+    use lossless_proto::{ErrorCode, Event, PlayState, Repeat, StreamFormat};
 
     use super::{Command, Player, Shared, Worker, lock};
     use crate::fixtures::{BLOCK, Dir, Fixture, flac, write_bytes};
     use crate::output::Sink;
+    use crate::queue::Queue;
     use crate::{Error, Result};
 
     /// Records what reaches the "speaker". The last `delay` frames written
@@ -1054,15 +1095,14 @@ mod tests {
         let a = flac(&d, "a.flac", 44_100, 16, 2, 4 * BLOCK);
         let bytes = std::fs::read(&a.path).unwrap();
         let cut = write_bytes(&d, "cut.flac", &bytes[..bytes.len() / 2]);
-        let (player, _events) = Player::spawn_with(FakeSink::default());
-        player
-            .send(Command::Add {
-                paths: vec![cut],
-                at: None,
-            })
-            .unwrap();
-        player.send(Command::Play(None)).unwrap();
-        let err = player.send(Command::Seek { ms: 350 }).unwrap_err();
+        let (mut w, _events) = worker(FakeSink::default());
+        w.handle(Command::Add {
+            paths: vec![cut],
+            at: None,
+        })
+        .unwrap();
+        w.handle(Command::Play(None)).unwrap();
+        let err = w.handle(Command::Seek { ms: 350 }).unwrap_err();
         assert!(matches!(err, Error::Decode { .. }), "{err}");
     }
 
@@ -1350,6 +1390,184 @@ mod tests {
         let evs: Vec<_> = events.try_iter().collect();
         assert!(evs.contains(&Event::QueueChanged));
         assert!(evs.contains(&Event::TrackChanged { index: None }));
+    }
+
+    #[test]
+    fn repeat_one_is_gapless_and_bit_exact() {
+        let d = Dir::new();
+        let a = flac(&d, "a.flac", 44_100, 16, 2, 2 * BLOCK);
+        let (mut w, events) = worker(FakeSink::default());
+        w.handle(Command::Add {
+            paths: vec![a.path.clone()],
+            at: None,
+        })
+        .unwrap();
+        w.handle(Command::SetMode {
+            repeat: Some(Repeat::One),
+            random: None,
+        })
+        .unwrap();
+        w.handle(Command::Play(None)).unwrap();
+        for _ in 0..100_000 {
+            if w.output.heard.len() > 2 * a.expected.len() {
+                break;
+            }
+            w.step();
+        }
+        w.handle(Command::SetMode {
+            repeat: Some(Repeat::Off),
+            random: None,
+        })
+        .unwrap();
+        drive(&mut w);
+        assert!(w.output.heard == concat(&[&a, &a, &a]), "output differs");
+        assert_eq!(w.output.opens.len(), 1);
+        assert_eq!(tracks(&events), [Some(0), Some(0), Some(0), None]);
+    }
+
+    #[test]
+    fn random_plays_all() {
+        let d = Dir::new();
+        let fs: Vec<Fixture> = (0..5)
+            .map(|i| flac(&d, &format!("{i}.flac"), 44_100, 16, 2, BLOCK))
+            .collect();
+        let (mut w, events) = worker(FakeSink::default());
+        w.handle(Command::Add {
+            paths: fs.iter().map(|f| f.path.clone()).collect(),
+            at: None,
+        })
+        .unwrap();
+        w.handle(Command::SetMode {
+            repeat: Some(Repeat::Off),
+            random: Some(true),
+        })
+        .unwrap();
+        for pass in 0..2 {
+            w.output.heard.clear();
+            w.handle(Command::Play(None)).unwrap();
+            drive(&mut w);
+            assert_eq!((w.state, w.queue.current()), (PlayState::Stopped, None));
+            let played: Vec<usize> = tracks(&events).into_iter().flatten().collect();
+            let mut sorted = played.clone();
+            sorted.sort_unstable();
+            assert_eq!(sorted, [0, 1, 2, 3, 4], "pass {pass}: {played:?}");
+            let order: Vec<&Fixture> = played.iter().map(|&i| &fs[i]).collect();
+            assert!(
+                w.output.heard == concat(&order),
+                "pass {pass}: output differs"
+            );
+        }
+    }
+
+    #[test]
+    fn broken_entries_never_stop_a_repeating_shuffle() {
+        let d = Dir::new();
+        let a = flac(&d, "a.flac", 44_100, 16, 2, BLOCK);
+        let junk = write_bytes(&d, "junk.flac", &[0x5a; 512]);
+        for seed in 1..16 {
+            let (mut w, _events) = worker(FakeSink::default());
+            w.queue = Queue::with_seed(seed);
+            w.handle(Command::Add {
+                paths: vec![a.path.clone(), junk.clone(), junk.clone()],
+                at: None,
+            })
+            .unwrap();
+            w.handle(Command::SetMode {
+                repeat: Some(Repeat::Queue),
+                random: Some(true),
+            })
+            .unwrap();
+            w.handle(Command::Play(None)).unwrap();
+            for _ in 0..60 {
+                assert_eq!(w.state, PlayState::Playing, "seed {seed}");
+                w.step();
+            }
+        }
+    }
+
+    #[test]
+    fn set_mode_emits_one_mode_event_and_publishes() {
+        let (mut w, events) = worker(FakeSink::default());
+        w.handle(Command::SetMode {
+            repeat: Some(Repeat::Queue),
+            random: None,
+        })
+        .unwrap();
+        w.publish();
+        w.handle(Command::SetMode {
+            repeat: None,
+            random: Some(true),
+        })
+        .unwrap();
+        w.publish();
+        let modes: Vec<Event> = events
+            .try_iter()
+            .filter(|e| matches!(e, Event::Mode { .. }))
+            .collect();
+        let mode = |repeat, random| Event::Mode { repeat, random };
+        assert_eq!(
+            modes,
+            [mode(Repeat::Queue, false), mode(Repeat::Queue, true)]
+        );
+        let st = lock(&w.shared).at(Instant::now()).status;
+        assert_eq!((st.repeat, st.random), (Repeat::Queue, true));
+    }
+
+    #[test]
+    fn next_skips_past_repeat_one() {
+        let d = Dir::new();
+        let a = flac(&d, "a.flac", 44_100, 16, 2, BLOCK);
+        let b = flac(&d, "b.flac", 44_100, 16, 2, BLOCK);
+        let (mut w, _events) = worker(FakeSink::default());
+        w.handle(Command::Add {
+            paths: vec![a.path.clone(), b.path.clone()],
+            at: None,
+        })
+        .unwrap();
+        w.handle(Command::SetMode {
+            repeat: Some(Repeat::One),
+            random: None,
+        })
+        .unwrap();
+        w.handle(Command::Play(None)).unwrap();
+        w.handle(Command::Next).unwrap();
+        assert_eq!(w.queue.current(), Some(1));
+        w.handle(Command::Next).unwrap();
+        assert_eq!(w.queue.current(), Some(1), "next at the end does nothing");
+        w.handle(Command::Previous).unwrap();
+        assert_eq!(w.queue.current(), Some(0));
+    }
+
+    #[test]
+    fn removing_the_playing_entry_in_random_picks_a_random_next() {
+        let d = Dir::new();
+        let fs: Vec<Fixture> = (0..3)
+            .map(|i| flac(&d, &format!("{i}.flac"), 44_100, 16, 2, BLOCK))
+            .collect();
+        let (mut w, events) = worker(FakeSink::default());
+        w.handle(Command::Add {
+            paths: fs.iter().map(|f| f.path.clone()).collect(),
+            at: None,
+        })
+        .unwrap();
+        w.handle(Command::SetMode {
+            repeat: None,
+            random: Some(true),
+        })
+        .unwrap();
+        w.handle(Command::Play(Some(2))).unwrap();
+        w.publish();
+        let _ = events.try_iter().count();
+        w.handle(Command::Remove(vec![2])).unwrap();
+        w.publish();
+        let now = w.queue.current();
+        assert_eq!(tracks(&events), [now], "one track event");
+        assert_eq!(
+            w.state,
+            PlayState::Playing,
+            "the last entry was not the end"
+        );
+        assert!(w.queue.current().is_some_and(|c| c < 2));
     }
 
     #[test]

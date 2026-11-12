@@ -219,6 +219,7 @@ impl State {
             Command::Previous => play(PlayerCmd::Previous),
             Command::Seek { ms } => play(PlayerCmd::Seek { ms }),
             Command::Clear => play(PlayerCmd::Clear),
+            Command::SetMode { repeat, random } => play(PlayerCmd::SetMode { repeat, random }),
         }
     }
 }

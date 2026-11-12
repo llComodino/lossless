@@ -68,8 +68,8 @@ is the only thing the playback path knows how to do.
 | Queue: add, clear, jump | yes | |
 | Play, pause, stop, next, previous, sample-accurate seek | yes | |
 | Events for clients | yes | state, track, queue, library |
-| Queue: insert at position, remove, move, play now | planned | |
-| Repeat (queue / one), random | planned | |
+| Queue: insert at position, remove, move, play now | yes | the playing track keeps its place |
+| Repeat (queue / one), random | yes | repeat one stays gapless; next skips past it |
 | Browse by folder, artist, album | planned | |
 | Volume: DAC hardware mixer, or software gain on the PipeWire path | planned | the bit-perfect path never scales samples |
 | Queue and position restored after restart | planned | |
@@ -159,6 +159,8 @@ lossless move 3 1
 lossless play                    # or: play 3 (1-based queue entry)
 lossless status
 lossless seek 2:30
+lossless repeat queue            # off | queue | one
+lossless random on               # on | off
 lossless pause | toggle | stop | next | prev
 lossless queue
 lossless clear
@@ -166,8 +168,9 @@ lossless watch                   # print events until interrupted
 lossless --json status           # raw protocol replies
 ```
 
-`status` shows what the device was actually opened with, e.g.
-`playing  #1  0:12/4:31  output 24-bit/96 kHz/2ch`. To check from the kernel
+`status` shows what the device was actually opened with, then the modes,
+e.g. `playing  #1  0:12/4:31  output 24-bit/96 kHz/2ch repeat:off random:off`.
+To check from the kernel
 side that nothing converted the stream, read the device's hardware
 parameters while playing:
 
