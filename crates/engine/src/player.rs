@@ -404,40 +404,44 @@ impl<S: Sink> Worker<S> {
     }
 
     /// Open queue entry `index` (heard from `starts_at`) and make the output
-    /// ready for it, skipping entries that can't be opened. At most one try
-    /// per entry, so a queue of broken files ends even under repeat.
+    /// ready for it, skipping entries that can't be opened. Each entry is
+    /// tried once per load, so a queue of broken files ends even under repeat.
     fn load(&mut self, index: usize, starts_at: Instant) {
         let mut skipped = false;
+        let mut tried = vec![false; self.queue.entries().len()];
+        let mut left = tried.len();
         let mut next = Some(index);
-        for _ in 0..self.queue.entries().len() {
-            let Some(index) = next else { break };
-            match Source::open(&self.queue.entries()[index]) {
-                Ok(source) => match self.output.ensure(source.format) {
-                    Ok(_) => {
-                        if !skipped && !self.keep_error {
-                            self.last_error = None;
-                            self.dirty = true;
+        while let Some(index) = next.filter(|_| left > 0) {
+            if !std::mem::replace(&mut tried[index], true) {
+                left -= 1;
+                match Source::open(&self.queue.entries()[index]) {
+                    Ok(source) => match self.output.ensure(source.format) {
+                        Ok(_) => {
+                            if !skipped && !self.keep_error {
+                                self.last_error = None;
+                                self.dirty = true;
+                            }
+                            self.source = Some(source);
+                            self.queue.set_current(Some(index));
+                            self.written = 0;
+                            self.anchor_ms = 0;
+                            self.anchor_at = starts_at;
+                            self.emit(Event::TrackChanged { index: Some(index) });
+                            return;
                         }
-                        self.source = Some(source);
-                        self.queue.set_current(Some(index));
-                        self.written = 0;
-                        self.anchor_ms = 0;
-                        self.anchor_at = starts_at;
-                        self.emit(Event::TrackChanged { index: Some(index) });
-                        return;
-                    }
+                        Err(e) => {
+                            self.fail(&e);
+                            return self.halt();
+                        }
+                    },
                     Err(e) => {
                         self.fail(&e);
-                        return self.halt();
+                        skipped = true;
                     }
-                },
-                Err(e) => {
-                    self.fail(&e);
-                    skipped = true;
-                    self.queue.set_current(Some(index));
-                    next = self.queue.skip();
                 }
             }
+            self.queue.set_current(Some(index));
+            next = self.queue.skip();
         }
         self.finish();
     }
@@ -640,6 +644,7 @@ mod tests {
     use super::{Command, Player, Shared, Worker, lock};
     use crate::fixtures::{BLOCK, Dir, Fixture, flac, write_bytes};
     use crate::output::Sink;
+    use crate::queue::Queue;
     use crate::{Error, Result};
 
     /// Records what reaches the "speaker". The last `delay` frames written
@@ -1451,6 +1456,32 @@ mod tests {
                 w.output.heard == concat(&order),
                 "pass {pass}: output differs"
             );
+        }
+    }
+
+    #[test]
+    fn broken_entries_never_stop_a_repeating_shuffle() {
+        let d = Dir::new();
+        let a = flac(&d, "a.flac", 44_100, 16, 2, BLOCK);
+        let junk = write_bytes(&d, "junk.flac", &[0x5a; 512]);
+        for seed in 1..16 {
+            let (mut w, _events) = worker(FakeSink::default());
+            w.queue = Queue::with_seed(seed);
+            w.handle(Command::Add {
+                paths: vec![a.path.clone(), junk.clone(), junk.clone()],
+                at: None,
+            })
+            .unwrap();
+            w.handle(Command::SetMode {
+                repeat: Some(Repeat::Queue),
+                random: Some(true),
+            })
+            .unwrap();
+            w.handle(Command::Play(None)).unwrap();
+            for _ in 0..60 {
+                assert_eq!(w.state, PlayState::Playing, "seed {seed}");
+                w.step();
+            }
         }
     }
 
