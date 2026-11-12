@@ -120,9 +120,16 @@ music_dir = "~/Music"
 
 # ALSA mixer control the hardware mixer drives (1 to 44 of A-Za-z0-9 _-).
 # Percent is linear over its dB range (raw range without dB information).
-# A card or control that can't be opened is logged as a warning and the
-# daemon runs without volume (`no_mixer`).
+# A card or control that can't be opened yet (say, the DAC is off) is tried
+# again whenever the device opens and on `set_volume`; until then there is
+# no volume (`no_mixer`).
 # mixer_control = "PCM"
+
+# Logging to stderr: off (default), warn, info or debug. warn notes the
+# faults the daemon recovers from (skipped files, a missing mixer, dropped
+# state entries); info adds startup and scans; debug every request, command
+# and event. `losslessd --log-level <level>` overrides it.
+# log_level = "off"
 ```
 
 The config is validated strictly. `device` must be a plain device name:
@@ -138,8 +145,8 @@ The queue, the current entry, the position and the modes are saved to
 `~/.local/state/lossless/state.json`, mode 0600) whenever they change, by
 writing a temporary file and renaming it over the old one. On start the
 daemon restores the session paused where it was, without opening the device
-until you play. Files that have gone away are dropped (a warning gives the
-count); a corrupt or unreadable state file is logged and the queue starts
+until you play. Files that have gone away are dropped (with `log_level`
+warn, a warning gives the count); a corrupt or unreadable state file is logged and the queue starts
 empty. A state directory that can't be created or written stops the daemon at
 startup, before it binds the socket.
 While playing, the position is saved on events only (no timer), so after a
@@ -166,10 +173,13 @@ lossless owns the DAC.
 
 ## Usage
 
-Start the daemon in the foreground (it logs to stderr):
+Start the daemon in the foreground. It is silent by default; fatal errors
+still reach stderr, and `--log-level warn|info|debug` turns logging on (see
+`log_level` above):
 
 ```sh
 losslessd
+losslessd --log-level info
 ```
 
 and drive it with the client:
@@ -242,14 +252,46 @@ that its reply echoes:
 {"type":"reply","id":2,"ok":{"kind":"status","data":{"state":"playing","index":0,"position_ms":12000,"duration_ms":271000,"output":{"rate":96000,"bits":24,"channels":2},"track":{...}}}}
 ```
 
-After `{"id":3,"cmd":"subscribe"}` the connection also receives events:
+A failed request gets an error with a code and a message:
+
+```json
+{"id":3,"cmd":"play","index":14}
+{"type":"reply","id":3,"err":{"code":"out_of_range","message":"index 14 out of range: queue has 12 entries"}}
+```
+
+| Code | When |
+|---|---|
+| `bad_request` | unparseable or oversized request, invalid values |
+| `not_found` | a path that doesn't exist or isn't playable, an empty collection |
+| `out_of_range` | a queue index or `at` outside the queue |
+| `no_mixer` | volume without a mixer |
+| `no_music_dir` | `update` or `browse` without `music_dir` |
+| `scan_running` | `update` while a scan runs |
+| `device` | the output device failed after retries |
+| `decode` | a file failed to decode |
+| `io` | any other I/O failure |
+
+Besides `state`, `index`, `position_ms`, `duration_ms`, `output` and `track`,
+status carries `repeat` (`off`, `queue`, `one`), `random`, `volume` (percent,
+`null` without a mixer) and `last_error` (the last failure the daemon
+recovered from by itself, as `{code, message}`, cleared once a track loads
+cleanly).
+
+After `{"id":4,"cmd":"subscribe"}` the connection also receives events:
 
 ```json
 {"type":"event","event":"state","state":"paused","position_ms":61250}
 {"type":"event","event":"track_changed","index":1}
 {"type":"event","event":"queue_changed"}
 {"type":"event","event":"library_changed","tracks":914}
+{"type":"event","event":"mode","repeat":"queue","random":true}
+{"type":"event","event":"volume","percent":40}
+{"type":"event","event":"error","code":"decode","message":"x.flac: bad frame"}
 ```
+
+`volume` follows every `set_volume` and changes made on the card outside the
+daemon; `error` reports a failure the daemon recovered from (a skipped file,
+a device that stopped playback).
 
 There are no position ticks: while playing, clients advance `position_ms`
 from the last `state` event with their own clock. Requests are capped at
@@ -293,12 +335,9 @@ cargo reldeps      # what the release binaries link
 
 ## Roadmap
 
-1. Daemon: typed errors with codes, leveled logging (off by default), queue
-   insert/remove/move/replace, repeat and random, browsing by folder,
-   artist and album, hardware and software volume, a state file.
-2. `losslessd-tui`: an rmpc-style terminal UI (queue, directories,
+1. `losslessd-tui`: an rmpc-style terminal UI (queue, directories,
    artists/albums, search).
-3. MPRIS bridge.
+2. MPRIS bridge.
 
 ## License
 

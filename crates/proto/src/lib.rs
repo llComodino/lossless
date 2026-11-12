@@ -208,6 +208,8 @@ pub struct Status {
     /// The current queue entry, with tags when the library knows it.
     #[serde(default)]
     pub track: Option<Track>,
+    /// The last failure the daemon recovered from on its own (a skipped
+    /// file, a device that stopped playback), until a track loads cleanly.
     #[serde(default)]
     pub last_error: Option<WireError>,
     #[serde(default)]

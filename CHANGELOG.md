@@ -25,8 +25,9 @@ First development version, not yet tagged.
 - Repeat (off, queue, one) and random modes: `set_mode` and the `mode` event
   in the protocol, `repeat` and `random` in the client and status. Repeat
   one stays gapless; random plays each entry once per cycle.
-- Library scan with tags (artist, album, title, track number, duration,
-  format) and word search; rescan on demand.
+- Library scan with tags (artist, album, title, track and disc number,
+  duration, format) and word search; rescan on demand. Unreadable entries
+  inside the music folder are skipped, not fatal.
 - Library listings: `browse` by folder, `artists`, `albums` and `find`, over
   the socket and in `lossless`.
 - Newline-delimited JSON protocol over a unix socket, with request ids and
@@ -34,20 +35,28 @@ First development version, not yet tagged.
   subscribed clients.
 - Event-driven position: no ticks, zero wakeups while idle; clients derive
   the position from the last state event.
-- Volume mixer config (`mixer`, `mixer_control`) and software gain.
-- Volume end to end: the DAC's hardware mixer (changes made outside the
-  daemon reported too), `set_volume` and the `volume` event, `volume` in
-  status, and `lossless volume [N|+N|-N]`.
+- Volume: the DAC's hardware mixer (changes made outside the daemon
+  reported too; a card missing at startup is picked up once it appears) or
+  software gain on default/pipewire/pulse, chosen by `mixer` and
+  `mixer_control`; `set_volume` and the `volume` event, `volume` in status,
+  and `lossless volume [N|+N|-N]`.
+- Typed errors: every error reply carries a code (`bad_request`,
+  `not_found`, `out_of_range`, `no_mixer`, `no_music_dir`, `scan_running`,
+  `device`, `decode`, `io`) and a message; failures the daemon recovers from
+  by itself are sent as an `error` event and kept in status as `last_error`.
+- Leveled logging to stderr (`log_level` off, warn, info, debug; off by
+  default) and `losslessd --log-level`.
 - State file (`$XDG_STATE_HOME/lossless/state.json`): the queue, position
   and modes survive a restart, restored paused with the device closed.
-- TOML config (`device`, `music_dir`, `socket`) with strict validation.
+- TOML config (`device`, `music_dir`, `socket`, `log_level`, `mixer`,
+  `mixer_control`) with strict validation.
 - `lossless`: command line client (`status`, `queue`, `add`, `play`,
   `pause`, `toggle`, `stop`, `next`, `prev`, `seek`, `clear`, `search`,
   `update`, `watch`, `--json`, `--socket`).
 - Tests: bit-exact decode and seek against generated FLAC fixtures, player
   state machine against a fake sink, daemon over a real socket, CLI as a
   real binary, property tests, and fuzz targets for requests, config files,
-  device names, decoding and tags.
+  device names, decoding, tags and state files.
 
 ### Fixed
 
@@ -63,7 +72,7 @@ First development version, not yet tagged.
 
 ### Security
 
-- Request lines are capped at 64 KiB; invalid UTF-8 gets an error reply.
+- Request lines are capped at 4 MiB; invalid UTF-8 gets an error reply.
 - Tags are parsed only as FLAC or MP3, chosen by extension: content sniffing
   let crafted files hang the AAC parser.
 - The socket is created owner-only (0600) and only a stale socket is ever
