@@ -106,6 +106,13 @@ pub fn save(path: &Path, s: &Saved) -> io::Result<()> {
     fs::rename(write_tmp(path, &json)?, path)
 }
 
+/// Create the directory for `path` and prove a state file can be written
+/// there, through the same path `save` takes.
+pub fn prepare(path: &Path) -> io::Result<()> {
+    fs::create_dir_all(path.parent().unwrap_or(Path::new("/")))?;
+    fs::remove_file(write_tmp(path, b"")?)
+}
+
 /// Read the state at `path`; a missing file is `None`. Only a regular file
 /// of at most `MAX_STATE` bytes is read, and reading stops past the cap.
 pub fn load(path: &Path) -> Result<Option<Saved>, StateError> {

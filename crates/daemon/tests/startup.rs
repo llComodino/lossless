@@ -139,7 +139,27 @@ fn run_stops_on_a_bad_config_or_socket() {
 
     let err = run(&ok, dir.path("s.sock"), key.join("state.json"), None).unwrap_err();
     let msg = format!("{err:#}");
-    assert!(msg.starts_with("creating state directory"), "{msg}");
+    assert!(msg.starts_with("preparing state directory"), "{msg}");
+    assert!(!dir.path("s.sock").exists(), "bound before the state check");
+}
+
+#[test]
+fn run_stops_on_a_read_only_state_dir() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = Dir::new();
+    let ro = dir.path("ro");
+    std::fs::create_dir(&ro).unwrap();
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o500)).unwrap();
+    if std::fs::write(ro.join("probe"), "").is_ok() {
+        return; // root ignores the mode
+    }
+    let cfg = write_config(&dir, "device = \"null\"\n");
+    let err = run(&cfg, dir.path("s.sock"), ro.join("state.json"), None).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.starts_with("preparing state directory"), "{msg}");
+    assert!(msg.contains("ermission denied"), "{msg}");
+    assert!(!dir.path("s.sock").exists(), "bound before the state check");
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
 
 fn losslessd(env: &[(&str, &Path)]) -> Output {
@@ -193,7 +213,8 @@ fn binary_without_home_uses_defaults_and_the_runtime_socket() {
     // absent, so all defaults; a non-socket where the socket goes stops it.
     let dir = Dir::new();
     std::fs::write(dir.path("lossless.sock"), "not a socket").unwrap();
-    failed_with(&losslessd(&[("XDG_RUNTIME_DIR", &dir.0)]), "not a socket");
+    let env = [("XDG_RUNTIME_DIR", &*dir.0), ("XDG_STATE_HOME", &*dir.0)];
+    failed_with(&losslessd(&env), "not a socket");
 }
 
 fn spawn_with(dir: &Dir, args: &[&str]) -> std::process::Child {

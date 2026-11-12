@@ -140,7 +140,8 @@ writing a temporary file and renaming it over the old one. On start the
 daemon restores the session paused where it was, without opening the device
 until you play. Files that have gone away are dropped (a warning gives the
 count); a corrupt or unreadable state file is logged and the queue starts
-empty. A state directory that can't be created stops the daemon at startup.
+empty. A state directory that can't be created or written stops the daemon at
+startup, before it binds the socket.
 While playing, the position is saved on events only (no timer), so after a
 crash playback resumes from the last pause, seek or track change.
 

@@ -44,6 +44,7 @@ impl Server {
         let listener = bind(&self.dir.path(socket)).unwrap();
         let (player, events) = Player::spawn_with_mixer(PacedSink::default(), mixer);
         let state = self.dir.path("state/state.json");
+        std::fs::create_dir_all(self.dir.path("state")).unwrap();
         let daemon = Daemon::start(player, events, music, state, Box::new(|| {})).unwrap();
         thread::spawn(move || daemon.serve(listener));
     }

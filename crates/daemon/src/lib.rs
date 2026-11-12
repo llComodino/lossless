@@ -352,9 +352,9 @@ fn serve(state: &State, stream: UnixStream) -> Result<()> {
     }
 }
 
-/// Load the config at `config`, bind its socket (or `default_socket`), open
-/// its device, restore the session saved at `state` and serve until the
-/// listener fails.
+/// Load the config at `config`, check the state directory for `state` is
+/// writable, bind its socket (or `default_socket`), open its device, restore
+/// the session saved at `state` and serve until the listener fails.
 pub fn run(
     config: &Path,
     default_socket: PathBuf,
@@ -363,6 +363,9 @@ pub fn run(
 ) -> Result<()> {
     let cfg = load_config(config)?;
     init_logging(log_override.unwrap_or(cfg.log_level));
+    let dir = state.parent().unwrap_or(Path::new("/"));
+    state::prepare(&state)
+        .with_context(|| format!("preparing state directory {}", dir.display()))?;
     let socket = cfg.socket.unwrap_or(default_socket);
     let listener = bind(&socket)?;
     info!("device {} socket {}", cfg.device, socket.display());
@@ -420,8 +423,9 @@ pub struct Daemon {
 
 impl Daemon {
     /// Wire a player (and its event stream) to a new daemon, restoring the
-    /// session saved at `state_file`. Its directory must be creatable; the
-    /// file itself may be missing or broken (then the queue starts empty).
+    /// session saved at `state_file`. Its directory must exist (`run`
+    /// prepares it); the file may be missing or broken (then the queue starts
+    /// empty).
     pub fn start(
         player: Player,
         events: Receiver<Event>,
@@ -429,9 +433,6 @@ impl Daemon {
         state_file: PathBuf,
         on_player_gone: Box<dyn FnOnce() + Send>,
     ) -> Result<Self> {
-        let dir = state_file.parent().unwrap_or(Path::new("/"));
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("creating state directory {}", dir.display()))?;
         restore(&player, &state_file)?;
         let subscribers = Arc::new(Mutex::new(Vec::new()));
         let state = Arc::new(State {
