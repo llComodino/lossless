@@ -552,7 +552,10 @@ impl<S: Sink> Worker<S> {
                 PlayState::Playing => {}
                 PlayState::Paused => self.set_state(PlayState::Playing),
                 PlayState::Stopped if !self.queue.entries().is_empty() => {
-                    let first = self.queue.current().or_else(|| self.queue.next());
+                    let first = self.queue.current().or_else(|| {
+                        self.queue.restart_cycle();
+                        self.queue.next()
+                    });
                     self.jump(first.unwrap_or(0), true)
                 }
                 PlayState::Stopped => {}
@@ -1434,15 +1437,21 @@ mod tests {
             random: Some(true),
         })
         .unwrap();
-        w.handle(Command::Play(None)).unwrap();
-        drive(&mut w);
-        assert_eq!((w.state, w.queue.current()), (PlayState::Stopped, None));
-        let played: Vec<usize> = tracks(&events).into_iter().flatten().collect();
-        let mut sorted = played.clone();
-        sorted.sort_unstable();
-        assert_eq!(sorted, [0, 1, 2, 3, 4], "{played:?}");
-        let order: Vec<&Fixture> = played.iter().map(|&i| &fs[i]).collect();
-        assert!(w.output.heard == concat(&order), "output differs");
+        for pass in 0..2 {
+            w.output.heard.clear();
+            w.handle(Command::Play(None)).unwrap();
+            drive(&mut w);
+            assert_eq!((w.state, w.queue.current()), (PlayState::Stopped, None));
+            let played: Vec<usize> = tracks(&events).into_iter().flatten().collect();
+            let mut sorted = played.clone();
+            sorted.sort_unstable();
+            assert_eq!(sorted, [0, 1, 2, 3, 4], "pass {pass}: {played:?}");
+            let order: Vec<&Fixture> = played.iter().map(|&i| &fs[i]).collect();
+            assert!(
+                w.output.heard == concat(&order),
+                "pass {pass}: output differs"
+            );
+        }
     }
 
     #[test]

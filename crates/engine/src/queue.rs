@@ -118,6 +118,12 @@ impl Queue {
         self.random
     }
 
+    /// Forget what this shuffle cycle played, so every entry is due again.
+    pub(crate) fn restart_cycle(&mut self) {
+        self.cycle_start = self.history.len();
+        self.rebuild_order();
+    }
+
     pub(crate) fn set_mode(&mut self, repeat: Option<Repeat>, random: Option<bool>) {
         if let Some(r) = repeat {
             self.repeat = r;
