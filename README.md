@@ -72,7 +72,7 @@ is the only thing the playback path knows how to do.
 | Repeat (queue / one), random | yes | repeat one stays gapless; next skips past it |
 | Browse by folder, artist, album | yes | `browse`, `artists`, `albums`, `find` |
 | Volume: DAC hardware mixer, or software gain on the PipeWire path | yes | the bit-perfect path never scales samples; changes from `alsamixer` are reported |
-| Queue and position restored after restart | planned | |
+| Queue and position restored after restart | yes | paused where it was; vanished files dropped |
 | Terminal UI (`losslessd-tui`) | planned | |
 | MPRIS (media keys, bars) | planned | |
 | Other formats (ALAC, WAV, AIFF, Opus, Vorbis) | later | via symphonia |
@@ -130,6 +130,20 @@ The config is validated strictly. `device` must be a plain device name:
 `hw`/`plughw`/`front`/`sysdefault` followed by `:CARD=<id>[,DEV=<n>]` (or
 `:<id>,<n>`). Paths must be absolute or start with `~/`. Anything else is
 refused at startup with a message saying why.
+
+### State
+
+The queue, the current entry, the position and the modes are saved to
+`$XDG_STATE_HOME/lossless/state.json` (usually
+`~/.local/state/lossless/state.json`, mode 0600) whenever they change, by
+writing a temporary file and renaming it over the old one. On start the
+daemon restores the session paused where it was, without opening the device
+until you play. Files that have gone away are dropped (a warning gives the
+count); a corrupt or unreadable state file is logged and the queue starts
+empty. A state directory that can't be created or written stops the daemon at
+startup, before it binds the socket.
+While playing, the position is saved on events only (no timer), so after a
+crash playback resumes from the last pause, seek or track change.
 
 ### Keeping PipeWire or PulseAudio off the DAC
 

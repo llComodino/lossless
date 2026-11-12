@@ -47,6 +47,15 @@ pub enum Command {
     SetVolume(u8),
     /// The level the mixer watcher read after a change on the card.
     VolumeChanged(u8),
+    /// Put back a saved session: paused at `position_ms` of entry `index`,
+    /// with the device left closed until play.
+    Restore {
+        queue: Vec<PathBuf>,
+        index: Option<usize>,
+        position_ms: u64,
+        repeat: Repeat,
+        random: bool,
+    },
     Shutdown,
 }
 
@@ -569,6 +578,46 @@ impl<S: Sink> Worker<S> {
         }
     }
 
+    /// Open entry `index` at `ms` without touching the device. A failure
+    /// leaves it stopped on that entry, like a failed load.
+    fn restore(&mut self, index: Option<usize>, ms: u64) {
+        let index = index.filter(|&i| i < self.queue.entries().len());
+        self.queue.set_current(index);
+        self.emit(Event::TrackChanged { index });
+        let Some(i) = index else {
+            return self.anchor(0, Instant::now());
+        };
+        let opened = Source::open(&self.queue.entries()[i]).and_then(|mut s| {
+            match ms.saturating_mul(u64::from(s.format.rate)) / 1000 {
+                0 => Ok((s, 0)),
+                frame => s.seek(frame).map(|at| (s, at)),
+            }
+        });
+        match opened {
+            Ok((source, at)) => {
+                self.source = Some(source);
+                self.written = at;
+                self.state = PlayState::Paused;
+                self.anchor(self.frames_to_ms(at), Instant::now());
+            }
+            Err(e) => {
+                self.fail(&e);
+                self.anchor(0, Instant::now());
+            }
+        }
+    }
+
+    /// Paused to playing; the device may still be closed after a restore.
+    fn resume(&mut self) {
+        let format = self.source.as_ref().map(|s| s.format);
+        if let Some(Err(e)) = format.map(|f| self.output.ensure(f)) {
+            self.fail(&e);
+            return self.halt();
+        }
+        self.arm();
+        self.set_state(PlayState::Playing);
+    }
+
     /// Re-seek the source to what was actually heard, then drop the buffer:
     /// the device stays open, so there is no clock switch.
     fn rewind_to_heard(&mut self) {
@@ -654,7 +703,7 @@ impl<S: Sink> Worker<S> {
             }
             Command::Play(None) => match self.state {
                 PlayState::Playing => {}
-                PlayState::Paused => self.set_state(PlayState::Playing),
+                PlayState::Paused => self.resume(),
                 PlayState::Stopped if !self.queue.entries().is_empty() => {
                     let first = self.queue.current().or_else(|| {
                         self.queue.restart_cycle();
@@ -741,6 +790,25 @@ impl<S: Sink> Worker<S> {
                 self.emit(Event::Volume { percent: now });
             }
             Command::VolumeChanged(percent) => self.volume_seen(percent),
+            Command::Restore {
+                queue,
+                index,
+                position_ms,
+                repeat,
+                random,
+            } => {
+                self.output.stop();
+                self.source = None;
+                self.written = 0;
+                self.state = PlayState::Stopped;
+                self.last_error = None;
+                self.queue.replace(queue);
+                self.queue.set_mode(Some(repeat), Some(random));
+                self.queue_dirty = true;
+                self.emit(Event::QueueChanged);
+                self.emit(Event::Mode { repeat, random });
+                self.restore(index, position_ms);
+            }
             Command::Shutdown => {}
         }
         Ok(())
@@ -1852,6 +1920,115 @@ mod tests {
         );
         let st = lock(&w.shared).at(Instant::now()).status;
         assert_eq!((st.repeat, st.random), (Repeat::Queue, true));
+    }
+
+    fn restore(w: &mut Worker<FakeSink>, queue: Vec<std::path::PathBuf>, index: Option<usize>) {
+        w.handle(Command::Restore {
+            queue,
+            index,
+            position_ms: 250,
+            repeat: Repeat::Queue,
+            random: true,
+        })
+        .unwrap();
+        w.publish();
+    }
+
+    #[test]
+    fn restore_resumes_bit_exact_without_opening_the_device() {
+        let d = Dir::new();
+        let a = flac(&d, "a.flac", 44_100, 16, 2, 4 * BLOCK);
+        let (mut w, events) = worker(FakeSink::default());
+        restore(&mut w, vec![a.path.clone()], Some(0));
+        assert!(w.output.opens.is_empty(), "device opened before play");
+        let st = lock(&w.shared).at(Instant::now()).status;
+        assert_eq!(
+            (st.state, st.index, st.position_ms, st.repeat, st.random),
+            (PlayState::Paused, Some(0), 250, Repeat::Queue, true)
+        );
+        let got: Vec<Event> = events.try_iter().collect();
+        assert_eq!(
+            got,
+            [
+                Event::QueueChanged,
+                Event::Mode {
+                    repeat: Repeat::Queue,
+                    random: true
+                },
+                Event::TrackChanged { index: Some(0) },
+                Event::State {
+                    state: PlayState::Paused,
+                    position_ms: 250
+                },
+            ]
+        );
+        w.handle(Command::SetMode {
+            repeat: Some(Repeat::Off),
+            random: None,
+        })
+        .unwrap();
+        w.handle(Command::Toggle).unwrap();
+        assert_eq!(w.output.opens, [fmt(44_100, 16)]);
+        drive(&mut w);
+        let frame = 250 * 44_100 / 1000;
+        assert!(
+            w.output.heard == a.expected[frame * 2..],
+            "resume not exact"
+        );
+    }
+
+    #[test]
+    fn restore_keeps_the_queue_when_its_entry_is_broken() {
+        let d = Dir::new();
+        let a = flac(&d, "a.flac", 44_100, 16, 2, BLOCK);
+        let junk = write_bytes(&d, "junk.flac", &[0x5a; 512]);
+        let (mut w, events) = worker(FakeSink::default());
+        restore(&mut w, vec![junk.clone(), a.path.clone()], Some(0));
+        assert_eq!(errors(&events).len(), 1);
+        assert_eq!((w.state, w.queue.current()), (PlayState::Stopped, Some(0)));
+        assert_eq!(w.queue.entries().len(), 2);
+        assert!(w.output.opens.is_empty());
+
+        restore(&mut w, vec![a.path.clone()], Some(0));
+        w.handle(Command::Restore {
+            queue: vec![a.path.clone()],
+            index: Some(0),
+            position_ms: u64::MAX / 1000,
+            repeat: Repeat::Off,
+            random: false,
+        })
+        .unwrap();
+        assert_eq!(w.state, PlayState::Stopped, "seek past the end");
+        w.handle(Command::Restore {
+            queue: vec![a.path.clone()],
+            index: Some(0),
+            position_ms: 0,
+            repeat: Repeat::Off,
+            random: false,
+        })
+        .unwrap();
+        assert_eq!(w.state, PlayState::Paused, "no seek needed at 0");
+
+        restore(&mut w, vec![a.path.clone()], Some(5));
+        assert_eq!((w.state, w.queue.current()), (PlayState::Stopped, None));
+        assert_eq!(lock(&w.shared).queue.len(), 1);
+    }
+
+    #[test]
+    fn resume_after_restore_reports_a_device_failure() {
+        let d = Dir::new();
+        let a = flac(&d, "a.flac", 44_100, 16, 2, 4 * BLOCK);
+        let (mut w, events) = worker(FakeSink {
+            fail_ensure: true,
+            ..FakeSink::default()
+        });
+        restore(&mut w, vec![a.path.clone()], Some(0));
+        assert_eq!(w.state, PlayState::Paused);
+        assert!(errors(&events).is_empty());
+        w.handle(Command::Play(None)).unwrap();
+        w.publish();
+        assert_eq!(errors(&events)[0].code, ErrorCode::Device);
+        assert_eq!((w.state, w.queue.current()), (PlayState::Stopped, Some(0)));
     }
 
     #[test]

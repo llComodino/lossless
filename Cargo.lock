@@ -418,6 +418,7 @@ dependencies = [
  "lossless-proto",
  "proptest",
  "serde",
+ "serde_json",
  "thiserror",
  "toml",
 ]

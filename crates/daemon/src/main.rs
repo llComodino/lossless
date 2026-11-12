@@ -22,6 +22,7 @@ fn main() -> ExitCode {
     lossless_daemon::run(
         &lossless_daemon::config_path(),
         lossless_proto::default_socket(),
+        lossless_daemon::state::state_path(),
         level,
     )
     .map_or_else(fatal, |()| ExitCode::SUCCESS)

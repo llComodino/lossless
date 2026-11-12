@@ -38,6 +38,8 @@ First development version, not yet tagged.
 - Volume end to end: the DAC's hardware mixer (changes made outside the
   daemon reported too), `set_volume` and the `volume` event, `volume` in
   status, and `lossless volume [N|+N|-N]`.
+- State file (`$XDG_STATE_HOME/lossless/state.json`): the queue, position
+  and modes survive a restart, restored paused with the device closed.
 - TOML config (`device`, `music_dir`, `socket`) with strict validation.
 - `lossless`: command line client (`status`, `queue`, `add`, `play`,
   `pause`, `toggle`, `stop`, `next`, `prev`, `seek`, `clear`, `search`,

@@ -55,7 +55,8 @@ fn run_serves_the_configured_socket_and_music() {
         ),
     );
     let unused = dir.path("default.sock");
-    thread::spawn(move || run(&cfg, unused, None));
+    let state = dir.path("state.json");
+    thread::spawn(move || run(&cfg, unused, state, None));
     let c = connect(&sock);
     assert!(call(&c, r#"{"id":1,"cmd":"status"}"#).contains(r#""state":"stopped""#));
     assert!(call(&c, r#"{"id":2,"cmd":"add","paths":["a.flac"]}"#).contains("done"));
@@ -68,7 +69,8 @@ fn run_falls_back_to_the_default_socket() {
     let cfg = write_config(&dir, "device = \"null\"\nmixer = \"software\"\n");
     let sock = dir.path("default.sock");
     let s = sock.clone();
-    thread::spawn(move || run(&cfg, s, None));
+    let state = dir.path("state.json");
+    thread::spawn(move || run(&cfg, s, state, None));
     let c = connect(&sock);
     assert!(call(&c, r#"{"id":1,"cmd":"update"}"#).contains("no music_dir configured"));
 }
@@ -84,7 +86,8 @@ fn a_missing_mixer_card_runs_without_volume() {
             sock.display()
         ),
     );
-    thread::spawn(move || run(&cfg, PathBuf::from("/nonexistent"), None));
+    let state = dir.path("state.json");
+    thread::spawn(move || run(&cfg, PathBuf::from("/nonexistent"), state, None));
     let c = connect(&sock);
     let reply = call(&c, r#"{"id":1,"cmd":"set_volume","percent":50}"#);
     assert!(reply.contains(r#""code":"no_mixer""#), "{reply}");
@@ -123,23 +126,48 @@ fn a_missing_mixer_card_is_logged() {
 fn run_stops_on_a_bad_config_or_socket() {
     let dir = Dir::new();
     let bad = write_config(&dir, "device = \"file:'|id'\"\n");
-    let err = run(&bad, dir.path("s.sock"), None).unwrap_err();
+    let err = run(&bad, dir.path("s.sock"), dir.path("state.json"), None).unwrap_err();
     assert!(format!("{err:#}").contains("not allowed"), "{err:#}");
     assert!(!dir.path("s.sock").exists(), "bound before validating");
 
     let key = dir.path("key");
     std::fs::write(&key, "secret").unwrap();
     let ok = write_config(&dir, "device = \"null\"\n");
-    let err = run(&ok, key.clone(), None).unwrap_err();
+    let err = run(&ok, key.clone(), dir.path("state.json"), None).unwrap_err();
     assert!(format!("{err:#}").contains("not a socket"), "{err:#}");
     assert_eq!(std::fs::read_to_string(&key).unwrap(), "secret");
+
+    let err = run(&ok, dir.path("s.sock"), key.join("state.json"), None).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.starts_with("preparing state directory"), "{msg}");
+    assert!(!dir.path("s.sock").exists(), "bound before the state check");
+}
+
+#[test]
+fn run_stops_on_a_read_only_state_dir() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = Dir::new();
+    let ro = dir.path("ro");
+    std::fs::create_dir(&ro).unwrap();
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o500)).unwrap();
+    if std::fs::write(ro.join("probe"), "").is_ok() {
+        return; // root ignores the mode
+    }
+    let cfg = write_config(&dir, "device = \"null\"\n");
+    let err = run(&cfg, dir.path("s.sock"), ro.join("state.json"), None).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.starts_with("preparing state directory"), "{msg}");
+    assert!(msg.contains("ermission denied"), "{msg}");
+    assert!(!dir.path("s.sock").exists(), "bound before the state check");
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
 
 fn losslessd(env: &[(&str, &Path)]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_losslessd"));
     cmd.env_remove("HOME")
         .env_remove("XDG_CONFIG_HOME")
-        .env_remove("XDG_RUNTIME_DIR");
+        .env_remove("XDG_RUNTIME_DIR")
+        .env_remove("XDG_STATE_HOME");
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -185,14 +213,21 @@ fn binary_without_home_uses_defaults_and_the_runtime_socket() {
     // absent, so all defaults; a non-socket where the socket goes stops it.
     let dir = Dir::new();
     std::fs::write(dir.path("lossless.sock"), "not a socket").unwrap();
-    failed_with(&losslessd(&[("XDG_RUNTIME_DIR", &dir.0)]), "not a socket");
+    let env = [("XDG_RUNTIME_DIR", &*dir.0), ("XDG_STATE_HOME", &*dir.0)];
+    failed_with(&losslessd(&env), "not a socket");
 }
 
 fn spawn_with(dir: &Dir, args: &[&str]) -> std::process::Child {
+    spawn_env(dir, args, &[("XDG_STATE_HOME", &dir.path("state"))])
+}
+
+fn spawn_env(dir: &Dir, args: &[&str], env: &[(&str, &Path)]) -> std::process::Child {
     Command::new(env!("CARGO_BIN_EXE_losslessd"))
         .env_remove("HOME")
         .env("XDG_CONFIG_HOME", dir.path("xdg"))
         .env_remove("XDG_RUNTIME_DIR")
+        .env_remove("XDG_STATE_HOME")
+        .envs(env.iter().copied())
         .args(args)
         .stderr(Stdio::piped())
         .spawn()
@@ -269,4 +304,95 @@ fn bad_flag_prints_usage() {
             "{err}"
         );
     }
+}
+
+/// The first stderr line containing `want`, within the usual wait. The rest
+/// is drained, so the daemon never logs into a closed pipe.
+fn stderr_line(child: &mut std::process::Child, want: &'static str) -> Option<String> {
+    let stderr = child.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if line.contains(want) {
+                let _ = tx.send(line);
+            }
+        }
+    });
+    rx.recv_timeout(Duration::from_secs(10)).ok()
+}
+
+#[test]
+fn restore_survives_gone_and_corrupt_state() {
+    for (text, want) in [
+        (
+            r#"{"queue":["/gone/a.flac","/gone/b.flac"],"index":1,"position_ms":5,"repeat":"off","random":false}"#,
+            "state: dropped 2 missing entries",
+        ),
+        (r#"{"queue":["/gone/a.flac"],"ind"#, "state: parsing"),
+    ] {
+        let dir = Dir::new();
+        let sock = dir.path("s.sock");
+        xdg_config(
+            &dir,
+            &format!("device = \"null\"\nsocket = \"{}\"\n", sock.display()),
+        );
+        std::fs::create_dir_all(dir.path("state/lossless")).unwrap();
+        std::fs::write(dir.path("state/lossless/state.json"), text).unwrap();
+        let mut child = spawn_with(&dir, &["--log-level", "warn"]);
+        let line = stderr_line(&mut child, "state:");
+        let c = connect(&sock);
+        let q = call(&c, r#"{"id":1,"cmd":"queue"}"#);
+        let _ = child.kill();
+        let _ = child.wait();
+        let line = line.expect("no state warning on stderr");
+        assert!(line.starts_with("WARN") && line.contains(want), "{line}");
+        assert!(q.contains(r#""data":[]"#), "{q}");
+    }
+}
+
+#[test]
+fn binary_state_falls_back_to_home_without_an_absolute_xdg_dir() {
+    let dir = Dir::new();
+    xdg_config(
+        &dir,
+        &format!(
+            "device = \"null\"\nsocket = \"{}\"\n",
+            dir.path("s.sock").display()
+        ),
+    );
+    std::fs::create_dir_all(dir.path(".local/state/lossless")).unwrap();
+    std::fs::write(dir.path(".local/state/lossless/state.json"), "{").unwrap();
+    let mut child = spawn_env(
+        &dir,
+        &["--log-level", "warn"],
+        &[("HOME", &dir.0), ("XDG_STATE_HOME", Path::new("relative"))],
+    );
+    let line = stderr_line(&mut child, "state:");
+    let _ = child.kill();
+    let _ = child.wait();
+    let line = line.expect("no state warning on stderr");
+    assert!(line.contains(".local/state/lossless/state.json"), "{line}");
+}
+
+#[test]
+fn run_restores_modes_when_every_entry_is_gone() {
+    let dir = Dir::new();
+    let sock = dir.path("s.sock");
+    let cfg = write_config(
+        &dir,
+        &format!("device = \"null\"\nsocket = \"{}\"\n", sock.display()),
+    );
+    let state = dir.path("state.json");
+    std::fs::write(
+        &state,
+        r#"{"queue":["/gone/a.flac"],"index":0,"position_ms":5,"repeat":"one","random":true}"#,
+    )
+    .unwrap();
+    let unused = dir.path("default.sock");
+    thread::spawn(move || run(&cfg, unused, state, None));
+    let c = connect(&sock);
+    let st = call(&c, r#"{"id":1,"cmd":"status"}"#);
+    assert!(st.contains(r#""repeat":"one""#), "{st}");
+    assert!(st.contains(r#""random":true"#), "{st}");
+    assert!(call(&c, r#"{"id":2,"cmd":"queue"}"#).contains(r#""data":[]"#));
 }
