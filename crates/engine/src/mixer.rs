@@ -197,7 +197,7 @@ impl HardwareMixer {
     /// Block until the card reports a control change, then read the level.
     fn next_change(&self, fds: &mut [poll::pollfd]) -> Result<u8> {
         let err = |e: alsa::Error| device_error(&self.device, e);
-        poll::poll(fds, -1).map_err(err)?;
+        retry_interrupted(|| poll::poll(fds, -1)).map_err(err)?;
         let flags = self.mixer.revents(fds).map_err(err)?;
         if flags.intersects(Flags::ERR | Flags::HUP | Flags::NVAL) {
             return Err(device_error(&self.device, "device gone"));
@@ -254,6 +254,19 @@ pub fn watch(
         .name("mixer".into())
         .spawn(move || relay(|| m.next_change(&mut fds), on_change))
         .map_err(|e| device_error(card, e))
+}
+
+/// A signal landing on the thread interrupts `poll`; that is no reason to
+/// stop watching.
+fn retry_interrupted(mut poll: impl FnMut() -> alsa::Result<usize>) -> alsa::Result<usize> {
+    loop {
+        match poll() {
+            Err(e)
+                if std::io::Error::from_raw_os_error(e.errno()).kind()
+                    == std::io::ErrorKind::Interrupted => {}
+            r => return r,
+        }
+    }
 }
 
 /// Pass each level read to `on_change`; the first error ends the watch. The
@@ -609,6 +622,27 @@ mod tests {
             },
         );
         assert_eq!((reads, calls), (2, 2), "stops once nobody listens");
+    }
+
+    #[test]
+    fn interrupted_polls_are_retried() {
+        let (eintr, enodev) = (4, 19);
+        let mut calls = 0;
+        let got = retry_interrupted(|| {
+            calls += 1;
+            if calls < 3 {
+                Err(alsa::Error::new("poll", eintr))
+            } else {
+                Ok(1)
+            }
+        });
+        assert_eq!((got.unwrap(), calls), (1, 3));
+        let mut calls = 0;
+        let got = retry_interrupted(|| {
+            calls += 1;
+            Err(alsa::Error::new("poll", enodev))
+        });
+        assert_eq!((got.unwrap_err().errno(), calls), (enodev, 1));
     }
 
     /// Restores the control to raw 120 (0 dB on the PRO2), even if an
