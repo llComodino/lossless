@@ -253,7 +253,7 @@ After `{"id":3,"cmd":"subscribe"}` the connection also receives events:
 
 There are no position ticks: while playing, clients advance `position_ms`
 from the last `state` event with their own clock. Requests are capped at
-64 KiB per line. The types live in `crates/proto`.
+4 MiB per line. The types live in `crates/proto`.
 
 ## Security
 

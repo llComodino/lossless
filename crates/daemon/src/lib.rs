@@ -294,9 +294,10 @@ impl State {
     }
 }
 
-/// Longest accepted request line. Real requests are tiny; the cap stops a
-/// client from making the daemon buffer an endless line.
-pub const MAX_REQUEST: usize = 64 * 1024;
+/// Longest accepted request line: room for queue edits naming a whole
+/// artist, while a client still can't make the daemon buffer an endless
+/// line. The buffer grows only as bytes arrive.
+pub const MAX_REQUEST: usize = 4 * 1024 * 1024;
 
 fn bad(msg: String) -> ServerMessage {
     ServerMessage::Reply {
@@ -532,10 +533,11 @@ mod tests {
         let daemon =
             Daemon::start(player, events, None, dir.path("s.json"), Box::new(|| {})).unwrap();
         let (server, mut client) = UnixStream::pair().unwrap();
-        client.write_all(&vec![b'x'; MAX_REQUEST + 1]).unwrap();
-        drop(client);
+        client.shutdown(std::net::Shutdown::Read).unwrap();
+        let writer = std::thread::spawn(move || client.write_all(&vec![b'x'; MAX_REQUEST + 1]));
         let err = serve(&daemon.state, server).unwrap_err();
         assert!(err.to_string().contains("pipe"), "{err}");
+        writer.join().unwrap().unwrap();
     }
 
     #[test]

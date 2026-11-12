@@ -484,6 +484,16 @@ fn oversized_request_closes_only_that_connection() {
 }
 
 #[test]
+fn requests_past_64_kib_are_accepted() {
+    let s = Server::start(true);
+    s.album(1);
+    let mut c = s.connect();
+    let paths = vec!["album/01 one.flac".to_string(); 5_000];
+    c.ok(Command::Add { paths, at: None });
+    assert_eq!(queue(&mut c).len(), 5_000);
+}
+
+#[test]
 fn a_dead_subscriber_does_not_stop_the_others() {
     let s = Server::start(true);
     s.album(1);
