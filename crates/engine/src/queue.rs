@@ -1,11 +1,48 @@
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hasher};
 use std::path::PathBuf;
+
+use lossless_proto::Repeat;
 
 use crate::error::{Error, Result};
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Queue {
     entries: Vec<PathBuf>,
     current: Option<usize>,
+    repeat: Repeat,
+    random: bool,
+    order: Vec<usize>,
+    history: Vec<usize>,
+    seed: u64,
+}
+
+impl Default for Queue {
+    fn default() -> Self {
+        Self::with_seed(RandomState::new().build_hasher().finish())
+    }
+}
+
+fn xorshift(state: &mut u64) -> u64 {
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    x
+}
+
+fn shuffle(items: &mut [usize], seed: &mut u64) {
+    for i in (1..items.len()).rev() {
+        let j = (xorshift(seed) % (i as u64 + 1)) as usize;
+        items.swap(i, j);
+    }
+}
+
+struct Step {
+    index: usize,
+    new_cycle: Option<Vec<usize>>,
+    seed: u64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -15,6 +52,18 @@ pub(crate) enum Removal {
 }
 
 impl Queue {
+    pub(crate) fn with_seed(seed: u64) -> Self {
+        Self {
+            entries: Vec::new(),
+            current: None,
+            repeat: Repeat::Off,
+            random: false,
+            order: Vec::new(),
+            history: Vec::new(),
+            seed: seed | 1,
+        }
+    }
+
     pub(crate) fn entries(&self) -> &[PathBuf] {
         &self.entries
     }
@@ -24,7 +73,127 @@ impl Queue {
     }
 
     pub(crate) fn set_current(&mut self, i: Option<usize>) {
+        if let Some(old) = self.current.filter(|&o| i.is_some_and(|n| n != o)) {
+            self.push_history(old);
+        }
         self.current = i;
+        self.order.retain(|&o| Some(o) != i);
+    }
+
+    fn push_history(&mut self, i: usize) {
+        self.history.push(i);
+        if self.history.len() > self.entries.len() {
+            self.history.remove(0);
+        }
+    }
+
+    fn rebuild_order(&mut self) {
+        self.order = (0..self.entries.len())
+            .filter(|&i| Some(i) != self.current && !self.history.contains(&i))
+            .collect();
+        shuffle(&mut self.order, &mut self.seed);
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn set_mode(&mut self, repeat: Option<Repeat>, random: Option<bool>) {
+        if let Some(r) = repeat {
+            self.repeat = r;
+        }
+        if let Some(on) = random {
+            let was = std::mem::replace(&mut self.random, on);
+            if on && !was {
+                self.rebuild_order();
+            }
+        }
+    }
+
+    fn plan(&self) -> Option<Step> {
+        let len = self.entries.len();
+        if len == 0 {
+            return None;
+        }
+        let step = |index| Step {
+            index,
+            new_cycle: None,
+            seed: self.seed,
+        };
+        if let (Repeat::One, Some(c)) = (self.repeat, self.current) {
+            return Some(step(c));
+        }
+        if !self.random {
+            return match self.current {
+                None => Some(step(0)),
+                Some(c) if c + 1 < len => Some(step(c + 1)),
+                Some(_) if self.repeat == Repeat::Queue => Some(step(0)),
+                Some(_) => None,
+            };
+        }
+        if let Some(&i) = self.order.last() {
+            return Some(step(i));
+        }
+        if self.repeat != Repeat::Queue {
+            return None;
+        }
+        let mut seed = self.seed;
+        let mut pool: Vec<usize> = (0..len).collect();
+        shuffle(&mut pool, &mut seed);
+        if len > 1 && pool.last().copied() == self.current {
+            pool.swap(0, len - 1);
+        }
+        let index = pool.pop()?;
+        Some(Step {
+            index,
+            new_cycle: Some(pool),
+            seed,
+        })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn peek_next(&self) -> Option<usize> {
+        self.plan().map(|s| s.index)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn next(&mut self) -> Option<usize> {
+        let step = self.plan()?;
+        self.seed = step.seed;
+        match step.new_cycle {
+            Some(order) => {
+                self.order = order;
+                self.history.clear();
+            }
+            None => {
+                if self.random && self.repeat != Repeat::One {
+                    self.order.pop();
+                }
+                if let Some(old) = self.current.filter(|&c| c != step.index) {
+                    self.push_history(old);
+                }
+            }
+        }
+        self.current = Some(step.index);
+        Some(step.index)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn previous(&mut self) -> Option<usize> {
+        let target = loop {
+            match self.history.pop() {
+                Some(h) if Some(h) == self.current => continue,
+                Some(h) => break Some(h),
+                None => break self.current.and_then(|c| c.checked_sub(1)),
+            }
+        };
+        if let Some(t) = target {
+            self.current = Some(t);
+            self.order.retain(|&o| o != t);
+        }
+        target
+    }
+
+    fn remap_history(&mut self, f: impl Fn(usize) -> Option<usize>) {
+        self.history = self.history.iter().filter_map(|&h| f(h)).collect();
+        self.rebuild_order();
     }
 
     pub(crate) fn insert(&mut self, at: Option<usize>, paths: Vec<PathBuf>) -> Result<()> {
@@ -38,6 +207,7 @@ impl Queue {
         if let Some(c) = self.current.as_mut().filter(|c| at <= **c) {
             *c += n;
         }
+        self.remap_history(|h| Some(if at <= h { h + n } else { h }));
         Ok(())
     }
 
@@ -75,6 +245,7 @@ impl Queue {
             i += 1;
             keep
         });
+        self.remap_history(|h| sorted.binary_search(&h).is_err().then(|| h - before(h)));
         Ok(outcome)
     }
 
@@ -85,8 +256,8 @@ impl Queue {
         }
         let entry = self.entries.remove(from);
         self.entries.insert(to, entry);
-        if let Some(c) = self.current {
-            self.current = Some(if c == from {
+        let moved = |c: usize| {
+            if c == from {
                 to
             } else if from < c && c <= to {
                 c - 1
@@ -94,14 +265,18 @@ impl Queue {
                 c + 1
             } else {
                 c
-            });
-        }
+            }
+        };
+        self.current = self.current.map(moved);
+        self.remap_history(|h| Some(moved(h)));
         Ok(())
     }
 
     pub(crate) fn replace(&mut self, paths: Vec<PathBuf>) {
         self.entries = paths;
         self.current = None;
+        self.history.clear();
+        self.rebuild_order();
     }
 }
 
@@ -110,6 +285,8 @@ mod tests {
     use std::path::PathBuf;
 
     use proptest::prelude::*;
+
+    use lossless_proto::Repeat;
 
     use super::{Queue, Removal};
     use crate::Error;
@@ -245,6 +422,158 @@ mod tests {
                     } else {
                         prop_assert_eq!(q.current(), None);
                     }
+                }
+            }
+        }
+    }
+
+    fn seeded(n: usize, repeat: Repeat, random: bool) -> Queue {
+        let mut q = Queue::with_seed(0x9e37_79b9_7f4a_7c15);
+        q.replace((0..n).map(|i| PathBuf::from(format!("f{i}"))).collect());
+        q.set_mode(Some(repeat), Some(random));
+        q
+    }
+
+    fn take(q: &mut Queue, n: usize) -> Vec<usize> {
+        (0..n).map(|_| q.next().unwrap()).collect()
+    }
+
+    fn sorted(mut v: Vec<usize>) -> Vec<usize> {
+        v.sort_unstable();
+        v
+    }
+
+    #[test]
+    fn repeat_one_repeats() {
+        let mut q = seeded(3, Repeat::One, true);
+        q.set_current(Some(1));
+        assert_eq!(take(&mut q, 4), [1, 1, 1, 1]);
+        q.set_mode(None, Some(false));
+        assert_eq!(q.next(), Some(1));
+    }
+
+    #[test]
+    fn repeat_queue_wraps() {
+        let mut q = seeded(3, Repeat::Queue, false);
+        q.set_current(Some(1));
+        assert_eq!(take(&mut q, 4), [2, 0, 1, 2]);
+    }
+
+    #[test]
+    fn off_stops_at_the_end() {
+        let mut q = seeded(3, Repeat::Off, false);
+        assert_eq!(take(&mut q, 3), [0, 1, 2]);
+        assert_eq!(q.next(), None);
+        assert_eq!(q.current(), Some(2));
+    }
+
+    #[test]
+    fn random_plays_each_entry_once_per_cycle() {
+        let all: Vec<usize> = (0..100).collect();
+        let mut q = seeded(100, Repeat::Queue, true);
+        let first = take(&mut q, 100);
+        assert_eq!(sorted(first.clone()), all);
+        let second = take(&mut q, 100);
+        assert_eq!(sorted(second.clone()), all);
+        assert_ne!(first, second);
+        assert_ne!(first, all);
+        let mut q = seeded(100, Repeat::Off, true);
+        assert_eq!(sorted(take(&mut q, 100)), all);
+        assert_eq!(q.next(), None);
+    }
+
+    #[test]
+    fn previous_follows_history() {
+        let mut q = seeded(5, Repeat::Off, false);
+        assert_eq!(take(&mut q, 3), [0, 1, 2]);
+        assert_eq!(q.previous(), Some(1));
+        assert_eq!(q.previous(), Some(0));
+        assert_eq!(q.previous(), None);
+        let mut q = seeded(5, Repeat::Off, false);
+        q.set_current(Some(3));
+        assert_eq!(q.previous(), Some(2));
+        q.set_current(Some(4));
+        assert_eq!(q.previous(), Some(2));
+        let mut q = seeded(5, Repeat::Off, true);
+        let played = take(&mut q, 3);
+        assert_eq!(q.previous(), Some(played[1]));
+        assert_eq!(q.previous(), Some(played[0]));
+    }
+
+    #[test]
+    fn random_handles_tiny_queues() {
+        let mut q = seeded(0, Repeat::Queue, true);
+        assert_eq!(q.next(), None);
+        let mut q = seeded(1, Repeat::Off, true);
+        assert_eq!(q.next(), Some(0));
+        assert_eq!(q.next(), None);
+        let mut q = seeded(1, Repeat::Queue, true);
+        assert_eq!(take(&mut q, 50), vec![0; 50]);
+        let mut q = seeded(2, Repeat::Queue, true);
+        let seen = take(&mut q, 1000);
+        assert!(seen.contains(&0) && seen.contains(&1));
+        assert!(seen.windows(2).all(|w| w[0] != w[1]));
+    }
+
+    #[test]
+    fn peek_matches_next() {
+        for (repeat, random) in [
+            (Repeat::Off, false),
+            (Repeat::Queue, false),
+            (Repeat::One, false),
+            (Repeat::Off, true),
+            (Repeat::Queue, true),
+            (Repeat::One, true),
+        ] {
+            let mut q = seeded(4, repeat, random);
+            for _ in 0..20 {
+                let peeked = q.peek_next();
+                assert_eq!(q.peek_next(), peeked);
+                assert_eq!(q.next(), peeked);
+            }
+        }
+    }
+
+    #[test]
+    fn edits_remap_history() {
+        let mut q = seeded(5, Repeat::Off, false);
+        take(&mut q, 4);
+        q.remove(&[0]).unwrap();
+        assert_eq!(q.previous(), Some(1));
+        q.insert(Some(0), paths(&["x"])).unwrap();
+        assert_eq!(q.previous(), Some(1));
+    }
+
+    proptest! {
+        #[test]
+        fn edits_rebuild_the_order(
+            start in 0..8usize,
+            edits in proptest::collection::vec((edit(), 0..3usize), 0..30),
+        ) {
+            let mut next_id = start;
+            let mut q = seeded(start, Repeat::Queue, true);
+            for (e, nexts) in edits {
+                let _ = match e {
+                    Edit::Insert(at, n) => {
+                        let new = (0..n).map(|_| { next_id += 1; PathBuf::from(format!("f{next_id}")) }).collect();
+                        q.insert(at, new).is_ok()
+                    }
+                    Edit::Remove(ix) => q.remove(&ix).is_ok(),
+                    Edit::Move(a, b) => q.move_entry(a, b).is_ok(),
+                };
+                for _ in 0..nexts {
+                    q.next();
+                }
+                let len = q.entries().len();
+                prop_assert!(q.order.iter().all(|&o| o < len && Some(o) != q.current() && !q.history.contains(&o)));
+                prop_assert!(q.history.iter().all(|&h| h < len));
+                prop_assert!(q.history.len() <= len);
+                let mut o = q.order.clone();
+                o.sort_unstable();
+                o.dedup();
+                prop_assert_eq!(o.len(), q.order.len());
+                if let Some(c) = q.current() {
+                    prop_assert!(c < len);
                 }
             }
         }
