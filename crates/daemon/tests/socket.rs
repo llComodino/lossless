@@ -760,19 +760,16 @@ fn restart_restores_queue_paused_at_position() {
         random: Some(true),
     });
     c.ok(Command::Play { index: Some(1) });
-    c.ok(Command::Seek { ms: 60_000 });
     c.ok(Command::Pause);
+    c.ok(Command::Seek { ms: 60_000 });
     c.wait_for(|e| {
-        matches!(
-            e,
-            Event::State {
-                state: PlayState::Paused,
-                ..
-            }
-        )
+        *e == Event::State {
+            state: PlayState::Paused,
+            position_ms: 60_000,
+        }
     });
     let before = status(&mut c);
-    assert!((60_000..61_000).contains(&before.position_ms), "{before:?}");
+    assert_eq!(before.position_ms, 60_000, "{before:?}");
 
     s.serve("sock2", Some(s.music()), None);
     let mut c = Client::connect(&s.dir.path("sock2"));
