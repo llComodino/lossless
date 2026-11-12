@@ -68,7 +68,7 @@ is the only thing the playback path knows how to do.
 | Queue: add, clear, jump | yes | |
 | Play, pause, stop, next, previous, sample-accurate seek | yes | |
 | Events for clients | yes | state, track, queue, library |
-| Queue: insert at position, remove, move, play now | planned | |
+| Queue: insert at position, remove, move, play now | yes | the playing track keeps its place |
 | Repeat (queue / one), random | yes | repeat one stays gapless; next skips past it |
 | Browse by folder, artist, album | planned | |
 | Volume: DAC hardware mixer, or software gain on the PipeWire path | planned | the bit-perfect path never scales samples |
