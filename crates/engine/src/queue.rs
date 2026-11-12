@@ -76,7 +76,7 @@ impl Queue {
     }
 
     pub(crate) fn set_current(&mut self, i: Option<usize>) {
-        if let Some(old) = self.current.filter(|&o| i.is_some_and(|n| n != o)) {
+        if let Some(old) = self.current.filter(|&o| i != Some(o)) {
             self.push_history(old);
         }
         self.current = i;
@@ -116,6 +116,11 @@ impl Queue {
 
     pub(crate) fn random(&self) -> bool {
         self.random
+    }
+
+    /// Shuffle played every entry and nothing is current: a finished cycle.
+    pub(crate) fn cycle_done(&self) -> bool {
+        self.random && self.current.is_none() && self.order.is_empty()
     }
 
     /// Forget what this shuffle cycle played, so every entry is due again.

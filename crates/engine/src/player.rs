@@ -694,7 +694,12 @@ impl<S: Sink> Worker<S> {
                 self.emit(Event::QueueChanged);
                 self.emit(Event::TrackChanged { index: None });
             }
-            Command::Play(Some(i)) if i < self.queue.entries().len() => self.jump(i, true),
+            Command::Play(Some(i)) if i < self.queue.entries().len() => {
+                if self.queue.cycle_done() {
+                    self.queue.restart_cycle();
+                }
+                self.jump(i, true)
+            }
             Command::Play(Some(index)) => {
                 return Err(Error::OutOfRange {
                     index,
@@ -729,16 +734,14 @@ impl<S: Sink> Worker<S> {
             }
             Command::Stop => self.halt(),
             Command::Next | Command::Previous => {
-                let Some(i) = self.queue.current() else {
-                    return Ok(());
+                let current = self.queue.current();
+                let target = match (&cmd, current) {
+                    (Command::Next, None) => None,
+                    (Command::Next, Some(_)) => self.queue.skip(),
+                    _ => self.queue.previous().or(current),
                 };
-                let target = if cmd == Command::Next {
-                    match self.queue.skip() {
-                        Some(t) => t,
-                        None => return Ok(()),
-                    }
-                } else {
-                    self.queue.previous().unwrap_or(i)
+                let Some(target) = target else {
+                    return Ok(());
                 };
                 if self.state == PlayState::Stopped {
                     self.queue.set_current(Some(target));
@@ -1866,6 +1869,57 @@ mod tests {
                 "pass {pass}: output differs"
             );
         }
+    }
+
+    #[test]
+    fn a_jump_after_a_finished_shuffle_starts_a_new_cycle() {
+        let d = Dir::new();
+        let fs: Vec<Fixture> = (0..4)
+            .map(|i| flac(&d, &format!("{i}.flac"), 44_100, 16, 2, BLOCK))
+            .collect();
+        let (mut w, events) = worker(FakeSink::default());
+        w.handle(Command::Add {
+            paths: fs.iter().map(|f| f.path.clone()).collect(),
+            at: None,
+        })
+        .unwrap();
+        w.handle(Command::SetMode {
+            repeat: Some(Repeat::Off),
+            random: Some(true),
+        })
+        .unwrap();
+        w.handle(Command::Play(None)).unwrap();
+        drive(&mut w);
+        w.publish();
+        let _ = events.try_iter().count();
+        w.handle(Command::Play(Some(2))).unwrap();
+        drive(&mut w);
+        let played: Vec<usize> = tracks(&events).into_iter().flatten().collect();
+        assert_eq!(played[0], 2);
+        let mut sorted = played.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, [0, 1, 2, 3], "{played:?}");
+    }
+
+    #[test]
+    fn previous_after_a_finish_goes_back_to_the_last_track() {
+        let d = Dir::new();
+        let a = flac(&d, "a.flac", 44_100, 16, 2, BLOCK);
+        let b = flac(&d, "b.flac", 44_100, 16, 2, BLOCK);
+        let (mut w, events) = worker(FakeSink::default());
+        w.handle(Command::Add {
+            paths: vec![a.path.clone(), b.path.clone()],
+            at: None,
+        })
+        .unwrap();
+        w.handle(Command::Play(None)).unwrap();
+        drive(&mut w);
+        w.publish();
+        let _ = events.try_iter().count();
+        w.handle(Command::Previous).unwrap();
+        assert_eq!((w.state, w.queue.current()), (PlayState::Stopped, Some(1)));
+        w.publish();
+        assert_eq!(tracks(&events), [Some(1)]);
     }
 
     #[test]
