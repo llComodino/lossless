@@ -70,7 +70,7 @@ is the only thing the playback path knows how to do.
 | Events for clients | yes | state, track, queue, library |
 | Queue: insert at position, remove, move, play now | yes | the playing track keeps its place |
 | Repeat (queue / one), random | yes | repeat one stays gapless; next skips past it |
-| Browse by folder, artist, album | planned | |
+| Browse by folder, artist, album | yes | `browse`, `artists`, `albums`, `find` |
 | Volume: DAC hardware mixer, or software gain on the PipeWire path | planned | the bit-perfect path never scales samples |
 | Queue and position restored after restart | planned | |
 | Terminal UI (`losslessd-tui`) | planned | |
@@ -151,6 +151,10 @@ and drive it with the client:
 ```sh
 lossless update                  # scan music_dir
 lossless search radiohead ok     # tracks matching every word
+lossless browse [Radiohead]      # folders (trailing /) and tracks under music_dir
+lossless artists                 # artist names
+lossless albums [artist]         # album names, of one artist or all
+lossless find --artist Radiohead --album "OK Computer"   # exact, either optional
 lossless add "Radiohead/OK Computer"
 lossless add --at 1 song.flac    # insert at position 1 (default: append)
 lossless replace "Radiohead/OK Computer"   # swap the queue, stops playback

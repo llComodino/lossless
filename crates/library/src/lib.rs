@@ -1,14 +1,16 @@
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use lofty::prelude::*;
 use lossless_proto::{StreamFormat, Track};
 
 mod error;
+mod listing;
 
 pub use error::{Error, Result};
+pub use listing::UNKNOWN;
 
 pub const AUDIO_EXTENSIONS: &[&str] = &["flac", "mp3"];
 
@@ -115,6 +117,7 @@ fn describe(path: String, file: Option<lofty::file::TaggedFile>) -> Track {
         artist: None,
         album: None,
         track_number: None,
+        disc_number: None,
         duration_ms: None,
         format: None,
     };
@@ -138,27 +141,41 @@ fn describe(path: String, file: Option<lofty::file::TaggedFile>) -> Track {
         track.artist = text(tag.artist());
         track.album = text(tag.album());
         track.track_number = tag.track();
+        track.disc_number = tag.disk();
     }
     track
 }
 
 #[derive(Default)]
 pub struct Library {
+    root: PathBuf,
     tracks: Vec<Track>,
     by_path: HashMap<String, usize>,
     /// Lowercased artist/album/title/path per track, for search.
     haystack: Vec<String>,
+    artists: BTreeMap<String, (String, BTreeSet<usize>)>,
+    albums: BTreeMap<(String, String), (String, BTreeSet<usize>)>,
 }
 
 impl Library {
     pub fn scan(root: &Path) -> Result<Self> {
         let mut files = Vec::new();
         collect(root, &mut files)?;
-        let mut lib = Self::default();
-        for path in files {
-            lib.insert(read_track(&path));
+        Ok(Self::from_tracks(
+            root,
+            files.iter().map(|path| read_track(path)),
+        ))
+    }
+
+    pub(crate) fn from_tracks(root: &Path, tracks: impl IntoIterator<Item = Track>) -> Self {
+        let mut lib = Self {
+            root: root.to_path_buf(),
+            ..Self::default()
+        };
+        for track in tracks {
+            lib.insert(track);
         }
-        Ok(lib)
+        lib
     }
 
     fn insert(&mut self, track: Track) {
@@ -173,7 +190,20 @@ impl Library {
         .collect::<Vec<_>>()
         .join("\n")
         .to_lowercase();
-        self.by_path.insert(track.path.clone(), self.tracks.len());
+        let i = self.tracks.len();
+        let artist = track.artist.as_deref().unwrap_or(UNKNOWN);
+        let album = track.album.as_deref().unwrap_or(UNKNOWN);
+        self.artists
+            .entry(artist.to_lowercase())
+            .or_insert_with(|| (artist.to_string(), BTreeSet::new()))
+            .1
+            .insert(i);
+        self.albums
+            .entry((artist.to_lowercase(), album.to_lowercase()))
+            .or_insert_with(|| (album.to_string(), BTreeSet::new()))
+            .1
+            .insert(i);
+        self.by_path.insert(track.path.clone(), i);
         self.tracks.push(track);
         self.haystack.push(hay);
     }
@@ -217,6 +247,7 @@ mod tests {
             artist: Some(artist.into()),
             album: Some(album.into()),
             track_number: None,
+            disc_number: None,
             duration_ms: None,
             format: None,
         }
@@ -297,6 +328,20 @@ mod tests {
                 assert_eq!(t.format, None);
             }
         }
+    }
+
+    #[test]
+    fn disc_numbers_are_read() {
+        use lofty::tag::{Tag, TagType};
+        use lossless_engine::fixtures::{BLOCK, Dir, flac};
+        let d = Dir::new();
+        let f = flac(&d, "a.flac", 44_100, 16, 2, BLOCK);
+        assert_eq!(read_track(&f.path).disc_number, None);
+        let mut tag = Tag::new(TagType::VorbisComments);
+        tag.insert_text(ItemKey::DiscNumber, "2".into());
+        tag.save_to_path(&f.path, lofty::config::WriteOptions::default())
+            .unwrap();
+        assert_eq!(read_track(&f.path).disc_number, Some(2));
     }
 
     #[test]
@@ -396,6 +441,7 @@ mod props {
                 artist: Some(artist.clone()),
                 album: Some(album.clone()),
                 track_number: None,
+                disc_number: None,
                 duration_ms: None,
                 format: None,
             });

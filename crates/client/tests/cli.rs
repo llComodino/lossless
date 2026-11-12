@@ -227,6 +227,31 @@ fn update_then_search_prints_tracks_with_paths() {
 }
 
 #[test]
+fn listing_commands() {
+    let s = Server::start();
+    s.album();
+    let watch = s.spawn(&["--json", "watch"]);
+    assert!(watch.wait_for("reply").contains("done"));
+    s.ok(&["update"]);
+    watch.wait_for("library_changed");
+
+    assert_eq!(s.ok(&["browse"]), "album/\n");
+    let out = s.ok(&["browse", "album"]);
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 4, "{out}");
+    assert!(lines[0].starts_with("   1  01 one.flac  "), "{out}");
+    assert_eq!(s.ok(&["artists"]), "Unknown\n");
+    assert_eq!(s.ok(&["albums"]), "Unknown\n");
+    assert_eq!(s.ok(&["albums", "Unknown"]), "Unknown\n");
+    assert_eq!(s.ok(&["find"]).lines().count(), 4);
+    assert_eq!(s.ok(&["find", "--album", "Unknown"]).lines().count(), 4);
+    assert_eq!(s.ok(&["find", "--artist", "Nobody"]), "");
+    assert!(s.err(&["browse", "nope"]).contains("no such"));
+    let json = s.ok(&["--json", "artists"]);
+    assert!(json.contains("\"names\""), "{json}");
+}
+
+#[test]
 fn watch_prints_events() {
     let s = Server::start();
     s.album();

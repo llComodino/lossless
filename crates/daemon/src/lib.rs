@@ -180,7 +180,7 @@ impl State {
                     .index
                     .and_then(|i| snap.queue.get(i))
                     .map(|p| self.track(p));
-                Ok(Body::Status(status))
+                Ok(Body::Status(Box::new(status)))
             }
             Command::Queue => Ok(Body::Queue(
                 self.player
@@ -194,6 +194,30 @@ impl State {
                 let lib = self.library.read().unwrap_or_else(PoisonError::into_inner);
                 Ok(Body::Tracks(
                     lib.search(&query).into_iter().cloned().collect(),
+                ))
+            }
+            Command::Browse { path } => {
+                if self.music_dir.is_none() {
+                    return Err(RequestError::NoMusicDir);
+                }
+                let lib = self.library.read().unwrap_or_else(PoisonError::into_inner);
+                Ok(Body::Entries(lib.browse(&path)?))
+            }
+            Command::Artists => {
+                let lib = self.library.read().unwrap_or_else(PoisonError::into_inner);
+                Ok(Body::Names(lib.artists()))
+            }
+            Command::Albums { artist } => {
+                let lib = self.library.read().unwrap_or_else(PoisonError::into_inner);
+                Ok(Body::Names(lib.albums(artist.as_deref())))
+            }
+            Command::Find { artist, album } => {
+                let lib = self.library.read().unwrap_or_else(PoisonError::into_inner);
+                Ok(Body::Tracks(
+                    lib.find(artist.as_deref(), album.as_deref())
+                        .into_iter()
+                        .cloned()
+                        .collect(),
                 ))
             }
             Command::Update => self.rescan().map(|_| Body::Done),

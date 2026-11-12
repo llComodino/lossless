@@ -72,6 +72,25 @@ pub enum Command {
     },
     /// Rescan the music directory.
     Update,
+    /// Folders and tracks directly under a path relative to the music
+    /// directory (empty for the top).
+    Browse {
+        #[serde(default)]
+        path: String,
+    },
+    Artists,
+    /// Album names of one artist, or of all.
+    Albums {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artist: Option<String>,
+    },
+    /// Tracks matching an exact artist and/or album, case-insensitively.
+    Find {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artist: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        album: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -125,9 +144,18 @@ impl std::fmt::Display for WireError {
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum Body {
     Done,
-    Status(Status),
+    Status(Box<Status>),
     Queue(Vec<Track>),
     Tracks(Vec<Track>),
+    Entries(Vec<Entry>),
+    Names(Vec<String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+pub enum Entry {
+    Dir { name: String, path: String },
+    Track(Track),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -195,6 +223,8 @@ pub struct Track {
     pub album: Option<String>,
     #[serde(default)]
     pub track_number: Option<u32>,
+    #[serde(default)]
+    pub disc_number: Option<u32>,
     pub duration_ms: Option<u64>,
     pub format: Option<StreamFormat>,
 }
@@ -299,6 +329,53 @@ mod tests {
     }
 
     #[test]
+    fn listings_on_the_wire() {
+        let line = |command| encode(&Request { id: 1, command }).unwrap();
+        assert_eq!(
+            line(Command::Browse { path: "a/b".into() }),
+            "{\"id\":1,\"cmd\":\"browse\",\"path\":\"a/b\"}\n"
+        );
+        assert_eq!(line(Command::Artists), "{\"id\":1,\"cmd\":\"artists\"}\n");
+        assert_eq!(
+            line(Command::Albums { artist: None }),
+            "{\"id\":1,\"cmd\":\"albums\"}\n"
+        );
+        assert_eq!(
+            line(Command::Find {
+                artist: Some("A".into()),
+                album: None
+            }),
+            "{\"id\":1,\"cmd\":\"find\",\"artist\":\"A\"}\n"
+        );
+        assert_eq!(
+            decode::<Request>("{\"id\":2,\"cmd\":\"browse\"}")
+                .unwrap()
+                .command,
+            Command::Browse {
+                path: String::new()
+            }
+        );
+        let reply = |body| {
+            encode(&ServerMessage::Reply {
+                id: 4,
+                result: Outcome::Ok(body),
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            reply(Body::Entries(vec![Entry::Dir {
+                name: "x".into(),
+                path: "x".into()
+            }])),
+            "{\"type\":\"reply\",\"id\":4,\"ok\":{\"kind\":\"entries\",\"data\":[{\"kind\":\"dir\",\"data\":{\"name\":\"x\",\"path\":\"x\"}}]}}\n"
+        );
+        assert_eq!(
+            reply(Body::Names(vec!["n".into()])),
+            "{\"type\":\"reply\",\"id\":4,\"ok\":{\"kind\":\"names\",\"data\":[\"n\"]}}\n"
+        );
+    }
+
+    #[test]
     fn modes_on_the_wire() {
         let ev = ServerMessage::Event {
             event: Event::Mode {
@@ -398,20 +475,31 @@ mod props {
             of(any::<String>()),
             of(any::<String>()),
             of(any::<u32>()),
+            of(any::<u32>()),
             of(any::<u64>()),
             of(format()),
         )
             .prop_map(
-                |(path, title, artist, album, track_number, duration_ms, format)| Track {
-                    path,
-                    title,
-                    artist,
-                    album,
-                    track_number,
-                    duration_ms,
-                    format,
+                |(path, title, artist, album, track_number, disc_number, duration_ms, format)| {
+                    Track {
+                        path,
+                        title,
+                        artist,
+                        album,
+                        track_number,
+                        disc_number,
+                        duration_ms,
+                        format,
+                    }
                 },
             )
+    }
+
+    fn entry() -> impl Strategy<Value = Entry> {
+        prop_oneof![
+            (any::<String>(), any::<String>()).prop_map(|(name, path)| Entry::Dir { name, path }),
+            track().prop_map(Entry::Track),
+        ]
     }
 
     fn state() -> impl Strategy<Value = PlayState> {
@@ -453,6 +541,11 @@ mod props {
             Just(Command::Subscribe),
             any::<String>().prop_map(|query| Command::Search { query }),
             Just(Command::Update),
+            any::<String>().prop_map(|path| Command::Browse { path }),
+            Just(Command::Artists),
+            of(any::<String>()).prop_map(|artist| Command::Albums { artist }),
+            (of(any::<String>()), of(any::<String>()))
+                .prop_map(|(artist, album)| Command::Find { artist, album }),
         ]
     }
 
@@ -525,9 +618,11 @@ mod props {
     fn message() -> impl Strategy<Value = ServerMessage> {
         let body = prop_oneof![
             Just(Body::Done),
-            status().prop_map(Body::Status),
+            status().prop_map(|s| Body::Status(Box::new(s))),
             proptest::collection::vec(track(), 0..3).prop_map(Body::Queue),
             proptest::collection::vec(track(), 0..3).prop_map(Body::Tracks),
+            proptest::collection::vec(entry(), 0..3).prop_map(Body::Entries),
+            proptest::collection::vec(any::<String>(), 0..3).prop_map(Body::Names),
         ];
         let outcome = prop_oneof![
             body.prop_map(Outcome::Ok),

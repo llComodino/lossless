@@ -6,8 +6,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
 use lossless_proto::{
-    Body, Command, Event, Outcome, PlayState, Repeat, Request, ServerMessage, Status, StreamFormat,
-    Track, decode, default_socket, encode,
+    Body, Command, Entry, Event, Outcome, PlayState, Repeat, Request, ServerMessage, Status,
+    StreamFormat, Track, decode, default_socket, encode,
 };
 
 /// `println!` that exits quietly when stdout is closed (e.g. piped to `head`)
@@ -40,6 +40,10 @@ const USAGE: &str = "usage: lossless [--json] [--socket PATH] <command>
   repeat off|queue|one   repeat nothing, the queue or the current track
   random on|off          play the queue in random order
   search <words>...      find tracks (artist, album, title or path)
+  browse [path]          list folders and tracks under music_dir
+  artists                list artists
+  albums [artist]        list albums, of one artist or all
+  find [--artist A] [--album B]  list tracks by artist and/or album
   update                 rescan the music directory
   watch                  print events until interrupted";
 
@@ -88,6 +92,34 @@ fn parse(args: &[String]) -> Result<Command> {
         "search" if !rest.is_empty() => Ok(Command::Search {
             query: rest.join(" "),
         }),
+        "browse" => match rest {
+            [] => Ok(Command::Browse {
+                path: String::new(),
+            }),
+            [p] => Ok(Command::Browse { path: p.clone() }),
+            _ => bail!("browse takes at most one path"),
+        },
+        "artists" => none(Command::Artists),
+        "albums" => Ok(Command::Albums {
+            artist: (!rest.is_empty()).then(|| rest.join(" ")),
+        }),
+        "find" => {
+            let (mut artist, mut album) = (None, None);
+            let mut it = rest.iter();
+            while let Some(flag) = it.next() {
+                let slot = match flag.as_str() {
+                    "--artist" => &mut artist,
+                    "--album" => &mut album,
+                    _ => bail!("find takes --artist and --album"),
+                };
+                *slot = Some(
+                    it.next()
+                        .ok_or_else(|| anyhow!("{flag} needs a value"))?
+                        .clone(),
+                );
+            }
+            Ok(Command::Find { artist, album })
+        }
         "add" => {
             let (at, paths) = match rest {
                 [flag, n, paths @ ..] if flag == "--at" => (Some(position(n)?), paths),
@@ -243,6 +275,13 @@ fn track_line(n: usize, t: &Track) -> String {
     format!("{n:>4}  {}  {duration:>6}  {format}", fit(&describe(t), 60))
 }
 
+fn print_tracks(tracks: &[Track]) {
+    for (i, t) in tracks.iter().enumerate() {
+        out!("{}", track_line(i + 1, t));
+        out!("      {}", t.path);
+    }
+}
+
 fn print_event(e: &Event) {
     match e {
         Event::State { state, position_ms } => {
@@ -295,11 +334,21 @@ fn main() -> Result<()> {
                         match body {
                             Body::Done => {}
                             Body::Status(s) => print_status(&s),
-                            Body::Tracks(tracks) => {
-                                for (i, t) in tracks.iter().enumerate() {
-                                    out!("{}", track_line(i + 1, t));
-                                    out!("      {}", t.path);
+                            Body::Tracks(tracks) => print_tracks(&tracks),
+                            Body::Names(names) => {
+                                for n in names {
+                                    out!("{n}");
                                 }
+                            }
+                            Body::Entries(entries) => {
+                                let mut tracks = Vec::new();
+                                for e in entries {
+                                    match e {
+                                        Entry::Dir { name, .. } => out!("{name}/"),
+                                        Entry::Track(t) => tracks.push(t),
+                                    }
+                                }
+                                print_tracks(&tracks);
                             }
                             Body::Queue(tracks) => {
                                 for (i, t) in tracks.iter().enumerate() {
@@ -355,6 +404,7 @@ mod tests {
             artist: artist.map(Into::into),
             album: album.map(Into::into),
             track_number: None,
+            disc_number: None,
             duration_ms: None,
             format: None,
         }
@@ -429,6 +479,36 @@ mod tests {
                 query: "a b".into()
             }
         );
+        assert_eq!(ok(&["browse"]), Command::Browse { path: "".into() });
+        assert_eq!(
+            ok(&["browse", "a/b"]),
+            Command::Browse { path: "a/b".into() }
+        );
+        assert_eq!(ok(&["artists"]), Command::Artists);
+        assert_eq!(ok(&["albums"]), Command::Albums { artist: None });
+        assert_eq!(
+            ok(&["albums", "The", "Band"]),
+            Command::Albums {
+                artist: Some("The Band".into())
+            }
+        );
+        assert_eq!(
+            ok(&["find"]),
+            Command::Find {
+                artist: None,
+                album: None
+            }
+        );
+        assert_eq!(
+            ok(&["find", "--album", "B", "--artist", "A"]),
+            Command::Find {
+                artist: Some("A".into()),
+                album: Some("B".into())
+            }
+        );
+        assert!(err(&["find", "--artist"]).contains("--artist needs a value"));
+        assert!(err(&["find", "x"]).contains("find takes"));
+        assert!(err(&["browse", "a", "b"]).contains("browse takes"));
         assert_eq!(
             ok(&["add", "x", "y"]),
             Command::Add {
