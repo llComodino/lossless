@@ -96,16 +96,74 @@ fn level(p: u8, lo: i64, hi: i64) -> i64 {
     lo + (span * i64::from(p) + 50) / 100
 }
 
-/// The control's playback dB range, or its raw range when it has no dB
-/// information.
-fn range(s: &Selem) -> (bool, i64, i64) {
-    let (lo, hi) = s.get_playback_db_range();
-    if lo < hi {
-        (true, lo.0, hi.0)
-    } else {
-        let (lo, hi) = s.get_playback_volume_range();
-        (false, lo, hi)
+/// ALSA's dB minimum for a control whose lowest step mutes.
+const MUTE: i64 = -9_999_999;
+
+/// How percent maps onto a control.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Scale {
+    /// Linear over `lo..=hi` mB. With a mute step, `lo` is the step above it
+    /// and the raw `mute` value is 0%.
+    Db {
+        lo: i64,
+        hi: i64,
+        mute: Option<i64>,
+    },
+    Raw {
+        lo: i64,
+        hi: i64,
+    },
+}
+
+#[derive(Debug, PartialEq)]
+enum Value {
+    Db(i64),
+    Raw(i64),
+}
+
+/// The scale from the control's `db` and `raw` ranges; `floor` is the dB of
+/// the raw step above the minimum, asked for only when the minimum mutes.
+fn scale(db: (i64, i64), raw: (i64, i64), floor: alsa::Result<i64>) -> Scale {
+    let (lo, hi) = db;
+    match floor {
+        _ if MUTE < lo && lo < hi => Scale::Db { lo, hi, mute: None },
+        Ok(f) if lo <= MUTE && MUTE < f && f < hi => Scale::Db {
+            lo: f,
+            hi,
+            mute: Some(raw.0),
+        },
+        _ => Scale::Raw {
+            lo: raw.0,
+            hi: raw.1,
+        },
     }
+}
+
+fn read(scale: Scale, db: i64, raw: i64) -> u8 {
+    match scale {
+        Scale::Db { mute: Some(m), .. } if raw <= m => 0,
+        Scale::Db { lo, hi, .. } => percent(db, lo, hi),
+        Scale::Raw { lo, hi } => percent(raw, lo, hi),
+    }
+}
+
+fn target(scale: Scale, p: u8) -> Value {
+    match scale {
+        Scale::Db { mute: Some(m), .. } if p == 0 => Value::Raw(m),
+        Scale::Db { lo, hi, .. } => Value::Db(level(p, lo, hi)),
+        Scale::Raw { lo, hi } => Value::Raw(level(p, lo, hi)),
+    }
+}
+
+fn probe(s: &Selem) -> Scale {
+    let (lo, hi) = s.get_playback_db_range();
+    let raw = s.get_playback_volume_range();
+    let floor = if lo.0 <= MUTE {
+        s.ask_playback_vol_db(raw.0 + 1).map(|d| d.0)
+    } else {
+        Ok(lo.0)
+    };
+    scale((lo.0, hi.0), raw, floor)
 }
 
 impl HardwareMixer {
@@ -153,24 +211,21 @@ impl Mixer for HardwareMixer {
         let err = |e: alsa::Error| device_error(&self.device, e);
         self.mixer.handle_events().map_err(err)?;
         let s = self.selem()?;
-        let (db, lo, hi) = range(&s);
+        let scale = probe(&s);
         let ch = SelemChannelId::mono();
-        let v = if db {
-            s.get_playback_vol_db(ch).map_err(err)?.0
-        } else {
-            s.get_playback_volume(ch).map_err(err)?
+        let raw = s.get_playback_volume(ch).map_err(err)?;
+        let db = match scale {
+            Scale::Db { .. } => s.get_playback_vol_db(ch).map_err(err)?.0,
+            Scale::Raw { .. } => 0,
         };
-        Ok(percent(v, lo, hi))
+        Ok(read(scale, db, raw))
     }
 
     fn set(&mut self, p: u8) -> Result<()> {
         let s = self.selem()?;
-        let (db, lo, hi) = range(&s);
-        let v = level(p.min(100), lo, hi);
-        if db {
-            s.set_playback_db_all(MilliBel(v), alsa::Round::Ceil)
-        } else {
-            s.set_playback_volume_all(v)
+        match target(probe(&s), p.min(100)) {
+            Value::Db(v) => s.set_playback_db_all(MilliBel(v), alsa::Round::Ceil),
+            Value::Raw(v) => s.set_playback_volume_all(v),
         }
         .map_err(|e| device_error(&self.device, e))
     }
@@ -415,7 +470,53 @@ mod tests {
         assert_eq!(level(40, 7, 7), 7);
     }
 
+    #[test]
+    fn the_mute_step_is_not_the_db_floor() {
+        let m = scale((MUTE, 0), (0, 100), Ok(-6000));
+        assert_eq!(
+            m,
+            Scale::Db {
+                lo: -6000,
+                hi: 0,
+                mute: Some(0)
+            }
+        );
+        assert_eq!(target(m, 50), Value::Db(-3000), "50% lands mid-range");
+        assert_eq!(read(m, -3000, 50), 50);
+        assert_eq!(read(m, -1500, 75), 75);
+        assert_eq!(target(m, 0), Value::Raw(0), "0% is the mute step");
+        assert_eq!(read(m, MUTE, 0), 0);
+        assert_eq!(target(m, 100), Value::Db(0));
+        let plain = scale((-6000, 0), (0, 120), Ok(-5950));
+        assert_eq!(
+            plain,
+            Scale::Db {
+                lo: -6000,
+                hi: 0,
+                mute: None
+            }
+        );
+        assert_eq!(target(plain, 0), Value::Db(-6000));
+        let raw = Scale::Raw { lo: 0, hi: 100 };
+        let gone = alsa::Error::new("snd_mixer_selem_ask_playback_vol_dB", 22);
+        assert_eq!(scale((MUTE, 0), (0, 100), Err(gone)), raw);
+        assert_eq!(scale((MUTE, 0), (0, 100), Ok(MUTE)), raw);
+        assert_eq!(scale((0, 0), (0, 100), Ok(0)), raw, "no dB information");
+        assert_eq!(target(raw, 40), Value::Raw(40));
+        assert_eq!(read(raw, 0, 40), 40);
+    }
+
     proptest! {
+        #[test]
+        fn mute_floor_scales_round_trip(p in 0u8..=100, floor in -20_000i64..-100) {
+            let m = scale((MUTE, 0), (0, 100), Ok(floor));
+            let back = match target(m, p) {
+                Value::Raw(r) => read(m, MUTE, r),
+                Value::Db(d) => read(m, d, 1),
+            };
+            prop_assert_eq!(back, p);
+        }
+
         #[test]
         fn percent_round_trips_on_fine_ranges(
             p in 0u8..=100,
