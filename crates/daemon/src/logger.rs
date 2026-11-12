@@ -1,4 +1,4 @@
-use ::log::{LevelFilter, Log, Metadata, Record};
+use log::{LevelFilter, Log, Metadata, Record};
 
 use crate::config::LogLevel;
 
@@ -6,7 +6,7 @@ struct Stderr;
 
 impl Log for Stderr {
     fn enabled(&self, metadata: &Metadata) -> bool {
-        metadata.level() <= ::log::max_level()
+        metadata.level() <= log::max_level()
     }
 
     fn log(&self, record: &Record) {
@@ -21,8 +21,8 @@ impl Log for Stderr {
 /// Install the stderr logger. The logger is set once per process; the level
 /// is applied on every call, so repeated in-process runs just retune it.
 pub fn init_logging(level: LogLevel) {
-    let _ = ::log::set_logger(&Stderr);
-    ::log::set_max_level(match level {
+    let _ = log::set_logger(&Stderr);
+    log::set_max_level(match level {
         LogLevel::Off => LevelFilter::Off,
         LogLevel::Warn => LevelFilter::Warn,
         LogLevel::Info => LevelFilter::Info,
@@ -32,7 +32,7 @@ pub fn init_logging(level: LogLevel) {
 
 #[cfg(test)]
 mod tests {
-    use ::log::Level;
+    use log::Level;
 
     use super::*;
 
@@ -59,5 +59,6 @@ mod tests {
                 .build(),
         );
         Stderr.flush();
+        init_logging(LogLevel::Off);
     }
 }

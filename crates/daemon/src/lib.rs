@@ -9,8 +9,8 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::thread;
 
-use ::log::{debug, info, warn};
 use anyhow::{Context, Result, bail};
+use log::{debug, info, warn};
 use lossless_engine::{Command as PlayerCmd, Player};
 use lossless_library::{Library, collect, read_track};
 use lossless_proto::{
@@ -19,14 +19,14 @@ use lossless_proto::{
 
 mod config;
 mod error;
-mod log;
+mod logger;
 
 use config::expand_tilde;
 pub use config::{
     Config, LogLevel, MAX_CONFIG, check_device, check_path, config_path, load_config, parse_config,
 };
 pub use error::RequestError;
-pub use log::init_logging;
+pub use logger::init_logging;
 
 /// Bind the socket, owner-only. An existing path is replaced only if it is
 /// itself a stale socket: never a live daemon, a symlink or any other file.
@@ -259,15 +259,12 @@ fn serve(state: &State, stream: UnixStream) -> Result<()> {
                     Ok(body) => Outcome::Ok(body),
                     Err(e) => Outcome::Err(e.to_wire()),
                 };
-                debug!(
-                    "reply {}: {}",
-                    req.id,
-                    if matches!(result, Outcome::Ok(_)) {
-                        "ok"
-                    } else {
-                        "error"
-                    }
-                );
+                let label = if matches!(result, Outcome::Ok(_)) {
+                    "ok"
+                } else {
+                    "error"
+                };
+                debug!("reply {}: {label}", req.id);
                 ServerMessage::Reply { id: req.id, result }
             }
             Err(e) => bad(format!("bad request: {e}")),
