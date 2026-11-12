@@ -11,7 +11,7 @@ use std::thread;
 
 use anyhow::{Context, Result, bail};
 use log::{debug, info, warn};
-use lossless_engine::{Command as PlayerCmd, Player};
+use lossless_engine::{Command as PlayerCmd, Output, Player, choose};
 use lossless_library::{Library, collect, read_track};
 use lossless_proto::{
     Body, Command, Event, Outcome, Request, ServerMessage, Track, decode, encode,
@@ -244,6 +244,7 @@ impl State {
             Command::Seek { ms } => play(PlayerCmd::Seek { ms }),
             Command::Clear => play(PlayerCmd::Clear),
             Command::SetMode { repeat, random } => play(PlayerCmd::SetMode { repeat, random }),
+            Command::SetVolume { percent } => play(PlayerCmd::SetVolume(percent)),
         }
     }
 }
@@ -314,7 +315,8 @@ pub fn run(config: &Path, default_socket: PathBuf, log_override: Option<LogLevel
     let socket = cfg.socket.unwrap_or(default_socket);
     let listener = bind(&socket)?;
     info!("device {} socket {}", cfg.device, socket.display());
-    let (player, events) = Player::spawn(cfg.device);
+    let mixer = choose(&cfg.device, cfg.mixer, &cfg.mixer_control).open();
+    let (player, events) = Player::spawn_with_mixer(Output::new(cfg.device), mixer);
     let on_player_gone = Box::new(|| {
         eprintln!("losslessd: player thread died; exiting");
         std::process::exit(70);

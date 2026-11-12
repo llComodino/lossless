@@ -39,6 +39,7 @@ const USAGE: &str = "usage: lossless [--json] [--socket PATH] <command>
   clear                  stop and empty the queue
   repeat off|queue|one   repeat nothing, the queue or the current track
   random on|off          play the queue in random order
+  volume [N|+N|-N]       print the volume, or set it (0-100)
   search <words>...      find tracks (artist, album, title or path)
   browse [path]          list folders and tracks under music_dir
   artists                list artists
@@ -188,6 +189,85 @@ fn parse(args: &[String]) -> Result<Command> {
     }
 }
 
+#[derive(Debug, PartialEq)]
+enum Volume {
+    Show,
+    Set(u8),
+    Step(i16),
+}
+
+fn parse_volume(rest: &[String]) -> Result<Volume> {
+    let bad = || anyhow!("volume takes N, +N or -N, from 0 to 100");
+    let n = |s: &str| {
+        s.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| s.parse::<u8>().ok())
+            .flatten()
+            .filter(|&n| n <= 100)
+            .ok_or_else(bad)
+    };
+    match rest {
+        [] => Ok(Volume::Show),
+        [a] => match (a.strip_prefix('+'), a.strip_prefix('-')) {
+            (Some(up), _) => Ok(Volume::Step(n(up)?.into())),
+            (_, Some(down)) => Ok(Volume::Step(-i16::from(n(down)?))),
+            _ => Ok(Volume::Set(n(a)?)),
+        },
+        _ => Err(bad()),
+    }
+}
+
+/// Send one request and wait for its reply, skipping anything else.
+fn ask(
+    reader: &mut impl BufRead,
+    writer: &mut impl Write,
+    id: u64,
+    command: Command,
+    json: bool,
+) -> Result<Body> {
+    writer.write_all(encode(&Request { id, command })?.as_bytes())?;
+    for line in reader.lines() {
+        let line = line?;
+        if json {
+            out!("{line}");
+        }
+        if let ServerMessage::Reply { id: got, result } = decode(&line)? {
+            match result {
+                _ if got != id => {}
+                Outcome::Ok(body) => return Ok(body),
+                Outcome::Err(e) => bail!("{}", e.message),
+            }
+        }
+    }
+    bail!("the daemon closed the connection")
+}
+
+/// Relative steps read the level first and clamp to 0-100.
+fn volume(v: Volume, reader: &mut impl BufRead, writer: &mut impl Write, json: bool) -> Result<()> {
+    let percent = match v {
+        Volume::Set(p) => p,
+        Volume::Show | Volume::Step(_) => {
+            let Body::Status(st) = ask(reader, writer, 1, Command::Status, json)? else {
+                bail!("unexpected reply to status");
+            };
+            match (v, st.volume) {
+                (Volume::Step(_), None) => bail!("no mixer"),
+                (Volume::Step(d), Some(now)) => (i16::from(now) + d).clamp(0, 100) as u8,
+                (_, now) => {
+                    if !json {
+                        match now {
+                            Some(p) => out!("{p}%"),
+                            None => out!("no mixer"),
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    };
+    ask(reader, writer, 2, Command::SetVolume { percent }, json).map(drop)
+}
+
 fn clock(ms: u64) -> String {
     let s = ms / 1000;
     if s >= 3600 {
@@ -228,8 +308,9 @@ fn print_status(s: &Status) {
         .output
         .as_ref()
         .map_or_else(|| "closed".into(), format_str);
+    let volume = s.volume.map_or_else(String::new, |v| format!(" vol {v}%"));
     out!(
-        "{state}  #{index}  {}/{duration}  output {output} {}",
+        "{state}  #{index}  {}/{duration}  output {output} {}{volume}",
         clock(s.position_ms),
         modes(s.repeat, s.random)
     );
@@ -294,6 +375,7 @@ fn print_event(e: &Event) {
         Event::QueueChanged => out!("queue changed"),
         Event::Mode { repeat, random } => out!("mode {}", modes(*repeat, *random)),
         Event::LibraryChanged { tracks } => out!("library {tracks} tracks"),
+        Event::Volume { percent } => out!("volume {percent}%"),
         Event::Error(e) => out!("error: {}", e.message),
     }
 }
@@ -314,11 +396,22 @@ fn main() -> Result<()> {
             _ => bail!("unknown flag {flag}\n\n{USAGE}"),
         }
     }
-    let command = parse(&args)?;
+    let vol = match args.split_first() {
+        Some((name, rest)) if name == "volume" => Some(parse_volume(rest)?),
+        _ => None,
+    };
+    let command = match vol {
+        Some(_) => Command::Status,
+        None => parse(&args)?,
+    };
     let watch = command == Command::Subscribe;
     let socket = socket.unwrap_or_else(default_socket);
     let mut stream = UnixStream::connect(&socket)
         .with_context(|| format!("connecting to {} (is losslessd running?)", socket.display()))?;
+    if let Some(v) = vol {
+        let mut reader = BufReader::new(stream.try_clone()?);
+        return volume(v, &mut reader, &mut stream, json);
+    }
     stream.write_all(encode(&Request { id: 1, command })?.as_bytes())?;
 
     for line in BufReader::new(stream).lines() {
@@ -553,6 +646,46 @@ mod tests {
         ] {
             assert_eq!(err(usage), USAGE, "{usage:?}");
         }
+    }
+
+    fn reply(id: u64, result: Outcome) -> String {
+        encode(&ServerMessage::Reply { id, result }).unwrap()
+    }
+
+    #[test]
+    fn ask_skips_events_and_other_replies() {
+        let lines = [
+            encode(&ServerMessage::Event {
+                event: Event::QueueChanged,
+            })
+            .unwrap(),
+            reply(1, Outcome::Ok(Body::Names(vec![]))),
+            reply(2, Outcome::Ok(Body::Done)),
+        ]
+        .concat();
+        let mut sent = Vec::new();
+        let body = ask(&mut lines.as_bytes(), &mut sent, 2, Command::Status, false).unwrap();
+        assert_eq!(body, Body::Done);
+        assert_eq!(
+            String::from_utf8(sent).unwrap(),
+            "{\"id\":2,\"cmd\":\"status\"}\n"
+        );
+        let err = ask(&mut &b""[..], &mut Vec::new(), 1, Command::Status, false).unwrap_err();
+        assert_eq!(err.to_string(), "the daemon closed the connection");
+        let done = reply(1, Outcome::Ok(Body::Done));
+        let err = volume(Volume::Show, &mut done.as_bytes(), &mut Vec::new(), false).unwrap_err();
+        assert_eq!(err.to_string(), "unexpected reply to status");
+    }
+
+    #[test]
+    fn volume_arguments() {
+        let v = |s: &[&str]| parse_volume(&s.iter().map(|a| a.to_string()).collect::<Vec<_>>());
+        assert_eq!(v(&[]).unwrap(), Volume::Show);
+        assert_eq!(v(&["7"]).unwrap(), Volume::Set(7));
+        assert_eq!(v(&["+7"]).unwrap(), Volume::Step(7));
+        assert_eq!(v(&["-100"]).unwrap(), Volume::Step(-100));
+        assert!(v(&["-101"]).is_err());
+        assert!(v(&["+-1"]).is_err());
     }
 
     #[test]

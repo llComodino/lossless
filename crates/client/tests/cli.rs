@@ -9,8 +9,8 @@ use std::thread;
 use std::time::Duration;
 
 use lossless_daemon::{Daemon, bind};
-use lossless_engine::Player;
 use lossless_engine::fixtures::{BLOCK, Dir, PacedSink, flac_at};
+use lossless_engine::{Mixer, Player, SoftwareMixer};
 use lossless_proto::{Body, Outcome, PlayState, ServerMessage, decode};
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -21,10 +21,14 @@ struct Server {
 
 impl Server {
     fn start() -> Self {
+        Self::start_with(None)
+    }
+
+    fn start_with(mixer: Option<Box<dyn Mixer>>) -> Self {
         let dir = Dir::new();
         std::fs::create_dir_all(dir.path("music/album")).unwrap();
         let listener = bind(&dir.path("sock")).unwrap();
-        let (player, events) = Player::spawn_with(PacedSink::default());
+        let (player, events) = Player::spawn_with_mixer(PacedSink::default(), mixer);
         let daemon =
             Daemon::start(player, events, Some(dir.path("music")), Box::new(|| {})).unwrap();
         thread::spawn(move || daemon.serve(listener));
@@ -358,4 +362,59 @@ fn mode_commands() {
     ] {
         assert_eq!(s.err(args).trim(), format!("Error: {want}"), "{args:?}");
     }
+}
+
+#[test]
+fn volume_command() {
+    let s = Server::start_with(Some(Box::new(SoftwareMixer::new())));
+    assert_eq!(s.ok(&["volume"]), "100%\n");
+    assert!(
+        s.ok(&["status"])
+            .ends_with(" repeat:off random:off vol 100%\n")
+    );
+    let watch = s.spawn(&["watch"]);
+    let mut seen = None;
+    for _ in 0..50 {
+        assert_eq!(s.ok(&["volume", "40"]), "");
+        if let Some(line) = watch.next(Duration::from_millis(200)) {
+            seen = Some(line);
+            break;
+        }
+    }
+    assert_eq!(seen.as_deref(), Some("volume 40%"));
+    for (args, want) in [
+        (&["volume", "+5"][..], "45%\n"),
+        (&["volume", "-50"], "0%\n"),
+        (&["volume", "+100"], "100%\n"),
+        (&["volume", "-0"], "100%\n"),
+        (&["volume", "0"], "0%\n"),
+    ] {
+        assert_eq!(s.ok(args), "", "{args:?}");
+        assert_eq!(s.ok(&["volume"]), want, "{args:?}");
+    }
+    let json = s.ok(&["--json", "volume", "+7"]);
+    let lines: Vec<&str> = json.lines().collect();
+    assert_eq!(lines.len(), 2, "{json}");
+    assert!(lines[0].contains("\"volume\":0"), "{json}");
+    assert!(lines[1].contains("\"id\":2"), "{json}");
+    for args in [
+        &["volume", "101"][..],
+        &["volume", "x"],
+        &["volume", "+"],
+        &["volume", "++5"],
+        &["volume", "+101"],
+        &["volume", "1", "2"],
+    ] {
+        assert_eq!(
+            s.err(args).trim(),
+            "Error: volume takes N, +N or -N, from 0 to 100",
+            "{args:?}"
+        );
+    }
+
+    let s = Server::start();
+    assert_eq!(s.ok(&["volume"]), "no mixer\n");
+    assert!(s.ok(&["status"]).ends_with(" random:off\n"));
+    assert_eq!(s.err(&["volume", "+5"]).trim(), "Error: no mixer");
+    assert_eq!(s.err(&["volume", "5"]).trim(), "Error: no hardware mixer");
 }
