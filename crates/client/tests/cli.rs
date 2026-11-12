@@ -146,7 +146,10 @@ fn no_daemon_says_so() {
 #[test]
 fn fresh_status_and_empty_queue() {
     let s = Server::start();
-    assert_eq!(s.ok(&["status"]), "stopped  #-  0:00/?  output closed\n");
+    assert_eq!(
+        s.ok(&["status"]),
+        "stopped  #-  0:00/?  output closed repeat:off random:off\n"
+    );
     assert_eq!(s.ok(&["queue"]), "");
 }
 
@@ -167,7 +170,9 @@ fn playback_session() {
     s.ok(&["seek", "0:02"]);
     let status = s.ok(&["status"]);
     assert!(
-        status.starts_with("paused  #1  0:02/0:04  output 16-bit/44.1 kHz/2ch\n"),
+        status.starts_with(
+            "paused  #1  0:02/0:04  output 16-bit/44.1 kHz/2ch repeat:off random:off\n"
+        ),
         "{status}"
     );
     assert_eq!(status.lines().nth(1), Some("01 one.flac"));
@@ -290,5 +295,42 @@ fn queue_editing_commands() {
             "Error: positions start at 1",
             "{args:?}"
         );
+    }
+}
+
+#[test]
+fn mode_commands() {
+    let s = Server::start();
+    let watch = s.spawn(&["--json", "watch"]);
+    assert!(watch.wait_for("reply").contains("done"));
+    assert_eq!(s.ok(&["repeat", "one"]), "");
+    assert!(watch.wait_for("\"mode\"").contains("\"repeat\":\"one\""));
+    s.ok(&["random", "on"]);
+    assert!(
+        s.ok(&["status"])
+            .ends_with("output closed repeat:one random:on\n")
+    );
+    s.ok(&["repeat", "queue"]);
+    s.ok(&["random", "off"]);
+    assert!(s.ok(&["status"]).ends_with(" repeat:queue random:off\n"));
+    s.ok(&["repeat", "off"]);
+    assert!(s.ok(&["status"]).ends_with(" repeat:off random:off\n"));
+    let plain = s.spawn(&["watch"]);
+    let mut seen = None;
+    for _ in 0..50 {
+        s.ok(&["random", "on"]);
+        if let Some(line) = plain.next(Duration::from_millis(200)) {
+            seen = Some(line);
+            break;
+        }
+    }
+    assert_eq!(seen.as_deref(), Some("mode repeat:off random:on"));
+    for (args, want) in [
+        (&["repeat", "all"][..], "repeat takes off, queue or one"),
+        (&["repeat"], "repeat takes off, queue or one"),
+        (&["random", "yes"], "random takes on or off"),
+        (&["random", "on", "off"], "random takes on or off"),
+    ] {
+        assert_eq!(s.err(args).trim(), format!("Error: {want}"), "{args:?}");
     }
 }

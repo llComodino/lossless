@@ -12,8 +12,8 @@ use lossless_daemon::{Daemon, MAX_REQUEST, bind, parse_config};
 use lossless_engine::Player;
 use lossless_engine::fixtures::{BLOCK, Dir, PacedSink, flac_at};
 use lossless_proto::{
-    Body, Command, ErrorCode, Event, Outcome, PlayState, Request, ServerMessage, WireError, decode,
-    encode,
+    Body, Command, ErrorCode, Event, Outcome, PlayState, Repeat, Request, ServerMessage, WireError,
+    decode, encode,
 };
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -601,4 +601,37 @@ fn queue_edits_over_the_socket() {
         paths: vec!["album".into()],
     });
     assert_eq!(queue(&mut c), names);
+}
+
+#[test]
+fn modes_over_the_socket() {
+    let s = Server::start(true);
+    let mut c = s.connect();
+    let st = status(&mut c);
+    assert_eq!((st.repeat, st.random), (Repeat::Off, false));
+    c.ok(Command::Subscribe);
+    for (repeat, random, want) in [
+        (Some(Repeat::One), None, (Repeat::One, false)),
+        (None, Some(true), (Repeat::One, true)),
+        (None, None, (Repeat::One, true)),
+    ] {
+        c.ok(Command::SetMode { repeat, random });
+        let st = status(&mut c);
+        assert_eq!((st.repeat, st.random), want);
+        let ev = c.wait_for(|e| matches!(e, Event::Mode { .. }));
+        assert_eq!(
+            ev,
+            Event::Mode {
+                repeat: want.0,
+                random: want.1
+            }
+        );
+    }
+    c.ok(Command::Clear);
+    c.wait_for(|e| *e == Event::QueueChanged);
+    assert!(
+        !c.events.iter().any(|e| matches!(e, Event::Mode { .. })),
+        "one mode event per set_mode: {:?}",
+        c.events
+    );
 }

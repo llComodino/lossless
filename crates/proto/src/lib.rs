@@ -58,6 +58,13 @@ pub enum Command {
         to: usize,
     },
     Clear,
+    /// Omitted fields are left as they are.
+    SetMode {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repeat: Option<Repeat>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        random: Option<bool>,
+    },
     Subscribe,
     /// Tracks whose artist, album, title or path contain every word.
     Search {
@@ -136,6 +143,10 @@ pub enum Event {
         index: Option<usize>,
     },
     QueueChanged,
+    Mode {
+        repeat: Repeat,
+        random: bool,
+    },
     LibraryChanged {
         tracks: usize,
     },
@@ -163,6 +174,10 @@ pub struct Status {
     pub track: Option<Track>,
     #[serde(default)]
     pub last_error: Option<WireError>,
+    #[serde(default)]
+    pub repeat: Repeat,
+    #[serde(default)]
+    pub random: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -261,6 +276,44 @@ mod tests {
             .unwrap(),
             "{\"id\":3,\"cmd\":\"move\",\"from\":1,\"to\":0}\n"
         );
+        assert_eq!(
+            encode(&Request {
+                id: 4,
+                command: Command::SetMode {
+                    repeat: Some(Repeat::One),
+                    random: None
+                }
+            })
+            .unwrap(),
+            "{\"id\":4,\"cmd\":\"set_mode\",\"repeat\":\"one\"}\n"
+        );
+        assert_eq!(
+            decode::<Request>("{\"id\":5,\"cmd\":\"set_mode\",\"random\":true}")
+                .unwrap()
+                .command,
+            Command::SetMode {
+                repeat: None,
+                random: Some(true)
+            }
+        );
+    }
+
+    #[test]
+    fn modes_on_the_wire() {
+        let ev = ServerMessage::Event {
+            event: Event::Mode {
+                repeat: Repeat::Queue,
+                random: true,
+            },
+        };
+        assert_eq!(
+            encode(&ev).unwrap(),
+            "{\"type\":\"event\",\"event\":\"mode\",\"repeat\":\"queue\",\"random\":true}\n"
+        );
+        let old =
+            r#"{"state":"stopped","index":null,"position_ms":0,"duration_ms":null,"output":null}"#;
+        let st: Status = decode(old).unwrap();
+        assert_eq!((st.repeat, st.random), (Repeat::Off, false));
     }
 
     #[test]
@@ -369,6 +422,10 @@ mod props {
         ]
     }
 
+    fn repeat() -> impl Strategy<Value = Repeat> {
+        prop_oneof![Just(Repeat::Off), Just(Repeat::Queue), Just(Repeat::One)]
+    }
+
     fn command() -> impl Strategy<Value = Command> {
         prop_oneof![
             Just(Command::Status),
@@ -391,6 +448,8 @@ mod props {
                 .prop_map(|indices| Command::Remove { indices }),
             (any::<usize>(), any::<usize>()).prop_map(|(from, to)| Command::Move { from, to }),
             Just(Command::Clear),
+            (of(repeat()), of(any::<bool>()))
+                .prop_map(|(repeat, random)| Command::SetMode { repeat, random }),
             Just(Command::Subscribe),
             any::<String>().prop_map(|query| Command::Search { query }),
             Just(Command::Update),
@@ -406,9 +465,11 @@ mod props {
             of(format()),
             of(track()),
             of(wire_error()),
+            repeat(),
+            any::<bool>(),
         )
             .prop_map(
-                |(state, index, position_ms, duration_ms, output, track, last_error)| Status {
+                |(
                     state,
                     index,
                     position_ms,
@@ -416,6 +477,20 @@ mod props {
                     output,
                     track,
                     last_error,
+                    repeat,
+                    random,
+                )| {
+                    Status {
+                        state,
+                        index,
+                        position_ms,
+                        duration_ms,
+                        output,
+                        track,
+                        last_error,
+                        repeat,
+                        random,
+                    }
                 },
             )
     }
@@ -441,6 +516,7 @@ mod props {
                 .prop_map(|(state, position_ms)| Event::State { state, position_ms }),
             of(any::<usize>()).prop_map(|index| Event::TrackChanged { index }),
             Just(Event::QueueChanged),
+            (repeat(), any::<bool>()).prop_map(|(repeat, random)| Event::Mode { repeat, random }),
             any::<usize>().prop_map(|tracks| Event::LibraryChanged { tracks }),
             wire_error().prop_map(Event::Error),
         ]

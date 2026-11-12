@@ -110,7 +110,14 @@ impl Queue {
         shuffle(&mut self.order, &mut self.seed);
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn repeat(&self) -> Repeat {
+        self.repeat
+    }
+
+    pub(crate) fn random(&self) -> bool {
+        self.random
+    }
+
     pub(crate) fn set_mode(&mut self, repeat: Option<Repeat>, random: Option<bool>) {
         if let Some(r) = repeat {
             self.repeat = r;
@@ -123,7 +130,7 @@ impl Queue {
         }
     }
 
-    fn plan(&self) -> Option<Step> {
+    fn plan(&self, repeat: Repeat) -> Option<Step> {
         let len = self.entries.len();
         if len == 0 {
             return None;
@@ -134,14 +141,14 @@ impl Queue {
             from_order: false,
             seed: self.seed,
         };
-        if let (Repeat::One, Some(c)) = (self.repeat, self.current) {
+        if let (Repeat::One, Some(c)) = (repeat, self.current) {
             return Some(step(c));
         }
         if !self.random {
             return match self.current {
                 None => Some(step(0)),
                 Some(c) if c + 1 < len => Some(step(c + 1)),
-                Some(_) if self.repeat == Repeat::Queue => Some(step(0)),
+                Some(_) if repeat == Repeat::Queue => Some(step(0)),
                 Some(_) => None,
             };
         }
@@ -151,7 +158,7 @@ impl Queue {
                 ..step(i)
             });
         }
-        if self.repeat != Repeat::Queue {
+        if repeat != Repeat::Queue {
             return None;
         }
         let mut seed = self.seed;
@@ -171,12 +178,25 @@ impl Queue {
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn peek_next(&self) -> Option<usize> {
-        self.plan().map(|s| s.index)
+        self.plan(self.repeat).map(|s| s.index)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// The entry after this one ends: repeat one plays it again.
     pub(crate) fn next(&mut self) -> Option<usize> {
-        let step = self.plan()?;
+        self.advance(self.repeat)
+    }
+
+    /// The entry a user skip goes to: repeat one counts as off.
+    pub(crate) fn skip(&mut self) -> Option<usize> {
+        let repeat = match self.repeat {
+            Repeat::One => Repeat::Off,
+            r => r,
+        };
+        self.advance(repeat)
+    }
+
+    fn advance(&mut self, repeat: Repeat) -> Option<usize> {
+        let step = self.plan(repeat)?;
         self.seed = step.seed;
         let old = self.current.replace(step.index);
         match step.new_cycle {
@@ -199,7 +219,6 @@ impl Queue {
         Some(step.index)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn previous(&mut self) -> Option<usize> {
         let target = loop {
             match self.history.pop() {
@@ -485,6 +504,26 @@ mod tests {
         assert_eq!(take(&mut q, 4), [1, 1, 1, 1]);
         q.set_mode(None, Some(false));
         assert_eq!(q.next(), Some(1));
+    }
+
+    #[test]
+    fn skip_moves_on_under_repeat_one() {
+        let mut q = seeded(3, Repeat::One, false);
+        q.set_current(Some(1));
+        assert_eq!(q.skip(), Some(2));
+        assert_eq!(q.skip(), None);
+        assert_eq!(q.current(), Some(2));
+        assert_eq!(q.next(), Some(2), "end of track still repeats");
+        let mut q = seeded(4, Repeat::One, true);
+        let first = q.next().unwrap();
+        let rest = sorted(vec![
+            first,
+            q.skip().unwrap(),
+            q.skip().unwrap(),
+            q.skip().unwrap(),
+        ]);
+        assert_eq!(rest, [0, 1, 2, 3]);
+        assert_eq!(q.skip(), None);
     }
 
     #[test]

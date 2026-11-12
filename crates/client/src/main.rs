@@ -6,8 +6,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
 use lossless_proto::{
-    Body, Command, Event, Outcome, PlayState, Request, ServerMessage, Status, StreamFormat, Track,
-    decode, default_socket, encode,
+    Body, Command, Event, Outcome, PlayState, Repeat, Request, ServerMessage, Status, StreamFormat,
+    Track, decode, default_socket, encode,
 };
 
 /// `println!` that exits quietly when stdout is closed (e.g. piped to `head`)
@@ -37,6 +37,8 @@ const USAGE: &str = "usage: lossless [--json] [--socket PATH] <command>
   next | prev
   seek <[[h:]m:]s>       seek within the current track
   clear                  stop and empty the queue
+  repeat off|queue|one   repeat nothing, the queue or the current track
+  random on|off          play the queue in random order
   search <words>...      find tracks (artist, album, title or path)
   update                 rescan the music directory
   watch                  print events until interrupted";
@@ -123,6 +125,29 @@ fn parse(args: &[String]) -> Result<Command> {
             }
             _ => bail!("play takes at most one index"),
         },
+        "repeat" => {
+            let repeat = match rest {
+                [m] if m == "off" => Repeat::Off,
+                [m] if m == "queue" => Repeat::Queue,
+                [m] if m == "one" => Repeat::One,
+                _ => bail!("repeat takes off, queue or one"),
+            };
+            Ok(Command::SetMode {
+                repeat: Some(repeat),
+                random: None,
+            })
+        }
+        "random" => {
+            let random = match rest {
+                [m] if m == "on" => true,
+                [m] if m == "off" => false,
+                _ => bail!("random takes on or off"),
+            };
+            Ok(Command::SetMode {
+                repeat: None,
+                random: Some(random),
+            })
+        }
         "seek" => match rest {
             [t] => Ok(Command::Seek { ms: parse_time(t)? }),
             _ => bail!("seek takes one time"),
@@ -149,6 +174,16 @@ fn format_str(f: &StreamFormat) -> String {
     )
 }
 
+fn modes(repeat: Repeat, random: bool) -> String {
+    let repeat = match repeat {
+        Repeat::Off => "off",
+        Repeat::Queue => "queue",
+        Repeat::One => "one",
+    };
+    let random = if random { "on" } else { "off" };
+    format!("repeat:{repeat} random:{random}")
+}
+
 fn print_status(s: &Status) {
     let state = match s.state {
         PlayState::Playing => "playing",
@@ -162,8 +197,9 @@ fn print_status(s: &Status) {
         .as_ref()
         .map_or_else(|| "closed".into(), format_str);
     out!(
-        "{state}  #{index}  {}/{duration}  output {output}",
-        clock(s.position_ms)
+        "{state}  #{index}  {}/{duration}  output {output} {}",
+        clock(s.position_ms),
+        modes(s.repeat, s.random)
     );
     if let Some(t) = &s.track {
         out!("{}", describe(t));
@@ -217,6 +253,7 @@ fn print_event(e: &Event) {
             None => out!("track none"),
         },
         Event::QueueChanged => out!("queue changed"),
+        Event::Mode { repeat, random } => out!("mode {}", modes(*repeat, *random)),
         Event::LibraryChanged { tracks } => out!("library {tracks} tracks"),
         Event::Error(e) => out!("error: {}", e.message),
     }

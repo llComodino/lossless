@@ -22,6 +22,9 @@ First development version, not yet tagged.
   sample-accurate seek.
 - Queue editing: `add --at`, `replace`, `remove` and `move`, with the playing
   track keeping its place.
+- Repeat (off, queue, one) and random modes: `set_mode` and the `mode` event
+  in the protocol, `repeat` and `random` in the client and status. Repeat
+  one stays gapless; random plays each entry once per cycle.
 - Library scan with tags (artist, album, title, track number, duration,
   format) and word search; rescan on demand.
 - Newline-delimited JSON protocol over a unix socket, with request ids and
