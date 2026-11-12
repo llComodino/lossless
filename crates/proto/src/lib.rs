@@ -131,6 +131,13 @@ pub enum Body {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+pub enum Entry {
+    Dir { name: String, path: String },
+    Track(Track),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
     /// Sent on every state change and seek. While playing, clients advance
