@@ -235,7 +235,8 @@ struct Worker<S: Sink> {
     /// The last level published.
     volume: Option<u8>,
     watcher: Option<JoinHandle<()>>,
-    /// A watcher ended, so the card went away: reopen the mixer before use.
+    /// The card went away (a watcher ended) or was missing at start: reopen
+    /// the mixer before use.
     stale: bool,
     scratch: Vec<i32>,
 }
@@ -249,6 +250,7 @@ impl<S: Sink> Worker<S> {
     ) -> (Self, Receiver<Event>) {
         let (events, events_rx) = mpsc::channel();
         let volume = mixer.as_ref().and_then(|m| m.get().ok());
+        let mixer_closed = mixer.is_some() && volume.is_none();
         let mut shared = Shared::new();
         shared.status.volume = volume;
         let worker = Self {
@@ -272,7 +274,7 @@ impl<S: Sink> Worker<S> {
             mixer,
             volume,
             watcher: None,
-            stale: false,
+            stale: mixer_closed,
             scratch: Vec::new(),
         };
         (worker, events_rx)
@@ -786,6 +788,10 @@ impl<S: Sink> Worker<S> {
                 )));
             }
             Command::SetVolume(percent) => {
+                self.arm();
+                if self.stale {
+                    return Err(Error::NoMixer);
+                }
                 let m = self.mixer.as_mut().ok_or(Error::NoMixer)?;
                 m.set(percent)?;
                 let now = m.get().unwrap_or(percent);
@@ -992,6 +998,8 @@ mod tests {
     struct FakeMixer {
         level: u8,
         fail_set: bool,
+        /// Not opened yet: reads fail until a reopen succeeds.
+        closed: bool,
         /// Reopens that fail before the card is back.
         absent: usize,
         watches: Arc<Mutex<Vec<Watch>>>,
@@ -1002,6 +1010,7 @@ mod tests {
             Self {
                 level,
                 fail_set: false,
+                closed: false,
                 absent: 0,
                 watches: Arc::default(),
             }
@@ -1010,10 +1019,16 @@ mod tests {
 
     impl Mixer for FakeMixer {
         fn get(&self) -> Result<u8> {
+            if self.closed {
+                return Err(Error::Device {
+                    device: "hw:Fake".into(),
+                    reason: "not open".into(),
+                });
+            }
             Ok(self.level)
         }
         fn set(&mut self, percent: u8) -> Result<()> {
-            if self.fail_set {
+            if self.fail_set || self.closed {
                 return Err(Error::Device {
                     device: "hw:Fake".into(),
                     reason: "No such device".into(),
@@ -1042,6 +1057,7 @@ mod tests {
                 });
             }
             self.fail_set = false;
+            self.closed = false;
             self.level = 25;
             Ok(())
         }
@@ -1102,6 +1118,43 @@ mod tests {
         assert!(volumes(&events).is_empty());
         w.arm();
         assert!(w.watcher.is_none());
+    }
+
+    #[test]
+    fn a_mixer_missing_at_start_is_retried() {
+        let mut m = FakeMixer::new(100);
+        m.closed = true;
+        m.absent = 2;
+        let watches = Arc::clone(&m.watches);
+        let (mut w, events) = faked(FakeSink::default(), m);
+        assert_eq!(volume(&w), None, "unknown until opened");
+        w.arm();
+        assert!(watches.lock().unwrap().is_empty(), "the card is not there");
+        let err = w.handle(Command::SetVolume(50)).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::NoMixer);
+        w.publish();
+        assert_eq!(volume(&w), None);
+        w.handle(Command::SetVolume(50)).unwrap();
+        w.publish();
+        assert_eq!(volumes(&events), [25, 50], "reopened, then set");
+        assert_eq!(volume(&w), Some(50));
+        assert_eq!(watches.lock().unwrap().len(), 1, "watched once opened");
+
+        let d = Dir::new();
+        let a = flac(&d, "a.flac", 44_100, 16, 2, BLOCK);
+        let mut m = FakeMixer::new(100);
+        m.closed = true;
+        let watches2 = Arc::clone(&m.watches);
+        let (mut w2, events2) = faked(FakeSink::default(), m);
+        play_one(&mut w2, &a);
+        w2.publish();
+        assert_eq!(volumes(&events2), [25], "opened on the first ensure");
+        assert_eq!(volume(&w2), Some(25));
+        for ws in [watches, watches2] {
+            for (_, end) in ws.lock().unwrap().iter_mut() {
+                end.take();
+            }
+        }
     }
 
     /// Wait for a fake watcher thread to finish (bounded).

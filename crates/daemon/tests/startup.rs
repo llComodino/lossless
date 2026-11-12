@@ -119,7 +119,10 @@ fn a_missing_mixer_card_is_logged() {
     let _ = child.kill();
     let _ = child.wait();
     let line = got.expect("no mixer warning on stderr");
-    assert!(line.ends_with("; no volume control"), "{line}");
+    assert!(
+        line.ends_with("; no volume control until it opens"),
+        "{line}"
+    );
 }
 
 #[test]
