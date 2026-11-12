@@ -352,3 +352,26 @@ fn binary_state_falls_back_to_home_without_an_absolute_xdg_dir() {
     let line = line.expect("no state warning on stderr");
     assert!(line.contains(".local/state/lossless/state.json"), "{line}");
 }
+
+#[test]
+fn run_restores_modes_when_every_entry_is_gone() {
+    let dir = Dir::new();
+    let sock = dir.path("s.sock");
+    let cfg = write_config(
+        &dir,
+        &format!("device = \"null\"\nsocket = \"{}\"\n", sock.display()),
+    );
+    let state = dir.path("state.json");
+    std::fs::write(
+        &state,
+        r#"{"queue":["/gone/a.flac"],"index":0,"position_ms":5,"repeat":"one","random":true}"#,
+    )
+    .unwrap();
+    let unused = dir.path("default.sock");
+    thread::spawn(move || run(&cfg, unused, state, None));
+    let c = connect(&sock);
+    let st = call(&c, r#"{"id":1,"cmd":"status"}"#);
+    assert!(st.contains(r#""repeat":"one""#), "{st}");
+    assert!(st.contains(r#""random":true"#), "{st}");
+    assert!(call(&c, r#"{"id":2,"cmd":"queue"}"#).contains(r#""data":[]"#));
+}

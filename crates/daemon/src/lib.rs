@@ -380,7 +380,8 @@ pub fn run(
     Ok(())
 }
 
-/// Put back the session saved at `path`, minus entries whose files are gone.
+/// Put back the session saved at `path`, minus entries whose files are gone
+/// (the modes survive even if all of them are).
 fn restore(player: &Player, path: &Path) -> Result<()> {
     let saved = match state::load(path) {
         Ok(Some(s)) => s,
@@ -395,6 +396,10 @@ fn restore(player: &Player, path: &Path) -> Result<()> {
         warn!("state: dropped {dropped} missing entries");
     }
     if s.queue.is_empty() {
+        player.send(PlayerCmd::SetMode {
+            repeat: Some(s.repeat),
+            random: Some(s.random),
+        })?;
         return Ok(());
     }
     info!("state: restored {} entries", s.queue.len());
