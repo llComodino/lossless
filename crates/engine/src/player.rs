@@ -645,6 +645,19 @@ impl<S: Sink> Worker<S> {
         }
     }
 
+    /// After an edit that moved the cursor: if nothing reported where it
+    /// ended up (a jump that failed to open the device), say so now.
+    fn track_settled(&mut self, was: Option<usize>) {
+        let told = self
+            .pending
+            .iter()
+            .any(|e| matches!(e, Event::TrackChanged { .. }));
+        let now = self.queue.current();
+        if !told && now != was {
+            self.emit(Event::TrackChanged { index: now });
+        }
+    }
+
     fn handle(&mut self, cmd: Command) -> Result<()> {
         log::debug!("player: {cmd:?}");
         match cmd {
@@ -655,9 +668,11 @@ impl<S: Sink> Worker<S> {
             }
             Command::Replace(paths) if paths.is_empty() => return self.handle(Command::Clear),
             Command::Replace(paths) => {
+                let was = self.queue.current();
                 self.queue.replace(paths);
                 self.queue_edited(None);
                 self.jump(0, true);
+                self.track_settled(was);
             }
             Command::Remove(indices) => {
                 let was = self.queue.current();
@@ -681,6 +696,7 @@ impl<S: Sink> Worker<S> {
                                 self.emit(Event::TrackChanged { index: next });
                             }
                         }
+                        self.track_settled(was);
                     }
                 }
             }
@@ -1749,6 +1765,30 @@ mod tests {
             "edits must not disturb the buffered audio"
         );
         assert_eq!(w.output.opens.len(), 1);
+    }
+
+    #[test]
+    fn a_device_failure_after_an_edit_still_reports_the_track() {
+        let d = Dir::new();
+        let a = flac(&d, "a.flac", 44_100, 16, 2, 4 * BLOCK);
+        let b = flac(&d, "b.flac", 44_100, 16, 2, 4 * BLOCK);
+        let (mut w, events) = worker(FakeSink::default());
+        let edits = [
+            Command::Replace(vec![b.path.clone()]),
+            Command::Remove(vec![0]),
+        ];
+        for edit in edits {
+            w.output.fail_ensure = false;
+            w.handle(Command::Replace(vec![a.path.clone(), b.path.clone()]))
+                .unwrap();
+            w.publish();
+            let _ = events.try_iter().count();
+            w.output.fail_ensure = true;
+            w.handle(edit.clone()).unwrap();
+            assert_eq!((w.state, w.queue.current()), (PlayState::Stopped, None));
+            w.publish();
+            assert_eq!(tracks(&events), [None], "{edit:?}");
+        }
     }
 
     #[test]
