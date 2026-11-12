@@ -75,21 +75,35 @@ pub fn state_path() -> PathBuf {
         .join("lossless/state.json")
 }
 
+/// Write `bytes` to `<path>.tmp`, created afresh (owner-only, never through
+/// a symlink or with a stale file's permissions) and synced. A failed write
+/// removes it.
+fn write_tmp(path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    match fs::remove_file(&tmp) {
+        Err(e) if e.kind() != ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .and_then(|mut f| {
+            f.write_all(bytes)?;
+            f.sync_all()
+        })
+        .inspect_err(|_| drop(fs::remove_file(&tmp)))?;
+    Ok(tmp)
+}
+
 /// Write `<path>.tmp`, sync it, then rename it over `path`: a crash leaves
 /// either the old file or the new one, never a partial one.
 pub fn save(path: &Path, s: &Saved) -> io::Result<()> {
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
     let json = serde_json::to_vec(s)?;
-    let mut f = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    f.write_all(&json)?;
-    f.sync_all()?;
-    fs::rename(&tmp, path)
+    fs::rename(write_tmp(path, &json)?, path)
 }
 
 /// Read the state at `path`; a missing file is `None`. Only a regular file
@@ -160,6 +174,29 @@ mod tests {
         let mode = std::fs::metadata(&tmp).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
         assert!(save(&dir.path("missing/state.json"), &saved(&[], None)).is_err());
+    }
+
+    #[test]
+    fn save_writes_a_fresh_private_tmp() {
+        let dir = Dir::new();
+        let p = dir.path("state.json");
+        let tmp = dir.path("state.json.tmp");
+        std::fs::write(&tmp, "stale").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        save(&p, &saved(&[], None)).unwrap();
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        let target = dir.path("target");
+        std::fs::write(&target, "keep").unwrap();
+        std::os::unix::fs::symlink(&target, &tmp).unwrap();
+        save(&p, &saved(&["/m/a.flac"], Some(0))).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
+        assert!(std::fs::symlink_metadata(&p).unwrap().file_type().is_file());
+        assert_eq!(load(&p).unwrap().unwrap(), saved(&["/m/a.flac"], Some(0)));
+
+        std::fs::create_dir(&tmp).unwrap();
+        assert!(save(&p, &saved(&[], None)).is_err());
     }
 
     #[test]
