@@ -738,7 +738,10 @@ fn volume_over_the_socket() {
     let e = c.err(Command::SetVolume { percent: 50 });
     assert_eq!(
         (e.code, e.message.as_str()),
-        (ErrorCode::NoMixer, "no hardware mixer")
+        (
+            ErrorCode::NoMixer,
+            "no volume control (mixer = none or unavailable)"
+        )
     );
 }
 

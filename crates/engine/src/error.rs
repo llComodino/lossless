@@ -16,7 +16,7 @@ pub enum Error {
     Device { device: String, reason: String },
     #[error("index {index} out of range: queue has {len} entries")]
     OutOfRange { index: usize, len: usize },
-    #[error("no hardware mixer")]
+    #[error("no volume control (mixer = none or unavailable)")]
     NoMixer,
     #[error("{0}")]
     BadRequest(String),
@@ -87,6 +87,10 @@ mod tests {
             (ErrorCode::Decode, "x.flac: bad".into())
         );
         assert_eq!(Error::NoMixer.code(), ErrorCode::NoMixer);
+        assert_eq!(
+            Error::NoMixer.to_string(),
+            "no volume control (mixer = none or unavailable)"
+        );
         let bad = Error::BadRequest("nope".into());
         assert_eq!(
             (bad.code(), bad.to_string()),
