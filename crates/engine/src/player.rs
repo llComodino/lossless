@@ -513,10 +513,10 @@ impl<S: Sink> Worker<S> {
                 match self.queue.remove(&indices)? {
                     Removal::Kept => self.queue_edited(was),
                     Removal::CurrentRemoved { mut next } => {
+                        self.queue_edited(None);
                         if self.queue.random() {
                             next = self.queue.next();
                         }
-                        self.queue_edited(None);
                         match next {
                             Some(n) if self.state != PlayState::Stopped => {
                                 let play = self.state == PlayState::Playing;
@@ -1544,7 +1544,7 @@ mod tests {
         let fs: Vec<Fixture> = (0..3)
             .map(|i| flac(&d, &format!("{i}.flac"), 44_100, 16, 2, BLOCK))
             .collect();
-        let (mut w, _events) = worker(FakeSink::default());
+        let (mut w, events) = worker(FakeSink::default());
         w.handle(Command::Add {
             paths: fs.iter().map(|f| f.path.clone()).collect(),
             at: None,
@@ -1556,7 +1556,12 @@ mod tests {
         })
         .unwrap();
         w.handle(Command::Play(Some(2))).unwrap();
+        w.publish();
+        let _ = events.try_iter().count();
         w.handle(Command::Remove(vec![2])).unwrap();
+        w.publish();
+        let now = w.queue.current();
+        assert_eq!(tracks(&events), [now], "one track event");
         assert_eq!(
             w.state,
             PlayState::Playing,
