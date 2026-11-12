@@ -31,8 +31,22 @@ pub enum Command {
     Seek {
         ms: u64,
     },
+    /// Append, or insert at a 0-based queue index.
     Add {
         paths: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at: Option<usize>,
+    },
+    /// Swap the whole queue; stops playback.
+    Replace {
+        paths: Vec<String>,
+    },
+    Remove {
+        indices: Vec<usize>,
+    },
+    Move {
+        from: usize,
+        to: usize,
     },
     Clear,
     Subscribe,
@@ -211,6 +225,33 @@ mod tests {
             encode(&jump).unwrap(),
             "{\"id\":2,\"cmd\":\"play\",\"index\":3}\n"
         );
+        let add = |at| Request {
+            id: 1,
+            command: Command::Add {
+                paths: vec!["a".into()],
+                at,
+            },
+        };
+        assert_eq!(
+            encode(&add(Some(0))).unwrap(),
+            "{\"id\":1,\"cmd\":\"add\",\"paths\":[\"a\"],\"at\":0}\n"
+        );
+        assert_eq!(
+            encode(&add(None)).unwrap(),
+            "{\"id\":1,\"cmd\":\"add\",\"paths\":[\"a\"]}\n"
+        );
+        assert_eq!(
+            decode::<Request>("{\"id\":1,\"cmd\":\"add\",\"paths\":[\"a\"]}").unwrap(),
+            add(None)
+        );
+        assert_eq!(
+            encode(&Request {
+                id: 3,
+                command: Command::Move { from: 1, to: 0 }
+            })
+            .unwrap(),
+            "{\"id\":3,\"cmd\":\"move\",\"from\":1,\"to\":0}\n"
+        );
     }
 
     #[test]
@@ -330,8 +371,16 @@ mod props {
             Just(Command::Next),
             Just(Command::Previous),
             any::<u64>().prop_map(|ms| Command::Seek { ms }),
+            (
+                proptest::collection::vec(any::<String>(), 0..4),
+                of(any::<usize>())
+            )
+                .prop_map(|(paths, at)| Command::Add { paths, at }),
             proptest::collection::vec(any::<String>(), 0..4)
-                .prop_map(|paths| Command::Add { paths }),
+                .prop_map(|paths| Command::Replace { paths }),
+            proptest::collection::vec(any::<usize>(), 0..4)
+                .prop_map(|indices| Command::Remove { indices }),
+            (any::<usize>(), any::<usize>()).prop_map(|(from, to)| Command::Move { from, to }),
             Just(Command::Clear),
             Just(Command::Subscribe),
             any::<String>().prop_map(|query| Command::Search { query }),

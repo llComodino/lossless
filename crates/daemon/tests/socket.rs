@@ -184,6 +184,7 @@ fn add_resolves_folders_relative_to_music_dir() {
     let mut c = s.connect();
     c.ok(Command::Add {
         paths: vec!["album".into()],
+        at: None,
     });
     let q = queue(&mut c);
     let want: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
@@ -191,6 +192,7 @@ fn add_resolves_folders_relative_to_music_dir() {
     // Absolute paths work too.
     c.ok(Command::Add {
         paths: vec![files[0].display().to_string()],
+        at: None,
     });
     assert_eq!(queue(&mut c).len(), 3);
 }
@@ -202,29 +204,36 @@ fn add_reports_errors() {
     let mut c = s.connect();
     assert!(
         c.err(Command::Add {
-            paths: vec!["nope".into()]
+            paths: vec!["nope".into()],
+            at: None,
         })
         .message
         .contains("nope")
     );
     let e = c.err(Command::Add {
         paths: vec!["empty".into(), "empty".into()],
+        at: None,
     });
     assert_eq!(e.code, ErrorCode::NotFound);
     assert_eq!(e.message, "no playable files in empty, empty");
-    let e = c.err(Command::Add { paths: vec![] });
+    let e = c.err(Command::Add {
+        paths: vec![],
+        at: None,
+    });
     assert_eq!(
         (e.code, e.message.as_str()),
         (ErrorCode::NotFound, "no playable files")
     );
     let e = c.err(Command::Add {
         paths: vec!["album/cover.jpg".into()],
+        at: None,
     });
     assert_eq!(e.code, ErrorCode::NotFound);
     assert!(e.message.ends_with("cover.jpg: not a flac or mp3 file"));
     // A failing path rejects the whole request.
     c.err(Command::Add {
         paths: vec!["album".into(), "nope".into()],
+        at: None,
     });
     assert!(queue(&mut c).is_empty());
 }
@@ -236,6 +245,7 @@ fn play_past_the_queue_is_out_of_range() {
     let mut c = s.connect();
     c.ok(Command::Add {
         paths: vec!["album".into()],
+        at: None,
     });
     let e = c.err(Command::Play { index: Some(5) });
     assert_eq!(e.code, ErrorCode::OutOfRange);
@@ -254,6 +264,7 @@ fn error_codes_name_the_problem() {
     }
     let e = c.err(Command::Add {
         paths: vec!["nope".into()],
+        at: None,
     });
     assert_eq!(e.code, ErrorCode::NotFound);
     let e = c.err(Command::Play { index: Some(9) });
@@ -309,6 +320,7 @@ fn playback_events_reach_subscribers_in_order() {
     c.ok(Command::Subscribe);
     c.ok(Command::Add {
         paths: vec!["album".into()],
+        at: None,
     });
     c.ok(Command::Play { index: None });
     c.wait_for(|e| *e == Event::TrackChanged { index: None });
@@ -336,6 +348,7 @@ fn status_names_the_current_track() {
     let mut c = s.connect();
     c.ok(Command::Add {
         paths: vec!["album".into()],
+        at: None,
     });
     c.ok(Command::Next);
     assert_eq!(status(&mut c).index, None, "next with nothing loaded");
@@ -411,10 +424,12 @@ fn a_dead_subscriber_does_not_stop_the_others() {
     c.ok(Command::Subscribe);
     c.ok(Command::Add {
         paths: vec!["album".into()],
+        at: None,
     });
     c.wait_for(|e| *e == Event::QueueChanged);
     c.ok(Command::Add {
         paths: vec!["album".into()],
+        at: None,
     });
     c.wait_for(|e| *e == Event::QueueChanged);
 }
@@ -443,6 +458,7 @@ fn queued_library_tracks_come_from_the_index() {
     };
     c.ok(Command::Add {
         paths: vec!["album/01 one.flac".into()],
+        at: None,
     });
     let Body::Queue(queued) = c.ok(Command::Queue) else {
         panic!("not a queue")
@@ -457,6 +473,7 @@ fn tracks_outside_the_library_are_read_on_demand() {
     let mut c = s.connect();
     c.ok(Command::Add {
         paths: vec![files[0].display().to_string()],
+        at: None,
     });
     match c.ok(Command::Queue) {
         Body::Queue(tracks) => {
@@ -543,4 +560,45 @@ fn config_parsing() {
     assert_eq!(cfg.socket, Some(PathBuf::from("/run/x.sock")));
     assert!(parse_config("devise = \"x\"").is_err(), "typo accepted");
     assert!(parse_config("device = ").is_err());
+}
+
+#[test]
+fn queue_edits_over_the_socket() {
+    let s = Server::start(true);
+    let files = s.album(1);
+    let names: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
+    let mut c = s.connect();
+    let add = |paths: &[&str], at| Command::Add {
+        paths: paths.iter().map(|p| p.to_string()).collect(),
+        at,
+    };
+    c.ok(add(&["album/02 two.flac"], None));
+    c.ok(add(&["album/01 one.flac"], Some(0)));
+    assert_eq!(queue(&mut c), names);
+    let e = c.err(add(&["album/01 one.flac"], Some(3)));
+    assert_eq!(e.code, ErrorCode::OutOfRange);
+    c.ok(Command::Move { from: 0, to: 1 });
+    assert_eq!(queue(&mut c), [names[1].clone(), names[0].clone()]);
+    let e = c.err(Command::Move { from: 0, to: 2 });
+    assert_eq!(e.code, ErrorCode::OutOfRange);
+    let e = c.err(Command::Remove {
+        indices: vec![0, 0],
+    });
+    assert_eq!(e.code, ErrorCode::BadRequest);
+    assert_eq!(queue(&mut c).len(), 2);
+    c.ok(Command::Remove { indices: vec![0] });
+    assert_eq!(queue(&mut c), [names[0].clone()]);
+    let e = c.err(Command::Remove { indices: vec![5] });
+    assert_eq!(e.code, ErrorCode::OutOfRange);
+    let e = c.err(Command::Replace {
+        paths: vec!["empty".into()],
+    });
+    assert_eq!(e.code, ErrorCode::NotFound);
+    let e = c.err(Command::Replace { paths: vec![] });
+    assert_eq!(e.code, ErrorCode::NotFound);
+    assert_eq!(queue(&mut c), [names[0].clone()], "queue untouched");
+    c.ok(Command::Replace {
+        paths: vec!["album".into()],
+    });
+    assert_eq!(queue(&mut c), names);
 }

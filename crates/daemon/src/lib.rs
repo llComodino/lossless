@@ -154,6 +154,17 @@ impl State {
         .ok_or(RequestError::ScanRunning)
     }
 
+    fn tracks(&self, paths: &[String]) -> Result<Vec<PathBuf>, RequestError> {
+        let mut tracks = Vec::new();
+        for p in paths {
+            collect(&self.resolve(p), &mut tracks)?;
+        }
+        if tracks.is_empty() {
+            return Err(RequestError::NoPlayableFiles(paths.to_vec()));
+        }
+        Ok(tracks)
+    }
+
     fn handle(&self, cmd: Command, writer: &Writer) -> Result<Body, RequestError> {
         let play = |c| {
             self.player
@@ -186,16 +197,13 @@ impl State {
                 ))
             }
             Command::Update => self.rescan().map(|_| Body::Done),
-            Command::Add { paths } => {
-                let mut tracks = Vec::new();
-                for p in &paths {
-                    collect(&self.resolve(p), &mut tracks)?;
-                }
-                if tracks.is_empty() {
-                    return Err(RequestError::NoPlayableFiles(paths));
-                }
-                play(PlayerCmd::Add(tracks))
-            }
+            Command::Add { paths, at } => play(PlayerCmd::Add {
+                paths: self.tracks(&paths)?,
+                at,
+            }),
+            Command::Replace { paths } => play(PlayerCmd::Replace(self.tracks(&paths)?)),
+            Command::Remove { indices } => play(PlayerCmd::Remove(indices)),
+            Command::Move { from, to } => play(PlayerCmd::Move { from, to }),
             Command::Subscribe => {
                 self.subscribers
                     .lock()
@@ -459,7 +467,14 @@ mod tests {
         let daemon = Daemon::start(player, events, None, gone).unwrap();
         let mut tracks = Vec::new();
         collect(&fixture.path, &mut tracks).unwrap();
-        daemon.state.player.send(PlayerCmd::Add(tracks)).unwrap();
+        daemon
+            .state
+            .player
+            .send(PlayerCmd::Add {
+                paths: tracks,
+                at: None,
+            })
+            .unwrap();
         daemon.state.player.send(PlayerCmd::Play(None)).unwrap();
         rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
     }

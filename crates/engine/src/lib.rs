@@ -5,6 +5,7 @@ mod error;
 pub mod fixtures;
 mod output;
 mod player;
+mod queue;
 mod source;
 
 pub use error::{Error, Result};
