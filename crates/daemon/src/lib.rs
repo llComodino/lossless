@@ -194,7 +194,10 @@ impl State {
                 if tracks.is_empty() {
                     return Err(RequestError::NoPlayableFiles(paths));
                 }
-                play(PlayerCmd::Add(tracks))
+                play(PlayerCmd::Add {
+                    paths: tracks,
+                    at: None,
+                })
             }
             Command::Subscribe => {
                 self.subscribers
@@ -459,7 +462,14 @@ mod tests {
         let daemon = Daemon::start(player, events, None, gone).unwrap();
         let mut tracks = Vec::new();
         collect(&fixture.path, &mut tracks).unwrap();
-        daemon.state.player.send(PlayerCmd::Add(tracks)).unwrap();
+        daemon
+            .state
+            .player
+            .send(PlayerCmd::Add {
+                paths: tracks,
+                at: None,
+            })
+            .unwrap();
         daemon.state.player.send(PlayerCmd::Play(None)).unwrap();
         rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
     }
