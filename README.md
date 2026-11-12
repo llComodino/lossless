@@ -183,7 +183,7 @@ lossless albums [artist]         # album names, of one artist or all
 lossless find --artist Radiohead --album "OK Computer"   # exact, either optional
 lossless add "Radiohead/OK Computer"
 lossless add --at 1 song.flac    # insert at position 1 (default: append)
-lossless replace "Radiohead/OK Computer"   # swap the queue, stops playback
+lossless replace "Radiohead/OK Computer"   # swap the queue, play from the first
 lossless remove 2 3              # 1-based queue positions
 lossless move 3 1
 lossless play                    # or: play 3 (1-based queue entry)

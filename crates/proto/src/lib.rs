@@ -46,7 +46,7 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         at: Option<usize>,
     },
-    /// Swap the whole queue; stops playback.
+    /// Swap the whole queue and play from its first entry.
     Replace {
         paths: Vec<String>,
     },

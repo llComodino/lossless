@@ -29,7 +29,7 @@ const USAGE: &str = "usage: lossless [--json] [--socket PATH] <command>
   status                 state, position, output format
   queue                  list the queue
   add [--at N] <path>... add files or folders (relative to music_dir)
-  replace <path>...      replace the queue and stop
+  replace <path>...      replace the queue and play it
   remove <N>...          remove queue entries (1-based)
   move <from> <to>       move a queue entry
   play [N]               start/resume, or jump to queue entry N (1-based)

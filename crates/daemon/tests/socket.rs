@@ -645,7 +645,7 @@ fn config_parsing() {
 #[test]
 fn queue_edits_over_the_socket() {
     let s = Server::start(true);
-    let files = s.album(1);
+    let files = s.album(20);
     let names: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
     let mut c = s.connect();
     let add = |paths: &[&str], at| Command::Add {
@@ -681,6 +681,8 @@ fn queue_edits_over_the_socket() {
         paths: vec!["album".into()],
     });
     assert_eq!(queue(&mut c), names);
+    let st = status(&mut c);
+    assert_eq!((st.state, st.index), (PlayState::Playing, Some(0)));
 }
 
 #[test]
