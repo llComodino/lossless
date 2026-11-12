@@ -46,7 +46,7 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         at: Option<usize>,
     },
-    /// Swap the whole queue; stops playback.
+    /// Swap the whole queue and play from its first entry.
     Replace {
         paths: Vec<String>,
     },
@@ -208,6 +208,8 @@ pub struct Status {
     /// The current queue entry, with tags when the library knows it.
     #[serde(default)]
     pub track: Option<Track>,
+    /// The last failure the daemon recovered from on its own (a skipped
+    /// file, a device that stopped playback), until a track loads cleanly.
     #[serde(default)]
     pub last_error: Option<WireError>,
     #[serde(default)]

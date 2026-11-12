@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 lofty = "0.24.0"
+log = "0.4"
 lossless-proto.workspace = true
 thiserror = "2"
 

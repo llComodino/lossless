@@ -484,6 +484,45 @@ fn oversized_request_closes_only_that_connection() {
 }
 
 #[test]
+fn requests_past_64_kib_are_accepted() {
+    let s = Server::start(true);
+    s.album(1);
+    let mut c = s.connect();
+    let paths = vec!["album/01 one.flac".to_string(); 5_000];
+    c.ok(Command::Add { paths, at: None });
+    assert_eq!(queue(&mut c).len(), 5_000);
+}
+
+#[test]
+fn shutdown_closes_live_connections() {
+    let dir = Dir::new();
+    let sock = dir.path("sock");
+    let listener = bind(&sock).unwrap();
+    let (player, events) = Player::spawn_with(PacedSink::default());
+    let daemon = Daemon::start(player, events, None, dir.path("s.json"), Box::new(|| {})).unwrap();
+    let daemon = std::sync::Arc::new(daemon);
+    let serving = {
+        let d = std::sync::Arc::clone(&daemon);
+        thread::spawn(move || d.serve(listener))
+    };
+    let mut c = Client::connect(&sock);
+    c.ok(Command::Subscribe);
+    let mut idle = UnixStream::connect(&sock).unwrap();
+    idle.set_read_timeout(Some(WAIT)).unwrap();
+    assert_eq!(status(&mut c).state, PlayState::Stopped);
+    daemon.shutdown();
+    serving.join().unwrap();
+    assert_eq!(
+        c.lines.recv_timeout(WAIT),
+        Err(mpsc::RecvTimeoutError::Disconnected),
+        "EOF"
+    );
+    assert_eq!(idle.read(&mut [0; 16]).unwrap(), 0, "EOF");
+    assert!(UnixStream::connect(&sock).is_err(), "no longer accepting");
+    daemon.shutdown();
+}
+
+#[test]
 fn a_dead_subscriber_does_not_stop_the_others() {
     let s = Server::start(true);
     s.album(1);
@@ -635,7 +674,7 @@ fn config_parsing() {
 #[test]
 fn queue_edits_over_the_socket() {
     let s = Server::start(true);
-    let files = s.album(1);
+    let files = s.album(20);
     let names: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
     let mut c = s.connect();
     let add = |paths: &[&str], at| Command::Add {
@@ -671,6 +710,8 @@ fn queue_edits_over_the_socket() {
         paths: vec!["album".into()],
     });
     assert_eq!(queue(&mut c), names);
+    let st = status(&mut c);
+    assert_eq!((st.state, st.index), (PlayState::Playing, Some(0)));
 }
 
 #[test]
@@ -726,7 +767,10 @@ fn volume_over_the_socket() {
     let e = c.err(Command::SetVolume { percent: 50 });
     assert_eq!(
         (e.code, e.message.as_str()),
-        (ErrorCode::NoMixer, "no hardware mixer")
+        (
+            ErrorCode::NoMixer,
+            "no volume control (mixer = none or unavailable)"
+        )
     );
 }
 
@@ -745,19 +789,16 @@ fn restart_restores_queue_paused_at_position() {
         random: Some(true),
     });
     c.ok(Command::Play { index: Some(1) });
-    c.ok(Command::Seek { ms: 60_000 });
     c.ok(Command::Pause);
+    c.ok(Command::Seek { ms: 60_000 });
     c.wait_for(|e| {
-        matches!(
-            e,
-            Event::State {
-                state: PlayState::Paused,
-                ..
-            }
-        )
+        *e == Event::State {
+            state: PlayState::Paused,
+            position_ms: 60_000,
+        }
     });
     let before = status(&mut c);
-    assert!((60_000..61_000).contains(&before.position_ms), "{before:?}");
+    assert_eq!(before.position_ms, 60_000, "{before:?}");
 
     s.serve("sock2", Some(s.music()), None);
     let mut c = Client::connect(&s.dir.path("sock2"));

@@ -70,7 +70,8 @@ pub struct HardwareMixer {
     card: String,
     control: String,
     device: String,
-    mixer: alsa::mixer::Mixer,
+    /// `None` until the card could be opened.
+    mixer: Option<alsa::mixer::Mixer>,
     id: SelemId,
 }
 
@@ -168,22 +169,34 @@ fn probe(s: &Selem) -> Scale {
 
 impl HardwareMixer {
     pub fn new(card: &str, control: &str) -> Result<Self> {
-        let device = format!("hw:{card}");
+        let mut m = Self::closed(card, control);
         let mixer =
-            alsa::mixer::Mixer::new(&device, false).map_err(|e| device_error(&device, e))?;
-        let m = Self {
-            card: card.into(),
-            control: control.into(),
-            id: SelemId::new(control, 0),
-            mixer,
-            device,
-        };
+            alsa::mixer::Mixer::new(&m.device, false).map_err(|e| device_error(&m.device, e))?;
+        m.mixer = Some(mixer);
         m.selem()?;
         Ok(m)
     }
 
-    fn selem(&self) -> Result<Selem<'_>> {
+    /// Remembers the card and control without opening them; every use fails
+    /// until `reopen` succeeds.
+    pub fn closed(card: &str, control: &str) -> Self {
+        Self {
+            card: card.into(),
+            control: control.into(),
+            device: format!("hw:{card}"),
+            mixer: None,
+            id: SelemId::new(control, 0),
+        }
+    }
+
+    fn handle(&self) -> Result<&alsa::mixer::Mixer> {
         self.mixer
+            .as_ref()
+            .ok_or_else(|| device_error(&self.device, "not open"))
+    }
+
+    fn selem(&self) -> Result<Selem<'_>> {
+        self.handle()?
             .find_selem(&self.id)
             .filter(Selem::has_playback_volume)
             .ok_or_else(|| {
@@ -198,7 +211,7 @@ impl HardwareMixer {
     fn next_change(&self, fds: &mut [poll::pollfd]) -> Result<u8> {
         let err = |e: alsa::Error| device_error(&self.device, e);
         retry_interrupted(|| poll::poll(fds, -1)).map_err(err)?;
-        let flags = self.mixer.revents(fds).map_err(err)?;
+        let flags = self.handle()?.revents(fds).map_err(err)?;
         if flags.intersects(Flags::ERR | Flags::HUP | Flags::NVAL) {
             return Err(device_error(&self.device, "device gone"));
         }
@@ -209,7 +222,7 @@ impl HardwareMixer {
 impl Mixer for HardwareMixer {
     fn get(&self) -> Result<u8> {
         let err = |e: alsa::Error| device_error(&self.device, e);
-        self.mixer.handle_events().map_err(err)?;
+        self.handle()?.handle_events().map_err(err)?;
         let s = self.selem()?;
         let scale = probe(&s);
         let ch = SelemChannelId::mono();
@@ -249,7 +262,7 @@ pub fn watch(
     on_change: impl Fn(u8) -> bool + Send + 'static,
 ) -> Result<JoinHandle<()>> {
     let m = HardwareMixer::new(card, control)?;
-    let mut fds = m.mixer.get().map_err(|e| device_error(&m.device, e))?;
+    let mut fds = m.handle()?.get().map_err(|e| device_error(&m.device, e))?;
     thread::Builder::new()
         .name("mixer".into())
         .spawn(move || relay(|| m.next_change(&mut fds), on_change))
@@ -342,16 +355,21 @@ fn card(device: &str) -> Option<&str> {
 }
 
 impl MixerKind {
-    /// The mixer itself. A card or control that can't be opened leaves the
-    /// daemon running without volume control.
+    /// The mixer itself. A card that can't be opened yet is kept closed: the
+    /// player reopens it once the device opens. A card without the control
+    /// is a config mistake and gets no mixer.
     pub fn open(self) -> Option<Box<dyn Mixer>> {
         match self {
             Self::Software => Some(Box::new(SoftwareMixer::new())),
             Self::Hardware { card, control } => match HardwareMixer::new(&card, &control) {
                 Ok(m) => Some(Box::new(m)),
-                Err(e) => {
+                Err(e) if alsa::mixer::Mixer::new(&format!("hw:{card}"), false).is_ok() => {
                     log::warn!("mixer: {e}; no volume control");
                     None
+                }
+                Err(e) => {
+                    log::warn!("mixer: {e}; no volume control until it opens");
+                    Some(Box::new(HardwareMixer::closed(&card, &control)))
                 }
             },
             Self::None => None,
@@ -552,7 +570,15 @@ mod tests {
             card: "NoSuchCard9".into(),
             control: "PCM".into(),
         };
-        assert!(kind.open().is_none());
+        let mut closed = kind.open().unwrap();
+        assert!(
+            closed
+                .get()
+                .is_err_and(|e| e.to_string() == "hw:NoSuchCard9: not open")
+        );
+        assert!(closed.set(10).is_err());
+        assert!(closed.gain().is_none());
+        assert!(closed.reopen().is_err());
         assert!(MixerKind::None.open().is_none());
         let mut soft = MixerKind::Software.open().unwrap();
         assert!(soft.gain().is_some());

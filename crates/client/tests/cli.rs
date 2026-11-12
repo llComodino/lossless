@@ -422,5 +422,8 @@ fn volume_command() {
     assert_eq!(s.ok(&["volume"]), "no mixer\n");
     assert!(s.ok(&["status"]).ends_with(" random:off\n"));
     assert_eq!(s.err(&["volume", "+5"]).trim(), "Error: no mixer");
-    assert_eq!(s.err(&["volume", "5"]).trim(), "Error: no hardware mixer");
+    assert_eq!(
+        s.err(&["volume", "5"]).trim(),
+        "Error: no volume control (mixer = none or unavailable)"
+    );
 }

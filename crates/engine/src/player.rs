@@ -235,7 +235,8 @@ struct Worker<S: Sink> {
     /// The last level published.
     volume: Option<u8>,
     watcher: Option<JoinHandle<()>>,
-    /// A watcher ended, so the card went away: reopen the mixer before use.
+    /// The card went away (a watcher ended) or was missing at start: reopen
+    /// the mixer before use.
     stale: bool,
     scratch: Vec<i32>,
 }
@@ -249,6 +250,7 @@ impl<S: Sink> Worker<S> {
     ) -> (Self, Receiver<Event>) {
         let (events, events_rx) = mpsc::channel();
         let volume = mixer.as_ref().and_then(|m| m.get().ok());
+        let mixer_closed = mixer.is_some() && volume.is_none();
         let mut shared = Shared::new();
         shared.status.volume = volume;
         let worker = Self {
@@ -272,7 +274,7 @@ impl<S: Sink> Worker<S> {
             mixer,
             volume,
             watcher: None,
-            stale: false,
+            stale: mixer_closed,
             scratch: Vec::new(),
         };
         (worker, events_rx)
@@ -643,6 +645,19 @@ impl<S: Sink> Worker<S> {
         }
     }
 
+    /// After an edit that moved the cursor: if nothing reported where it
+    /// ended up (a jump that failed to open the device), say so now.
+    fn track_settled(&mut self, was: Option<usize>) {
+        let told = self
+            .pending
+            .iter()
+            .any(|e| matches!(e, Event::TrackChanged { .. }));
+        let now = self.queue.current();
+        if !told && now != was {
+            self.emit(Event::TrackChanged { index: now });
+        }
+    }
+
     fn handle(&mut self, cmd: Command) -> Result<()> {
         log::debug!("player: {cmd:?}");
         match cmd {
@@ -653,9 +668,11 @@ impl<S: Sink> Worker<S> {
             }
             Command::Replace(paths) if paths.is_empty() => return self.handle(Command::Clear),
             Command::Replace(paths) => {
+                let was = self.queue.current();
                 self.queue.replace(paths);
                 self.queue_edited(None);
                 self.jump(0, true);
+                self.track_settled(was);
             }
             Command::Remove(indices) => {
                 let was = self.queue.current();
@@ -679,6 +696,7 @@ impl<S: Sink> Worker<S> {
                                 self.emit(Event::TrackChanged { index: next });
                             }
                         }
+                        self.track_settled(was);
                     }
                 }
             }
@@ -694,7 +712,12 @@ impl<S: Sink> Worker<S> {
                 self.emit(Event::QueueChanged);
                 self.emit(Event::TrackChanged { index: None });
             }
-            Command::Play(Some(i)) if i < self.queue.entries().len() => self.jump(i, true),
+            Command::Play(Some(i)) if i < self.queue.entries().len() => {
+                if self.queue.cycle_done() {
+                    self.queue.restart_cycle();
+                }
+                self.jump(i, true)
+            }
             Command::Play(Some(index)) => {
                 return Err(Error::OutOfRange {
                     index,
@@ -729,16 +752,14 @@ impl<S: Sink> Worker<S> {
             }
             Command::Stop => self.halt(),
             Command::Next | Command::Previous => {
-                let Some(i) = self.queue.current() else {
-                    return Ok(());
+                let current = self.queue.current();
+                let target = match (&cmd, current) {
+                    (Command::Next, None) => None,
+                    (Command::Next, Some(_)) => self.queue.skip(),
+                    _ => self.queue.previous().or(current),
                 };
-                let target = if cmd == Command::Next {
-                    match self.queue.skip() {
-                        Some(t) => t,
-                        None => return Ok(()),
-                    }
-                } else {
-                    self.queue.previous().unwrap_or(i)
+                let Some(target) = target else {
+                    return Ok(());
                 };
                 if self.state == PlayState::Stopped {
                     self.queue.set_current(Some(target));
@@ -783,6 +804,10 @@ impl<S: Sink> Worker<S> {
                 )));
             }
             Command::SetVolume(percent) => {
+                self.arm();
+                if self.stale {
+                    return Err(Error::NoMixer);
+                }
                 let m = self.mixer.as_mut().ok_or(Error::NoMixer)?;
                 m.set(percent)?;
                 let now = m.get().unwrap_or(percent);
@@ -989,6 +1014,8 @@ mod tests {
     struct FakeMixer {
         level: u8,
         fail_set: bool,
+        /// Not opened yet: reads fail until a reopen succeeds.
+        closed: bool,
         /// Reopens that fail before the card is back.
         absent: usize,
         watches: Arc<Mutex<Vec<Watch>>>,
@@ -999,6 +1026,7 @@ mod tests {
             Self {
                 level,
                 fail_set: false,
+                closed: false,
                 absent: 0,
                 watches: Arc::default(),
             }
@@ -1007,10 +1035,16 @@ mod tests {
 
     impl Mixer for FakeMixer {
         fn get(&self) -> Result<u8> {
+            if self.closed {
+                return Err(Error::Device {
+                    device: "hw:Fake".into(),
+                    reason: "not open".into(),
+                });
+            }
             Ok(self.level)
         }
         fn set(&mut self, percent: u8) -> Result<()> {
-            if self.fail_set {
+            if self.fail_set || self.closed {
                 return Err(Error::Device {
                     device: "hw:Fake".into(),
                     reason: "No such device".into(),
@@ -1039,6 +1073,7 @@ mod tests {
                 });
             }
             self.fail_set = false;
+            self.closed = false;
             self.level = 25;
             Ok(())
         }
@@ -1099,6 +1134,43 @@ mod tests {
         assert!(volumes(&events).is_empty());
         w.arm();
         assert!(w.watcher.is_none());
+    }
+
+    #[test]
+    fn a_mixer_missing_at_start_is_retried() {
+        let mut m = FakeMixer::new(100);
+        m.closed = true;
+        m.absent = 2;
+        let watches = Arc::clone(&m.watches);
+        let (mut w, events) = faked(FakeSink::default(), m);
+        assert_eq!(volume(&w), None, "unknown until opened");
+        w.arm();
+        assert!(watches.lock().unwrap().is_empty(), "the card is not there");
+        let err = w.handle(Command::SetVolume(50)).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::NoMixer);
+        w.publish();
+        assert_eq!(volume(&w), None);
+        w.handle(Command::SetVolume(50)).unwrap();
+        w.publish();
+        assert_eq!(volumes(&events), [25, 50], "reopened, then set");
+        assert_eq!(volume(&w), Some(50));
+        assert_eq!(watches.lock().unwrap().len(), 1, "watched once opened");
+
+        let d = Dir::new();
+        let a = flac(&d, "a.flac", 44_100, 16, 2, BLOCK);
+        let mut m = FakeMixer::new(100);
+        m.closed = true;
+        let watches2 = Arc::clone(&m.watches);
+        let (mut w2, events2) = faked(FakeSink::default(), m);
+        play_one(&mut w2, &a);
+        w2.publish();
+        assert_eq!(volumes(&events2), [25], "opened on the first ensure");
+        assert_eq!(volume(&w2), Some(25));
+        for ws in [watches, watches2] {
+            for (_, end) in ws.lock().unwrap().iter_mut() {
+                end.take();
+            }
+        }
     }
 
     /// Wait for a fake watcher thread to finish (bounded).
@@ -1696,6 +1768,30 @@ mod tests {
     }
 
     #[test]
+    fn a_device_failure_after_an_edit_still_reports_the_track() {
+        let d = Dir::new();
+        let a = flac(&d, "a.flac", 44_100, 16, 2, 4 * BLOCK);
+        let b = flac(&d, "b.flac", 44_100, 16, 2, 4 * BLOCK);
+        let (mut w, events) = worker(FakeSink::default());
+        let edits = [
+            Command::Replace(vec![b.path.clone()]),
+            Command::Remove(vec![0]),
+        ];
+        for edit in edits {
+            w.output.fail_ensure = false;
+            w.handle(Command::Replace(vec![a.path.clone(), b.path.clone()]))
+                .unwrap();
+            w.publish();
+            let _ = events.try_iter().count();
+            w.output.fail_ensure = true;
+            w.handle(edit.clone()).unwrap();
+            assert_eq!((w.state, w.queue.current()), (PlayState::Stopped, None));
+            w.publish();
+            assert_eq!(tracks(&events), [None], "{edit:?}");
+        }
+    }
+
+    #[test]
     fn replace_keeps_the_device_open_on_same_format() {
         let d = Dir::new();
         let a = flac(&d, "a.flac", 44_100, 16, 2, 4 * BLOCK);
@@ -1866,6 +1962,57 @@ mod tests {
                 "pass {pass}: output differs"
             );
         }
+    }
+
+    #[test]
+    fn a_jump_after_a_finished_shuffle_starts_a_new_cycle() {
+        let d = Dir::new();
+        let fs: Vec<Fixture> = (0..4)
+            .map(|i| flac(&d, &format!("{i}.flac"), 44_100, 16, 2, BLOCK))
+            .collect();
+        let (mut w, events) = worker(FakeSink::default());
+        w.handle(Command::Add {
+            paths: fs.iter().map(|f| f.path.clone()).collect(),
+            at: None,
+        })
+        .unwrap();
+        w.handle(Command::SetMode {
+            repeat: Some(Repeat::Off),
+            random: Some(true),
+        })
+        .unwrap();
+        w.handle(Command::Play(None)).unwrap();
+        drive(&mut w);
+        w.publish();
+        let _ = events.try_iter().count();
+        w.handle(Command::Play(Some(2))).unwrap();
+        drive(&mut w);
+        let played: Vec<usize> = tracks(&events).into_iter().flatten().collect();
+        assert_eq!(played[0], 2);
+        let mut sorted = played.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, [0, 1, 2, 3], "{played:?}");
+    }
+
+    #[test]
+    fn previous_after_a_finish_goes_back_to_the_last_track() {
+        let d = Dir::new();
+        let a = flac(&d, "a.flac", 44_100, 16, 2, BLOCK);
+        let b = flac(&d, "b.flac", 44_100, 16, 2, BLOCK);
+        let (mut w, events) = worker(FakeSink::default());
+        w.handle(Command::Add {
+            paths: vec![a.path.clone(), b.path.clone()],
+            at: None,
+        })
+        .unwrap();
+        w.handle(Command::Play(None)).unwrap();
+        drive(&mut w);
+        w.publish();
+        let _ = events.try_iter().count();
+        w.handle(Command::Previous).unwrap();
+        assert_eq!((w.state, w.queue.current()), (PlayState::Stopped, Some(1)));
+        w.publish();
+        assert_eq!(tracks(&events), [Some(1)]);
     }
 
     #[test]

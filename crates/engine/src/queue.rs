@@ -76,7 +76,7 @@ impl Queue {
     }
 
     pub(crate) fn set_current(&mut self, i: Option<usize>) {
-        if let Some(old) = self.current.filter(|&o| i.is_some_and(|n| n != o)) {
+        if let Some(old) = self.current.filter(|&o| i != Some(o)) {
             self.push_history(old);
         }
         self.current = i;
@@ -116,6 +116,11 @@ impl Queue {
 
     pub(crate) fn random(&self) -> bool {
         self.random
+    }
+
+    /// Shuffle played every entry and nothing is current: a finished cycle.
+    pub(crate) fn cycle_done(&self) -> bool {
+        self.random && self.current.is_none() && self.order.is_empty()
     }
 
     /// Forget what this shuffle cycle played, so every entry is due again.
@@ -182,7 +187,7 @@ impl Queue {
         })
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn peek_next(&self) -> Option<usize> {
         self.plan(self.repeat).map(|s| s.index)
     }
@@ -286,7 +291,10 @@ impl Queue {
         let before = |i: usize| sorted.partition_point(|&r| r < i);
         let outcome = match self.current {
             Some(c) if removed_current => {
-                let next = (c + 1..len).find(|i| sorted.binary_search(i).is_err());
+                let wrap = if self.repeat == Repeat::Queue { c } else { 0 };
+                let next = (c + 1..len)
+                    .chain(0..wrap)
+                    .find(|i| sorted.binary_search(i).is_err());
                 self.current = None;
                 Removal::CurrentRemoved {
                     next: next.map(|n| n - before(n)),
@@ -400,6 +408,23 @@ mod tests {
         assert_eq!(q.remove(&[0]).unwrap(), Removal::Kept);
         assert_eq!(q.current(), Some(1));
         assert_eq!(q.remove(&[]).unwrap(), Removal::Kept);
+    }
+
+    #[test]
+    fn removing_the_last_entry_wraps_under_repeat_queue() {
+        let mut q = queue(&["a", "b", "c"], Some(2));
+        q.set_mode(Some(Repeat::Queue), None);
+        assert_eq!(
+            q.remove(&[0, 2]).unwrap(),
+            Removal::CurrentRemoved { next: Some(0) }
+        );
+        assert_eq!(q.entries(), paths(&["b"]));
+        let mut q = queue(&["a", "b"], Some(1));
+        q.set_mode(Some(Repeat::Queue), None);
+        assert_eq!(
+            q.remove(&[0, 1]).unwrap(),
+            Removal::CurrentRemoved { next: None }
+        );
     }
 
     #[test]
