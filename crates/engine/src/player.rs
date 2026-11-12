@@ -254,6 +254,7 @@ impl<S: Sink> Worker<S> {
     }
 
     fn emit(&mut self, event: Event) {
+        log::debug!("player: {event:?}");
         self.dirty = true;
         self.pending.push(event);
     }
@@ -446,6 +447,7 @@ impl<S: Sink> Worker<S> {
     }
 
     fn handle(&mut self, cmd: Command) -> Result<()> {
+        log::debug!("player: {cmd:?}");
         match cmd {
             Command::Add(paths) => {
                 self.queue.extend(paths);
