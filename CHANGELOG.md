@@ -34,6 +34,7 @@ First development version, not yet tagged.
   subscribed clients.
 - Event-driven position: no ticks, zero wakeups while idle; clients derive
   the position from the last state event.
+- Volume mixer config (`mixer`, `mixer_control`) and software gain.
 - TOML config (`device`, `music_dir`, `socket`) with strict validation.
 - `lossless`: command line client (`status`, `queue`, `add`, `play`,
   `pause`, `toggle`, `stop`, `next`, `prev`, `seek`, `clear`, `search`,

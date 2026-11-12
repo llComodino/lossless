@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
@@ -6,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use lossless_proto::{Event, PlayState, Repeat, Status, WireError};
 
+use crate::mixer::{self, Mixer};
 use crate::output::{Output, Sink};
 use crate::queue::{Queue, Removal};
 use crate::source::Source;
@@ -41,6 +43,8 @@ pub enum Command {
         repeat: Option<Repeat>,
         random: Option<bool>,
     },
+    /// Percent, 0 to 100.
+    SetVolume(u8),
     Shutdown,
 }
 
@@ -89,10 +93,19 @@ impl Player {
         Self::spawn_with(Output::new(device))
     }
 
-    /// Start the playback thread on any sink.
+    /// Start the playback thread on any sink, without a mixer.
     pub fn spawn_with<S: Sink + Send + 'static>(sink: S) -> (Self, Receiver<Event>) {
+        Self::spawn_with_mixer(sink, None)
+    }
+
+    /// Start the playback thread on any sink. A mixer exposing a software
+    /// `gain` has it applied to every chunk; others never touch samples.
+    pub fn spawn_with_mixer<S: Sink + Send + 'static>(
+        sink: S,
+        mixer: Option<Box<dyn Mixer>>,
+    ) -> (Self, Receiver<Event>) {
         let (tx, rx) = mpsc::channel();
-        let (worker, events_rx) = Worker::new(sink, rx);
+        let (worker, events_rx) = Worker::new(sink, rx, mixer);
         let shared = Arc::clone(&worker.shared);
         let thread = thread::Builder::new()
             .name("player".into())
@@ -203,10 +216,17 @@ struct Worker<S: Sink> {
     shared: Arc<Mutex<Shared>>,
     dirty: bool,
     queue_dirty: bool,
+    mixer: Option<Box<dyn Mixer>>,
+    gain: Option<Arc<AtomicU8>>,
+    scratch: Vec<i32>,
 }
 
 impl<S: Sink> Worker<S> {
-    fn new(output: S, rx: Receiver<Envelope>) -> (Self, Receiver<Event>) {
+    fn new(
+        output: S,
+        rx: Receiver<Envelope>,
+        mixer: Option<Box<dyn Mixer>>,
+    ) -> (Self, Receiver<Event>) {
         let (events, events_rx) = mpsc::channel();
         let worker = Self {
             output,
@@ -224,6 +244,9 @@ impl<S: Sink> Worker<S> {
             shared: Arc::new(Mutex::new(Shared::new())),
             dirty: false,
             queue_dirty: false,
+            gain: mixer.as_ref().and_then(|m| m.gain()),
+            mixer,
+            scratch: Vec::new(),
         };
         (worker, events_rx)
     }
@@ -353,7 +376,19 @@ impl<S: Sink> Worker<S> {
         match source.next_chunk() {
             Ok(Some(chunk)) => {
                 let frames = chunk.len() as u64 / channels;
-                if let Err(e) = self.output.write(chunk) {
+                let gain = self
+                    .gain
+                    .as_ref()
+                    .map_or(100, |g| g.load(Ordering::Relaxed));
+                let written = if gain >= 100 {
+                    self.output.write(chunk)
+                } else {
+                    self.scratch.clear();
+                    self.scratch.extend_from_slice(chunk);
+                    mixer::apply(&mut self.scratch, gain);
+                    self.output.write(&self.scratch)
+                };
+                if let Err(e) = written {
                     self.fail(&e);
                     self.halt();
                     return;
@@ -628,6 +663,15 @@ impl<S: Sink> Worker<S> {
                     random: self.queue.random(),
                 });
             }
+            Command::SetVolume(percent) if percent > 100 => {
+                return Err(Error::BadRequest(format!(
+                    "volume {percent} out of range 0 to 100"
+                )));
+            }
+            Command::SetVolume(percent) => match self.mixer.as_mut() {
+                Some(m) => m.set(percent)?,
+                None => return Err(Error::NoMixer),
+            },
             Command::Shutdown => {}
         }
         Ok(())
@@ -643,6 +687,8 @@ mod tests {
 
     use super::{Command, Player, Shared, Worker, lock};
     use crate::fixtures::{BLOCK, Dir, Fixture, flac, write_bytes};
+    use crate::mixer::Mixer;
+    use crate::mixer::SoftwareMixer;
     use crate::output::Sink;
     use crate::queue::Queue;
     use crate::{Error, Result};
@@ -722,7 +768,14 @@ mod tests {
 
     fn worker(sink: FakeSink) -> (Worker<FakeSink>, mpsc::Receiver<Event>) {
         let (_tx, rx) = mpsc::channel();
-        Worker::new(sink, rx)
+        Worker::new(sink, rx, None)
+    }
+
+    fn mixed_worker(sink: FakeSink, p: u8) -> Worker<FakeSink> {
+        let (_tx, rx) = mpsc::channel();
+        let mut m = SoftwareMixer::new();
+        m.set(p).unwrap();
+        Worker::new(sink, rx, Some(Box::new(m))).0
     }
 
     /// Run until playback stops (bounded so a bug can't hang the test).
@@ -767,6 +820,41 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn play_one(w: &mut Worker<FakeSink>, f: &Fixture) {
+        w.handle(Command::Add {
+            paths: vec![f.path.clone()],
+            at: None,
+        })
+        .unwrap();
+        w.handle(Command::Play(None)).unwrap();
+        drive(w);
+    }
+
+    #[test]
+    fn software_gain_scales_and_full_gain_is_exact() {
+        let d = Dir::new();
+        let a = flac(&d, "a.flac", 44_100, 16, 2, BLOCK);
+        let mut w = mixed_worker(FakeSink::default(), 100);
+        play_one(&mut w, &a);
+        assert!(w.output.heard == concat(&[&a]), "100% must be untouched");
+        let mut w = mixed_worker(FakeSink::default(), 0);
+        play_one(&mut w, &a);
+        assert!(w.output.heard.iter().all(|&s| s == 0));
+        assert_eq!(w.output.heard.len(), concat(&[&a]).len());
+    }
+
+    #[test]
+    fn set_volume_validates_and_needs_a_mixer() {
+        let (mut w, _e) = worker(FakeSink::default());
+        let err = w.handle(Command::SetVolume(50)).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::NoMixer);
+        let mut w = mixed_worker(FakeSink::default(), 100);
+        let err = w.handle(Command::SetVolume(101)).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::BadRequest);
+        w.handle(Command::SetVolume(30)).unwrap();
+        assert_eq!(w.mixer.as_ref().unwrap().get().unwrap(), 30);
     }
 
     #[test]

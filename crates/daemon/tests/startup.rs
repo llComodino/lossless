@@ -65,7 +65,7 @@ fn run_serves_the_configured_socket_and_music() {
 #[test]
 fn run_falls_back_to_the_default_socket() {
     let dir = Dir::new();
-    let cfg = write_config(&dir, "device = \"null\"\n");
+    let cfg = write_config(&dir, "device = \"null\"\nmixer = \"software\"\n");
     let sock = dir.path("default.sock");
     let s = sock.clone();
     thread::spawn(move || run(&cfg, s, None));

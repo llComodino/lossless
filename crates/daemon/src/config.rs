@@ -2,7 +2,8 @@ use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use lossless_engine::MixerSetting;
+use serde::{Deserialize, Deserializer};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -16,6 +17,38 @@ pub struct Config {
     pub socket: Option<PathBuf>,
     #[serde(default)]
     pub log_level: LogLevel,
+    /// `auto` picks by device: the hardware mixer on a card, software gain
+    /// on `default`/`pipewire`/`pulse`, none on `null`.
+    #[serde(default = "default_mixer", deserialize_with = "mixer_setting")]
+    pub mixer: MixerSetting,
+    /// ALSA simple mixer control the hardware mixer drives.
+    #[serde(default = "default_control")]
+    pub mixer_control: String,
+}
+
+fn default_mixer() -> MixerSetting {
+    MixerSetting::Auto
+}
+
+fn default_control() -> String {
+    "PCM".into()
+}
+
+fn mixer_setting<'de, D: Deserializer<'de>>(d: D) -> Result<MixerSetting, D::Error> {
+    String::deserialize(d)?
+        .parse()
+        .map_err(serde::de::Error::custom)
+}
+
+fn check_control(name: &str) -> Result<()> {
+    let ok = (1..=44).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b' ' | b'_' | b'-'));
+    if !ok {
+        bail!("mixer_control {name:?} must be 1 to 44 characters of A-Z a-z 0-9 space _ -");
+    }
+    Ok(())
 }
 
 /// How much the daemon writes to stderr; nothing by default.
@@ -103,6 +136,7 @@ pub fn load_config(path: &Path) -> Result<Config> {
 pub fn parse_config(text: &str) -> Result<Config> {
     let mut cfg: Config = toml::from_str(text)?;
     check_device(&cfg.device)?;
+    check_control(&cfg.mixer_control)?;
     cfg.music_dir = cfg.music_dir.map(|d| expand_tilde(&d));
     cfg.socket = cfg.socket.map(|s| expand_tilde(&s));
     for (what, p) in [("music_dir", &cfg.music_dir), ("socket", &cfg.socket)] {
@@ -375,6 +409,33 @@ mod tests {
         )
         .unwrap();
         assert!(format!("{:#}", denied.unwrap_err()).contains("reading"));
+    }
+
+    #[test]
+    fn mixer_values() {
+        let cfg = parse_config("").unwrap();
+        assert_eq!(
+            (cfg.mixer, cfg.mixer_control.as_str()),
+            (MixerSetting::Auto, "PCM")
+        );
+        for (s, v) in [
+            ("auto", MixerSetting::Auto),
+            ("hardware", MixerSetting::Hardware),
+            ("software", MixerSetting::Software),
+            ("none", MixerSetting::None),
+        ] {
+            let cfg = parse_config(&format!("mixer = \"{s}\"")).unwrap();
+            assert_eq!(cfg.mixer, v);
+        }
+        let err = parse_config("mixer = \"loud\"").unwrap_err().to_string();
+        assert!(err.contains("auto, hardware, software, none"), "{err}");
+        let cfg = parse_config("mixer_control = \"Master Playback-1_x\"").unwrap();
+        assert_eq!(cfg.mixer_control, "Master Playback-1_x");
+        let long = format!("mixer_control = \"{}\"", "a".repeat(45));
+        for bad in ["mixer_control = \"\"", "mixer_control = \"a,b\"", &long] {
+            let err = parse_config(bad).unwrap_err().to_string();
+            assert!(err.contains("mixer_control"), "{bad}: {err}");
+        }
     }
 
     #[test]

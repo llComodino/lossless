@@ -111,6 +111,15 @@ music_dir = "~/Music"
 
 # Defaults to $XDG_RUNTIME_DIR/lossless.sock.
 # socket = "/run/user/1000/lossless.sock"
+
+# Volume: auto (default), hardware, software or none. auto uses the DAC's
+# hardware mixer on a hw/plughw/front/sysdefault card, software gain on
+# default/pipewire/pulse and none on null. Without a software mixer the
+# samples are never touched; software gain at 100% is an exact passthrough.
+# mixer = "auto"
+
+# ALSA mixer control the hardware mixer drives (1 to 44 of A-Za-z0-9 _-).
+# mixer_control = "PCM"
 ```
 
 The config is validated strictly. `device` must be a plain device name:
