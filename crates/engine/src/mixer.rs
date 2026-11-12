@@ -355,13 +355,18 @@ fn card(device: &str) -> Option<&str> {
 }
 
 impl MixerKind {
-    /// The mixer itself. A card or control that can't be opened yet is kept
-    /// closed: the player reopens it once the device opens.
+    /// The mixer itself. A card that can't be opened yet is kept closed: the
+    /// player reopens it once the device opens. A card without the control
+    /// is a config mistake and gets no mixer.
     pub fn open(self) -> Option<Box<dyn Mixer>> {
         match self {
             Self::Software => Some(Box::new(SoftwareMixer::new())),
             Self::Hardware { card, control } => match HardwareMixer::new(&card, &control) {
                 Ok(m) => Some(Box::new(m)),
+                Err(e) if alsa::mixer::Mixer::new(&format!("hw:{card}"), false).is_ok() => {
+                    log::warn!("mixer: {e}; no volume control");
+                    None
+                }
                 Err(e) => {
                     log::warn!("mixer: {e}; no volume control until it opens");
                     Some(Box::new(HardwareMixer::closed(&card, &control)))
