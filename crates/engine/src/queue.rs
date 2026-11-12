@@ -187,7 +187,7 @@ impl Queue {
         })
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn peek_next(&self) -> Option<usize> {
         self.plan(self.repeat).map(|s| s.index)
     }
