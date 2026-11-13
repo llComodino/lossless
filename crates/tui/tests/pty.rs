@@ -15,12 +15,23 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 const WAIT: Duration = Duration::from_secs(10);
 
+struct Kill(Box<dyn portable_pty::Child + Send + Sync>);
+
+impl Drop for Kill {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 fn ask(sock: &std::path::Path, command: Command) -> Body {
     let mut s = UnixStream::connect(sock).unwrap();
+    s.set_read_timeout(Some(WAIT)).unwrap();
     let req = Request { id: 1, command };
     s.write_all(encode(&req).unwrap().as_bytes()).unwrap();
     for line in BufReader::new(s).lines() {
-        if let ServerMessage::Reply { id: 1, result } = decode(&line.unwrap()).unwrap() {
+        let line = line.expect("reading the reply");
+        if let ServerMessage::Reply { id: 1, result } = decode(&line).unwrap() {
             match result {
                 Outcome::Ok(body) => return body,
                 other => panic!("{other:?}"),
@@ -84,7 +95,7 @@ fn keys_drive_the_daemon() {
     cmd.arg(&sock);
     cmd.env("XDG_RUNTIME_DIR", dir.path(""));
     cmd.env("TERM", "xterm-256color");
-    let mut child = pair.slave.spawn_command(cmd).unwrap();
+    let mut child = Kill(pair.slave.spawn_command(cmd).unwrap());
     drop(pair.slave);
 
     let mut reader = pair.master.try_clone_reader().unwrap();
@@ -118,7 +129,7 @@ fn keys_drive_the_daemon() {
     let end = Instant::now() + WAIT;
     let code = loop {
         while rx.try_recv().is_ok() {}
-        if let Some(st) = child.try_wait().unwrap() {
+        if let Some(st) = child.0.try_wait().unwrap() {
             break st;
         }
         assert!(Instant::now() < end, "tui did not exit");
