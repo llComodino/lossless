@@ -100,14 +100,14 @@ impl Dirs {
         }
     }
 
-    /// `default` first, then every regular `NAME.toml` with a valid name
+    /// `default` first, then every regular `NAME.toml` (symlinks followed) with a valid name
     /// other than `config`, sorted.
     pub fn profiles(&self) -> Vec<Profile> {
         let mut named: Vec<Profile> = std::fs::read_dir(self.config.join("lossless"))
             .into_iter()
             .flatten()
             .flatten()
-            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+            .filter(|e| std::fs::metadata(e.path()).is_ok_and(|m| m.is_file()))
             .filter_map(|e| {
                 let name = e.file_name().into_string().ok()?;
                 let stem = name.strip_suffix(".toml")?;
@@ -203,13 +203,17 @@ mod tests {
         ] {
             std::fs::write(dir.join(f), "").unwrap();
         }
+        std::fs::write(root.join("stowed.toml"), "").unwrap();
+        std::os::unix::fs::symlink(root.join("stowed.toml"), dir.join("dac.toml")).unwrap();
+        std::os::unix::fs::symlink(root.join("gone.toml"), dir.join("gone.toml")).unwrap();
+        std::os::unix::fs::symlink(dir.join("x.toml"), dir.join("y.toml")).unwrap();
         let d = Dirs {
             config: root.clone(),
             ..dirs()
         };
         let names: Vec<String> = d.profiles().iter().map(|p| p.name().to_owned()).collect();
         std::fs::remove_dir_all(&root).unwrap();
-        assert_eq!(names, ["default", "alsa", "pw"]);
+        assert_eq!(names, ["default", "alsa", "dac", "pw"]);
         let missing = Dirs {
             config: root.join("nope"),
             ..dirs()
