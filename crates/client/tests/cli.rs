@@ -25,9 +25,14 @@ impl Server {
     }
 
     fn start_with(mixer: Option<Box<dyn Mixer>>) -> Self {
+        Self::start_on("sock", mixer)
+    }
+
+    /// Listening on `dir/<socket>`.
+    fn start_on(socket: &str, mixer: Option<Box<dyn Mixer>>) -> Self {
         let dir = Dir::new();
         std::fs::create_dir_all(dir.path("music/album")).unwrap();
-        let listener = bind(&dir.path("sock")).unwrap();
+        let listener = bind(&dir.path(socket)).unwrap();
         let (player, events) = Player::spawn_with_mixer(PacedSink::default(), mixer);
         let daemon = Daemon::start(
             player,
@@ -134,6 +139,56 @@ fn help_and_bad_invocations() {
     assert!(s.err(&["--bogus"]).contains("unknown flag --bogus"));
     assert!(s.err(&[]).contains("usage: lossless"));
     assert!(s.err(&["play", "0"]).contains("indexes start at 1"));
+}
+
+/// `lossless ARGS` with `XDG_RUNTIME_DIR` set to the server's dir.
+fn in_runtime_dir(s: &Server, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_lossless"))
+        .env("XDG_RUNTIME_DIR", &s.dir.0)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn profile_flag_reaches_that_daemon() {
+    let s = Server::start_on("lossless-pw.sock", None);
+    for flag in ["-p", "--profile"] {
+        let out = in_runtime_dir(&s, &[flag, "pw", "status"]);
+        assert!(out.status.success(), "{flag}: {}", stderr(&out));
+        assert!(String::from_utf8_lossy(&out.stdout).contains("stopped"));
+    }
+    let out = in_runtime_dir(&s, &["status"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("lossless.sock"), "{}", stderr(&out));
+}
+
+#[test]
+fn socket_overrides_profile() {
+    let s = Server::start();
+    let sock = s.dir.path("sock");
+    let sock = sock.to_str().unwrap();
+    for args in [
+        &["-p", "pw", "--socket", sock, "status"][..],
+        &["--socket", sock, "-p", "pw", "status"],
+    ] {
+        let out = in_runtime_dir(&s, args);
+        assert!(out.status.success(), "{args:?}: {}", stderr(&out));
+    }
+}
+
+#[test]
+fn bad_profile_name_fails() {
+    let s = Server::start();
+    let out = in_runtime_dir(&s, &["-p", "Bad", "status"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        stderr(&out).trim(),
+        "Error: \"Bad\": profile names are 1-32 of a-z 0-9 _ -"
+    );
+    let out = in_runtime_dir(&s, &["-p"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("usage: lossless"), "{}", stderr(&out));
 }
 
 #[test]
