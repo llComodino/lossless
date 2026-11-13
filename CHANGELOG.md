@@ -56,6 +56,9 @@ First development version, not yet tagged.
 - `lossless`: command line client (`status`, `queue`, `add`, `play`,
   `pause`, `toggle`, `stop`, `next`, `prev`, `seek`, `clear`, `search`,
   `update`, `watch`, `--json`, `--socket`).
+- `losslessd-tui`: terminal UI with queue, directory, artist/album and search
+  views, profile switching and a key help screen. Event-driven: it wakes only
+  for input, daemon events and the progress clock while playing.
 - Tests: bit-exact decode and seek against generated FLAC fixtures, player
   state machine against a fake sink, daemon over a real socket, CLI as a
   real binary, property tests, and fuzz targets for requests, config files,
