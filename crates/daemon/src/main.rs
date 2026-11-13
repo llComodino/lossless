@@ -5,23 +5,31 @@ use std::process::ExitCode;
 use lossless_daemon::LogLevel;
 use lossless_proto::profile::{Dirs, Profile};
 
-const USAGE: &str = "usage: losslessd [--log-level off|warn|info|debug]";
+const USAGE: &str = "usage: losslessd [--profile NAME] [--log-level off|warn|info|debug]";
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
-    let level = match args.next().as_deref() {
-        None => None,
-        Some("--log-level") => match args.next().map(|v| v.parse::<LogLevel>()) {
-            Some(Ok(level)) => Some(level),
+    let mut level = None;
+    let mut profile = None;
+    while let Some(flag) = args.next() {
+        let value = args.next();
+        match (flag.as_str(), value) {
+            ("--log-level", Some(v)) if level.is_none() => match v.parse::<LogLevel>() {
+                Ok(l) => level = Some(l),
+                Err(_) => return usage(),
+            },
+            ("--profile", Some(v)) if profile.is_none() => match Profile::parse(&v) {
+                Ok(p) => profile = Some(p),
+                Err(e) => {
+                    eprintln!("losslessd: {e}");
+                    return ExitCode::from(2);
+                }
+            },
             _ => return usage(),
-        },
-        Some(_) => return usage(),
-    };
-    if args.next().is_some() {
-        return usage();
+        }
     }
+    let profile = profile.unwrap_or_default();
     let dirs = Dirs::from_env();
-    let profile = Profile::default();
     lossless_daemon::run(
         &dirs.config_path(&profile),
         dirs.socket(&profile),

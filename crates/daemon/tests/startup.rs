@@ -303,7 +303,7 @@ fn bad_flag_prints_usage() {
         let err = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(2), "{args:?}: {err}");
         assert!(
-            err.contains("usage: losslessd [--log-level off|warn|info|debug]"),
+            err.contains("usage: losslessd [--profile NAME] [--log-level off|warn|info|debug]"),
             "{err}"
         );
     }
@@ -398,4 +398,150 @@ fn run_restores_modes_when_every_entry_is_gone() {
     assert!(st.contains(r#""repeat":"one""#), "{st}");
     assert!(st.contains(r#""random":true"#), "{st}");
     assert!(call(&c, r#"{"id":2,"cmd":"queue"}"#).contains(r#""data":[]"#));
+}
+
+const USAGE: &str = "usage: losslessd [--profile NAME] [--log-level off|warn|info|debug]";
+
+/// A daemon child killed when dropped, so a failed assert never leaks it.
+struct Daemon(std::process::Child);
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// XDG dirs under `dir`: config `xdg`, state `state`, runtime `run`.
+fn profile_env(dir: &Dir) -> [(&'static str, PathBuf); 2] {
+    std::fs::create_dir_all(dir.path("run")).unwrap();
+    [
+        ("XDG_STATE_HOME", dir.path("state")),
+        ("XDG_RUNTIME_DIR", dir.path("run")),
+    ]
+}
+
+fn profile_config(dir: &Dir, name: &str) {
+    std::fs::create_dir_all(dir.path("xdg/lossless")).unwrap();
+    std::fs::write(
+        dir.path(&format!("xdg/lossless/{name}.toml")),
+        "device = \"null\"\n",
+    )
+    .unwrap();
+}
+
+fn spawn_profile(dir: &Dir, args: &[&str]) -> std::process::Child {
+    let env = profile_env(dir);
+    let env: Vec<(&str, &Path)> = env.iter().map(|(k, v)| (*k, v.as_path())).collect();
+    spawn_env(dir, args, &env)
+}
+
+fn start(dir: &Dir, args: &[&str]) -> Daemon {
+    Daemon(spawn_profile(dir, args))
+}
+
+fn wait_for(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "{} never appeared",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn named_profile_uses_its_own_files() {
+    let dir = Dir::new();
+    profile_config(&dir, "pw");
+    let track = dir.path("a.flac");
+    flac_at(&track, 44_100, 16, 2, BLOCK);
+    let _d = start(&dir, &["--profile", "pw"]);
+    let c = connect(&dir.path("run/lossless-pw.sock"));
+    assert!(call(&c, r#"{"id":1,"cmd":"status"}"#).contains(r#""state":"stopped""#));
+    let add = format!(r#"{{"id":2,"cmd":"add","paths":["{}"]}}"#, track.display());
+    assert!(call(&c, &add).contains("done"));
+    call(&c, r#"{"id":3,"cmd":"pause"}"#);
+    wait_for(&dir.path("state/lossless/pw/state.json"));
+    assert!(!dir.path("state/lossless/state.json").exists());
+    assert!(!dir.path("run/lossless.sock").exists());
+}
+
+#[test]
+fn two_profiles_run_side_by_side() {
+    let dir = Dir::new();
+    profile_config(&dir, "config");
+    profile_config(&dir, "pw");
+    let track = dir.path("a.flac");
+    flac_at(&track, 44_100, 16, 2, BLOCK);
+    let _a = start(&dir, &[]);
+    let _b = start(&dir, &["--profile", "pw"]);
+    let a = connect(&dir.path("run/lossless.sock"));
+    let b = connect(&dir.path("run/lossless-pw.sock"));
+    let add = format!(r#"{{"id":1,"cmd":"add","paths":["{}"]}}"#, track.display());
+    assert!(call(&b, &add).contains("done"));
+    assert!(call(&a, r#"{"id":2,"cmd":"queue"}"#).contains(r#""data":[]"#));
+    let q = call(&b, r#"{"id":3,"cmd":"queue"}"#);
+    assert!(q.contains("a.flac"), "{q}");
+}
+
+#[test]
+fn same_profile_twice_fails_at_bind() {
+    let dir = Dir::new();
+    profile_config(&dir, "pw");
+    let _first = start(&dir, &["--profile", "pw"]);
+    let sock = dir.path("run/lossless-pw.sock");
+    let c = connect(&sock);
+    let out = spawn_profile(&dir, &["--profile", "pw"])
+        .wait_with_output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("another daemon is listening"), "{err}");
+    assert!(call(&c, r#"{"id":1,"cmd":"status"}"#).contains("stopped"));
+}
+
+#[test]
+fn bad_profile_name_is_refused() {
+    let dir = Dir::new();
+    let out = spawn_with(&dir, &["--profile", "Bad"])
+        .wait_with_output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert_eq!(
+        err.trim_end(),
+        "losslessd: \"Bad\": profile names are 1-32 of a-z 0-9 _ -"
+    );
+}
+
+#[test]
+fn flags_in_any_order() {
+    for args in [
+        &["--profile", "pw", "--log-level", "warn"][..],
+        &["--log-level", "warn", "--profile", "pw"],
+    ] {
+        let dir = Dir::new();
+        profile_config(&dir, "pw");
+        let _d = start(&dir, args);
+        let c = connect(&dir.path("run/lossless-pw.sock"));
+        assert!(
+            call(&c, r#"{"id":1,"cmd":"status"}"#).contains("stopped"),
+            "{args:?}"
+        );
+    }
+    let dir = Dir::new();
+    for args in [
+        &["--profile", "pw", "--profile", "pw"][..],
+        &["--profile"],
+        &["--log-level", "warn", "--profile"],
+        &["--log-level", "warn", "--log-level", "warn"],
+    ] {
+        let out = spawn_with(&dir, args).wait_with_output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {err}");
+        assert!(err.contains(USAGE), "{args:?}: {err}");
+    }
 }
