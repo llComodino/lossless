@@ -232,6 +232,17 @@ mod tests {
     }
 
     #[test]
+    fn long_footer_keeps_its_cut_end_and_the_hint() {
+        let mut a = app("default", None);
+        a.footer = Some(format!("error: {}", "d/".repeat(60)));
+        let (l, _) = render(&a);
+        let row = l[23].trim_end();
+        assert!(row.ends_with("... ?: keys"), "{row:?}");
+        let msg = row.trim_end_matches("?: keys").trim_end();
+        assert!(msg.starts_with("error: d/d/") && msg.ends_with("..."), "{row:?}");
+    }
+
+    #[test]
     fn help_lists_every_key() {
         let mut a = app("default", None);
         let (without, _) = render(&a);
