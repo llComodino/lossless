@@ -110,8 +110,9 @@ impl Conn {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::sync::Arc;
-    use std::sync::mpsc::{self, Receiver};
+    use std::sync::mpsc::{self, Receiver, Sender};
     use std::time::Duration;
 
     use lossless_daemon::{Daemon, bind};
@@ -159,16 +160,40 @@ mod tests {
         }
     }
 
-    fn next(rx: &Receiver<Msg>) -> Msg {
-        rx.recv_timeout(WAIT).expect("no message")
+    struct Inbox {
+        rx: Receiver<Msg>,
+        events: RefCell<Vec<(u32, Event)>>,
+        wait: Duration,
     }
 
-    fn reply(rx: &Receiver<Msg>, generation: u32, want: u64) -> Outcome {
+    fn channel() -> (Sender<Msg>, Inbox) {
+        let (tx, rx) = mpsc::channel();
+        (tx, Inbox::new(rx, WAIT))
+    }
+
+    impl Inbox {
+        fn new(rx: Receiver<Msg>, wait: Duration) -> Self {
+            Self {
+                rx,
+                events: RefCell::default(),
+                wait,
+            }
+        }
+    }
+
+    fn next(inbox: &Inbox) -> Msg {
+        inbox.rx.recv_timeout(inbox.wait).expect("no message")
+    }
+
+    fn reply(inbox: &Inbox, generation: u32, want: u64) -> Outcome {
         loop {
-            match next(rx) {
+            match next(inbox) {
                 Msg::Server(g, ServerMessage::Reply { id, result }) if id == want => {
                     assert_eq!(g, generation);
                     return result;
+                }
+                Msg::Server(g, ServerMessage::Event { event }) => {
+                    inbox.events.borrow_mut().push((g, event));
                 }
                 Msg::Disconnected(g) => assert_ne!(g, generation, "disconnected"),
                 _ => {}
@@ -176,12 +201,18 @@ mod tests {
         }
     }
 
-    fn queue_changed(rx: &Receiver<Msg>, generation: u32) {
+    fn queue_changed(inbox: &Inbox, generation: u32) {
+        let hit = |(g, e): &(u32, Event)| {
+            assert_eq!(*g, generation);
+            *e == Event::QueueChanged
+        };
+        if inbox.events.borrow().iter().any(hit) {
+            return;
+        }
         loop {
-            match next(rx) {
+            match next(inbox) {
                 Msg::Server(g, ServerMessage::Event { event }) => {
-                    assert_eq!(g, generation);
-                    if event == Event::QueueChanged {
+                    if hit(&(g, event)) {
                         return;
                     }
                 }
@@ -191,6 +222,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn event_before_reply_is_not_lost() {
+        let (tx, rx) = mpsc::channel();
+        let inbox = Inbox::new(rx, Duration::from_millis(200));
+        tx.send(Msg::Server(
+            1,
+            ServerMessage::Event {
+                event: Event::QueueChanged,
+            },
+        ))
+        .unwrap();
+        tx.send(Msg::Server(
+            1,
+            ServerMessage::Reply {
+                id: 7,
+                result: Outcome::Ok(Body::Done),
+            },
+        ))
+        .unwrap();
+        assert!(is_done(&reply(&inbox, 1, 7)));
+        queue_changed(&inbox, 1);
+    }
+
     fn is_done(o: &Outcome) -> bool {
         matches!(o, Outcome::Ok(Body::Done))
     }
@@ -198,7 +252,7 @@ mod tests {
     #[test]
     fn requests_get_matching_replies() {
         let s = Server::new();
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = channel();
         let mut c = Conn::connect(&s.sock(), tx).unwrap();
         let a = c.send(Command::Status).unwrap();
         let b = c.send(Command::Queue).unwrap();
@@ -216,7 +270,7 @@ mod tests {
     #[test]
     fn events_arrive_after_subscribe() {
         let s = Server::new();
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = channel();
         let mut c = Conn::connect(&s.sock(), tx).unwrap();
         let r = c.resync().unwrap();
         assert!(is_done(&reply(&rx, c.generation(), r.subscribe)));
@@ -232,7 +286,7 @@ mod tests {
         let a = Server::new();
         let b = Server::new();
         let track = flac_at(&b.dir.path("music/one.flac"), 44_100, 16, 2, BLOCK).path;
-        let (btx, brx) = mpsc::channel();
+        let (btx, brx) = channel();
         let mut seed = Conn::connect(&b.sock(), btx).unwrap();
         let id = seed
             .send(Command::Add {
@@ -241,7 +295,7 @@ mod tests {
             })
             .unwrap();
         assert!(is_done(&reply(&brx, 1, id)));
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = channel();
         let mut c = Conn::connect(&a.sock(), tx).unwrap();
         assert_eq!(c.generation(), 1);
         let r = c.switch(&b.sock()).unwrap();
@@ -260,7 +314,7 @@ mod tests {
     #[test]
     fn reconnect_resubscribes_and_refetches() {
         let s = Server::new();
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = channel();
         let mut c = Conn::connect(&s.sock(), tx).unwrap();
         let first = c.generation();
         s.daemon.shutdown();
