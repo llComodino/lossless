@@ -11,7 +11,14 @@ const MIN_THREE: u16 = 60;
 
 pub fn draw(cols: &Columns<Entry>, f: &mut Frame, area: Rect) {
     if area.width < MIN_THREE {
-        list(&cols.items, Some(cols.selected), Style::new(), f, area);
+        list(
+            &cols.items,
+            Some(cols.selected),
+            cols.offset,
+            Style::new(),
+            f,
+            area,
+        );
         return;
     }
     let [parent, current, preview] = Layout::horizontal([
@@ -26,15 +33,24 @@ pub fn draw(cols: &Columns<Entry>, f: &mut Frame, area: Rect) {
             .iter()
             .position(|e| matches!(e, Entry::Dir { name: n, .. } if n == name))
     });
+    let rows = usize::from(parent.height);
     list(
         &cols.parent,
         came_from,
+        came_from.map_or(0, |s| (s + 1).saturating_sub(rows)),
         Style::new().add_modifier(Modifier::BOLD),
         f,
         parent,
     );
-    list(&cols.items, Some(cols.selected), Style::new(), f, current);
-    list(&cols.preview, None, Style::new(), f, preview);
+    list(
+        &cols.items,
+        Some(cols.selected),
+        cols.offset,
+        Style::new(),
+        f,
+        current,
+    );
+    list(&cols.preview, None, 0, Style::new(), f, preview);
 }
 
 fn label(e: &Entry) -> String {
@@ -44,10 +60,16 @@ fn label(e: &Entry) -> String {
     }
 }
 
-fn list(items: &[Entry], selected: Option<usize>, mark: Style, f: &mut Frame, area: Rect) {
+fn list(
+    items: &[Entry],
+    selected: Option<usize>,
+    offset: usize,
+    mark: Style,
+    f: &mut Frame,
+    area: Rect,
+) {
     let height = usize::from(area.height);
     let width = usize::from(area.width);
-    let offset = selected.map_or(0, |s| (s + 1).saturating_sub(height));
     let style = if mark == Style::new() {
         Style::new().add_modifier(Modifier::REVERSED)
     } else {

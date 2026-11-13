@@ -13,5 +13,6 @@ pub fn draw(app: &App, f: &mut Frame, area: Rect) {
         Paragraph::new(format!("/ {}{cursor}", app.search.query)),
         query,
     );
-    track_rows(&app.search.results, app.search.selected, None, f, results);
+    let s = &app.search;
+    track_rows(&s.results, s.selected, s.offset, None, f, results);
 }

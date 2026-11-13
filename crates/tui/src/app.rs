@@ -61,6 +61,8 @@ pub struct Columns<T> {
     pub parent: Vec<T>,
     pub items: Vec<T>,
     pub selected: usize,
+    /// First visible row of `items`.
+    pub offset: usize,
     pub preview: Vec<Entry>,
 }
 
@@ -71,6 +73,7 @@ impl<T> Default for Columns<T> {
             parent: Vec::new(),
             items: Vec::new(),
             selected: 0,
+            offset: 0,
             preview: Vec::new(),
         }
     }
@@ -82,6 +85,7 @@ pub struct Search {
     pub editing: bool,
     pub results: Vec<Track>,
     pub selected: usize,
+    pub offset: usize,
 }
 
 pub struct App {
@@ -93,6 +97,7 @@ pub struct App {
     pub status: Option<Status>,
     pub queue: Vec<Track>,
     pub queue_selected: usize,
+    pub queue_offset: usize,
     pub clock: Clock,
     pub dirs: Columns<Entry>,
     pub artists: Columns<Entry>,
@@ -103,6 +108,8 @@ pub struct App {
     pub quit: bool,
     /// Rows visible in the list, set from the terminal size.
     pub page: usize,
+    /// The next queue reply selects the playing entry.
+    first_queue: bool,
     pending: HashMap<u64, Pending>,
 }
 
@@ -121,6 +128,7 @@ impl App {
             status: None,
             queue: Vec::new(),
             queue_selected: 0,
+            queue_offset: 0,
             clock: stopped(),
             dirs: Columns::default(),
             artists: Columns::default(),
@@ -130,6 +138,7 @@ impl App {
             help: false,
             quit: false,
             page: 10,
+            first_queue: false,
             pending: HashMap::new(),
         }
     }
@@ -148,6 +157,7 @@ impl App {
         self.expect(resync.subscribe, Pending::Subscribe);
         self.expect(resync.status, Pending::Status);
         self.expect(resync.queue, Pending::Queue);
+        self.first_queue = true;
     }
 
     /// The next key retries the same socket (`Out::Reconnect`).
@@ -178,14 +188,35 @@ impl App {
         self.clock = stopped();
         self.queue.clear();
         self.queue_selected = 0;
+        self.queue_offset = 0;
         for cols in [&mut self.dirs, &mut self.artists] {
             cols.parent.clear();
             cols.items.clear();
             cols.preview.clear();
             cols.selected = 0;
+            cols.offset = 0;
         }
         self.search.results.clear();
         self.search.selected = 0;
+        self.search.offset = 0;
+    }
+
+    /// Keeps each list's window on its selection, moving it only when the
+    /// selection would leave it, and clamps it after a shrink or resize.
+    pub fn follow(&mut self) {
+        let page = self.page.max(1);
+        scroll(
+            &mut self.queue_offset,
+            self.queue_selected,
+            self.queue.len(),
+            page,
+        );
+        for cols in [&mut self.dirs, &mut self.artists] {
+            scroll(&mut cols.offset, cols.selected, cols.items.len(), page);
+        }
+        let rows = page.saturating_sub(1).max(1);
+        let s = &mut self.search;
+        scroll(&mut s.offset, s.selected, s.results.len(), rows);
     }
 
     fn columns(&mut self, view: View) -> &mut Columns<Entry> {
@@ -476,6 +507,10 @@ impl App {
             }
             (Pending::Queue, Body::Queue(q)) => {
                 self.queue = q;
+                if std::mem::take(&mut self.first_queue) {
+                    let playing = self.status.as_ref().and_then(|s| s.index);
+                    self.queue_selected = playing.unwrap_or(self.queue_selected);
+                }
                 self.queue_selected = clamp(self.queue_selected, self.queue.len());
                 vec![]
             }
@@ -615,6 +650,15 @@ fn next_repeat(status: Option<&Status>) -> Repeat {
     }
 }
 
+fn scroll(offset: &mut usize, selected: usize, len: usize, rows: usize) {
+    if selected < *offset {
+        *offset = selected;
+    } else if selected >= *offset + rows {
+        *offset = selected + 1 - rows;
+    }
+    *offset = (*offset).min(len.saturating_sub(rows));
+}
+
 fn clamp(i: usize, len: usize) -> usize {
     i.min(len.saturating_sub(1))
 }
@@ -664,7 +708,7 @@ fn list(view: View, path: Vec<String>, column: Col, select: Option<String>) -> O
 }
 
 pub fn update(app: &mut App, msg: Msg, now: Instant) -> Vec<Out> {
-    match msg {
+    let outs = match msg {
         Msg::Server(g, _) | Msg::Disconnected(g) if g != app.generation => vec![],
         Msg::Server(_, ServerMessage::Reply { id, result }) => app.reply(id, result, now),
         Msg::Server(_, ServerMessage::Event { event }) => app.event(event, now),
@@ -677,7 +721,9 @@ pub fn update(app: &mut App, msg: Msg, now: Instant) -> Vec<Out> {
         }
         Msg::Key(key) => app.key(key, now),
         Msg::Resize | Msg::Tick => vec![],
-    }
+    };
+    app.follow();
+    outs
 }
 
 #[cfg(test)]
@@ -1411,6 +1457,86 @@ mod tests {
             .map(|x| t.backend().buffer()[(x, 0)].symbol().to_string())
             .collect();
         assert!(!top.contains("playing"), "{top:?}");
+    }
+
+    fn long_queue(len: usize) -> App {
+        let mut app = app();
+        app.queue = (0..len).map(|i| track(&format!("q{i}"))).collect();
+        app.queue_selected = 0;
+        app.page = 10;
+        app
+    }
+
+    fn press_n(app: &mut App, c: char, n: usize) {
+        for _ in 0..n {
+            run(app, ch(c));
+        }
+    }
+
+    #[test]
+    fn moving_up_inside_the_window_keeps_the_offset() {
+        let mut app = long_queue(40);
+        press_n(&mut app, 'j', 25);
+        assert_eq!((app.queue_selected, app.queue_offset), (25, 16));
+        press_n(&mut app, 'k', 3);
+        assert_eq!((app.queue_selected, app.queue_offset), (22, 16));
+    }
+
+    #[test]
+    fn moving_past_the_bottom_scrolls_by_one() {
+        let mut app = long_queue(40);
+        press_n(&mut app, 'j', 9);
+        assert_eq!((app.queue_selected, app.queue_offset), (9, 0));
+        press_n(&mut app, 'j', 1);
+        assert_eq!((app.queue_selected, app.queue_offset), (10, 1));
+    }
+
+    #[test]
+    fn a_shrinking_list_clamps_the_offset() {
+        let mut app = long_queue(40);
+        app.queue_selected = 39;
+        app.follow();
+        assert_eq!(app.queue_offset, 30);
+        app.generation = 1;
+        app.expect(5, Pending::Queue);
+        let q = (0..12).map(|i| track(&format!("n{i}"))).collect();
+        run(&mut app, reply(1, 5, Outcome::Ok(Body::Queue(q))));
+        assert_eq!((app.queue_selected, app.queue_offset), (11, 2));
+        app.page = 20;
+        app.follow();
+        assert_eq!(app.queue_offset, 0);
+    }
+
+    #[test]
+    fn the_first_queue_reply_selects_the_playing_entry() {
+        let mut app = long_queue(0);
+        app.connected(
+            2,
+            &Resync {
+                subscribe: 10,
+                status: 11,
+                queue: 12,
+            },
+        );
+        run(
+            &mut app,
+            reply(
+                2,
+                11,
+                Outcome::Ok(Body::Status(Box::new(status(Some(30), None)))),
+            ),
+        );
+        let q = (0..40).map(|i| track(&format!("q{i}"))).collect();
+        run(&mut app, reply(2, 12, Outcome::Ok(Body::Queue(q))));
+        assert_eq!(app.queue_selected, 30);
+        assert!(app.queue_offset <= 30 && 30 < app.queue_offset + app.page);
+        app.queue_selected = 5;
+        app.expect(13, Pending::Queue);
+        run(
+            &mut app,
+            reply(2, 13, Outcome::Ok(Body::Queue(vec![track("a"); 40]))),
+        );
+        assert_eq!(app.queue_selected, 5);
     }
 
     #[test]

@@ -47,6 +47,7 @@ fn no_daemon(path: &std::path::Path) -> ExitCode {
 fn set_page(app: &mut App, terminal: &Terminal<CrosstermBackend<Stdout>>) {
     if let Ok(size) = terminal.size() {
         app.page = usize::from(size.height.saturating_sub(CHROME_ROWS)).max(1);
+        app.follow();
     }
 }
 

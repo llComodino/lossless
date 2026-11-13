@@ -9,7 +9,14 @@ use crate::app::App;
 
 pub fn draw(app: &App, f: &mut Frame, area: Rect) {
     let playing = app.status.as_ref().and_then(|s| s.index);
-    track_rows(&app.queue, app.queue_selected, playing, f, area);
+    track_rows(
+        &app.queue,
+        app.queue_selected,
+        app.queue_offset,
+        playing,
+        f,
+        area,
+    );
 }
 
 /// Numbered track rows (title, duration, format), `selected` reversed and
@@ -17,12 +24,12 @@ pub fn draw(app: &App, f: &mut Frame, area: Rect) {
 pub fn track_rows(
     tracks: &[Track],
     selected: usize,
+    offset: usize,
     playing: Option<usize>,
     f: &mut Frame,
     area: Rect,
 ) {
     let height = usize::from(area.height);
-    let offset = (selected + 1).saturating_sub(height);
     let width = usize::from(area.width);
     let lines: Vec<Line> = tracks
         .iter()
