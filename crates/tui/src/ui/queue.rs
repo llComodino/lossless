@@ -1,11 +1,10 @@
-use lossless_proto::fit;
+use lossless_proto::{clock, describe, fit, rate_str};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 
-use super::{clock, describe, format_str};
 use crate::app::App;
 
 pub fn draw(app: &App, f: &mut Frame, area: Rect) {
@@ -22,7 +21,7 @@ pub fn draw(app: &App, f: &mut Frame, area: Rect) {
         .map(|(i, t)| {
             let mark = if playing == Some(i) { '\u{25b6}' } else { ' ' };
             let dur = t.duration_ms.map_or_else(|| "?".into(), clock);
-            let fmt = t.format.as_ref().map_or_else(String::new, format_str);
+            let fmt = t.format.as_ref().map_or_else(String::new, rate_str);
             let tail = format!("  {dur:>6}  {fmt:<14}");
             let title = width.saturating_sub(7 + tail.chars().count());
             let row = format!("{mark} {:>3}  {}{tail}", i + 1, fit(&describe(t), title));

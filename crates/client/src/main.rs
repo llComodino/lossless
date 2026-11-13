@@ -5,12 +5,12 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
-use lossless_proto::fit;
 use lossless_proto::profile::{Dirs, Profile};
 use lossless_proto::{
-    Body, Command, Entry, Event, Outcome, PlayState, Repeat, Request, ServerMessage, Status,
-    StreamFormat, Track, decode, encode,
+    Body, Command, Entry, Event, Outcome, PlayState, Repeat, Request, ServerMessage, Status, Track,
+    decode, encode,
 };
+use lossless_proto::{clock, describe, fit, format_str};
 
 /// `println!` that exits quietly when stdout is closed (e.g. piped to `head`)
 /// instead of panicking.
@@ -270,24 +270,6 @@ fn volume(v: Volume, reader: &mut impl BufRead, writer: &mut impl Write, json: b
     ask(reader, writer, 2, Command::SetVolume { percent }, json).map(drop)
 }
 
-fn clock(ms: u64) -> String {
-    let s = ms / 1000;
-    if s >= 3600 {
-        format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
-    } else {
-        format!("{}:{:02}", s / 60, s % 60)
-    }
-}
-
-fn format_str(f: &StreamFormat) -> String {
-    format!(
-        "{}-bit/{} kHz/{}ch",
-        f.bits,
-        f64::from(f.rate) / 1000.0,
-        f.channels
-    )
-}
-
 fn modes(repeat: Repeat, random: bool) -> String {
     let repeat = match repeat {
         Repeat::Off => "off",
@@ -319,24 +301,6 @@ fn print_status(s: &Status) {
     if let Some(t) = &s.track {
         out!("{}", describe(t));
     }
-}
-
-/// "Artist - Title (Album)", falling back to the file name.
-fn describe(t: &Track) -> String {
-    let name = || {
-        std::path::Path::new(&t.path)
-            .file_name()
-            .map_or_else(|| t.path.clone(), |n| n.to_string_lossy().into_owned())
-    };
-    let mut s = match (&t.artist, &t.title) {
-        (Some(a), Some(ti)) => format!("{a} - {ti}"),
-        (None, Some(ti)) => ti.clone(),
-        _ => name(),
-    };
-    if let Some(album) = &t.album {
-        s.push_str(&format!(" ({album})"));
-    }
-    s
 }
 
 fn track_line(n: usize, t: &Track) -> String {
@@ -462,6 +426,7 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lossless_proto::StreamFormat;
 
     #[test]
     fn times() {

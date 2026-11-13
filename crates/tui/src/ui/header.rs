@@ -1,11 +1,10 @@
 use std::time::Instant;
 
-use lossless_proto::{PlayState, Repeat};
+use lossless_proto::{PlayState, Repeat, clock, describe, rate_str};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::widgets::Paragraph;
 
-use super::{clock, describe, format_str};
 use crate::app::App;
 
 pub fn draw(app: &App, now: Instant, f: &mut Frame, area: Rect) {
@@ -32,10 +31,7 @@ pub fn draw(app: &App, now: Instant, f: &mut Frame, area: Rect) {
     }
     f.render_widget(Paragraph::new(line), l1);
     if let Some(o) = &s.output {
-        f.render_widget(
-            Paragraph::new(format_str(o)).alignment(Alignment::Right),
-            l1,
-        );
+        f.render_widget(Paragraph::new(rate_str(o)).alignment(Alignment::Right), l1);
     }
     if let Some(t) = &s.track {
         f.render_widget(Paragraph::new(describe(t)), l2);

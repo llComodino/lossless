@@ -5,7 +5,6 @@ mod queue;
 
 use std::time::Instant;
 
-use lossless_proto::{StreamFormat, Track};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Modifier, Style};
@@ -60,34 +59,6 @@ fn tabs(current: View) -> Line<'static> {
     }
     spans.pop();
     Line::from(spans)
-}
-
-pub(super) fn clock(ms: u64) -> String {
-    let s = ms / 1000;
-    if s >= 3600 {
-        format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
-    } else {
-        format!("{}:{:02}", s / 60, s % 60)
-    }
-}
-
-pub(super) fn format_str(f: &StreamFormat) -> String {
-    format!("{}-bit/{} kHz", f.bits, f64::from(f.rate) / 1000.0)
-}
-
-/// "Artist - Title (Album)", falling back to the file name.
-pub(super) fn describe(t: &Track) -> String {
-    let mut s = match (&t.artist, &t.title) {
-        (Some(a), Some(ti)) => format!("{a} - {ti}"),
-        (None, Some(ti)) => ti.clone(),
-        _ => std::path::Path::new(&t.path)
-            .file_name()
-            .map_or_else(|| t.path.clone(), |n| n.to_string_lossy().into_owned()),
-    };
-    if let Some(album) = &t.album {
-        s.push_str(&format!(" ({album})"));
-    }
-    s
 }
 
 #[cfg(test)]

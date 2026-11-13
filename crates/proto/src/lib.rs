@@ -4,7 +4,10 @@
 //! Clients send `Request`s; the server sends `ServerMessage`s (replies, and
 //! events once the client has sent `Subscribe`).
 
+mod display;
 pub mod profile;
+
+pub use display::{clock, describe, format_str, rate_str};
 
 use serde::{Deserialize, Serialize};
 
