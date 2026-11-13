@@ -239,7 +239,10 @@ mod tests {
         let row = l[23].trim_end();
         assert!(row.ends_with("... ?: keys"), "{row:?}");
         let msg = row.trim_end_matches("?: keys").trim_end();
-        assert!(msg.starts_with("error: d/d/") && msg.ends_with("..."), "{row:?}");
+        assert!(
+            msg.starts_with("error: d/d/") && msg.ends_with("..."),
+            "{row:?}"
+        );
     }
 
     #[test]

@@ -160,6 +160,17 @@ impl App {
         });
     }
 
+    /// A lost daemon plays nothing: the clock freezes where it was.
+    fn stop_clock(&mut self, now: Instant) {
+        let position = self.clock.position(now);
+        let duration = self.status.as_ref().and_then(|s| s.duration_ms);
+        self.clock = Clock::from_event(PlayState::Stopped, position, duration, now);
+        if let Some(s) = &mut self.status {
+            s.state = PlayState::Stopped;
+            s.position_ms = position;
+        }
+    }
+
     fn reset(&mut self, generation: u32) {
         self.generation = generation;
         self.pending.clear();
@@ -660,6 +671,7 @@ pub fn update(app: &mut App, msg: Msg, now: Instant) -> Vec<Out> {
         Msg::Disconnected(_) => {
             app.connected = false;
             app.pending.clear();
+            app.stop_clock(now);
             app.footer = Some(DISCONNECTED.into());
             vec![]
         }
@@ -1376,6 +1388,29 @@ mod tests {
         run(&mut app, ch('j'));
         run(&mut app, reply(1, 99, Outcome::Err(err)));
         assert_eq!(app.footer, None);
+    }
+
+    #[test]
+    fn a_lost_daemon_stops_the_clock() {
+        use std::time::Duration;
+
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = app();
+        let now = Instant::now();
+        app.status.as_mut().unwrap().state = PlayState::Playing;
+        app.clock = Clock::from_event(PlayState::Playing, 10_000, Some(60_000), now);
+        assert!(app.clock.next_wake(now).is_some());
+        update(&mut app, Msg::Disconnected(1), now);
+        assert_eq!(app.clock.next_wake(now), None);
+        assert_eq!(app.clock.position(now + Duration::from_secs(5)), 10_000);
+        assert_eq!(app.queue.len(), 3);
+        let mut t = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        t.draw(|f| crate::ui::draw(&app, f)).unwrap();
+        let top: String = (0..80)
+            .map(|x| t.backend().buffer()[(x, 0)].symbol().to_string())
+            .collect();
+        assert!(!top.contains("playing"), "{top:?}");
     }
 
     #[test]
