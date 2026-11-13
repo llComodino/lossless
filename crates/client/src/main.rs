@@ -5,9 +5,10 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
+use lossless_proto::profile::{Dirs, Profile};
 use lossless_proto::{
     Body, Command, Entry, Event, Outcome, PlayState, Repeat, Request, ServerMessage, Status,
-    StreamFormat, Track, decode, default_socket, encode,
+    StreamFormat, Track, decode, encode,
 };
 
 /// `println!` that exits quietly when stdout is closed (e.g. piped to `head`)
@@ -24,7 +25,7 @@ macro_rules! out {
     }};
 }
 
-const USAGE: &str = "usage: lossless [--json] [--socket PATH] <command>
+const USAGE: &str = "usage: lossless [--json] [-p NAME | --socket PATH] <command>
 
   status                 state, position, output format
   queue                  list the queue
@@ -384,11 +385,15 @@ fn main() -> Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let mut json = false;
     let mut socket: Option<PathBuf> = None;
-    while let Some(flag) = args.first().filter(|a| a.starts_with("--")).cloned() {
+    let mut profile = Profile::default();
+    while let Some(flag) = args.first().filter(|a| a.starts_with('-')).cloned() {
         args.remove(0);
         match flag.as_str() {
             "--json" => json = true,
             "--socket" if !args.is_empty() => socket = Some(PathBuf::from(args.remove(0))),
+            "-p" | "--profile" if !args.is_empty() => {
+                profile = Profile::parse(&args.remove(0)).map_err(|e| anyhow!(e))?;
+            }
             "--help" => {
                 out!("{USAGE}");
                 return Ok(());
@@ -405,7 +410,7 @@ fn main() -> Result<()> {
         None => parse(&args)?,
     };
     let watch = command == Command::Subscribe;
-    let socket = socket.unwrap_or_else(default_socket);
+    let socket = socket.unwrap_or_else(|| Dirs::from_env().socket(&profile));
     let mut stream = UnixStream::connect(&socket)
         .with_context(|| format!("connecting to {} (is losslessd running?)", socket.display()))?;
     if let Some(v) = vol {

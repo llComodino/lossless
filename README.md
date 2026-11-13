@@ -152,6 +152,37 @@ startup, before it binds the socket.
 While playing, the position is saved on events only (no timer), so after a
 crash playback resumes from the last pause, seek or track change.
 
+### Profiles
+
+One daemon drives one output. To have more (the DAC bit-perfect, and
+PipeWire for when you share the sound card with other programs), run one
+daemon per profile: `losslessd --profile NAME`, with `NAME` 1 to 32 of
+`a-z 0-9 _ -`. Without the flag the profile is `default`, which uses the
+paths above. A named profile gets its own:
+
+| | path |
+|---|---|
+| config | `$XDG_CONFIG_HOME/lossless/NAME.toml` (missing file = defaults) |
+| state | `$XDG_STATE_HOME/lossless/NAME/state.json` |
+| socket | `$XDG_RUNTIME_DIR/lossless-NAME.sock`, unless the config sets `socket` |
+
+For the DAC in `config.toml` plus PipeWire:
+
+```toml
+# ~/.config/lossless/pw.toml
+device = "pipewire"
+music_dir = "~/Music"
+```
+
+Run `losslessd --profile pw` as a second supervised service (a copy of the
+one below with `--profile pw` added, and its own log directory), and reach
+it with `lossless -p pw status`. Both daemons can play at once; a second
+daemon for the same profile refuses to start while the first is listening.
+
+Clients never read the daemon's config: they find a profile's socket from
+its name alone. A profile whose config sets `socket` needs `--socket PATH`
+in clients instead of `-p`.
+
 ### Keeping PipeWire or PulseAudio off the DAC
 
 For exclusive, bit-perfect access the sound server must not open the DAC.
@@ -180,6 +211,7 @@ still reach stderr, and `--log-level warn|info|debug` turns logging on (see
 ```sh
 losslessd
 losslessd --log-level info
+losslessd --profile pw           # a second output, see Profiles
 ```
 
 and drive it with the client:
@@ -208,6 +240,7 @@ lossless queue
 lossless clear
 lossless watch                   # print events until interrupted
 lossless --json status           # raw protocol replies
+lossless -p pw status            # the pw profile's daemon (--socket wins)
 ```
 
 `status` shows what the device was actually opened with, then the modes and

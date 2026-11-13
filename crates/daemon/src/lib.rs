@@ -26,7 +26,7 @@ pub mod state;
 
 use config::expand_tilde;
 pub use config::{
-    Config, LogLevel, MAX_CONFIG, check_device, check_path, config_path, load_config, parse_config,
+    Config, LogLevel, MAX_CONFIG, check_device, check_path, load_config, parse_config,
 };
 pub use error::RequestError;
 pub use logger::init_logging;
