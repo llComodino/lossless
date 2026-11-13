@@ -2,7 +2,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::widgets::{Block, Clear, Paragraph};
 
-const KEYS: [(&str, &str); 17] = [
+pub(super) const KEYS: [(&str, &str); 17] = [
     ("j/k, g/G, Ctrl-d/Ctrl-u", "move, first/last, half page"),
     ("h/l", "column left/right; l on a track adds it"),
     ("1-4, Tab/S-Tab", "switch view"),
@@ -22,12 +22,21 @@ const KEYS: [(&str, &str); 17] = [
     ("?, q", "key help, quit"),
 ];
 
+pub(super) fn row(k: &str, a: &str) -> String {
+    format!("{k:<26}{a}")
+}
+
 pub fn draw(f: &mut Frame) {
     let area = f.area();
-    let w = 72.min(area.width);
+    let widest = KEYS
+        .iter()
+        .map(|(k, a)| row(k, a).chars().count())
+        .max()
+        .unwrap_or(0);
+    let w = (widest as u16 + 2).min(area.width);
     let h = (KEYS.len() as u16 + 2).min(area.height);
     let rect = Rect::new((area.width - w) / 2, (area.height - h) / 2, w, h);
-    let lines: Vec<String> = KEYS.iter().map(|(k, a)| format!("{k:<26}{a}")).collect();
+    let lines: Vec<String> = KEYS.iter().map(|(k, a)| row(k, a)).collect();
     f.render_widget(Clear, rect);
     f.render_widget(
         Paragraph::new(lines.join("\n")).block(Block::bordered().title(" keys ")),

@@ -232,9 +232,23 @@ mod tests {
     #[test]
     fn help_lists_every_key() {
         let mut a = app("default", None);
+        let (without, _) = render(&a);
         a.help = true;
         let (l, _) = render(&a);
-        let screen = l.join("\n");
+        for (k, d) in super::help::KEYS {
+            let row = super::help::row(k, d);
+            assert!(
+                l.iter().any(|r| r.contains(&row)),
+                "row {row:?} missing:\n{}",
+                l.join("\n")
+            );
+            assert!(!without.iter().any(|r| r.contains(&row)));
+        }
+        let keys: String = super::help::KEYS
+            .iter()
+            .map(|(k, _)| *k)
+            .collect::<Vec<_>>()
+            .join(" | ");
         for k in [
             "j/k",
             "g/G",
@@ -258,7 +272,7 @@ mod tests {
             "?",
             "q",
         ] {
-            assert!(screen.contains(k), "{k} missing:\n{screen}");
+            assert!(keys.contains(k), "{k} not in the key table");
         }
     }
 }
