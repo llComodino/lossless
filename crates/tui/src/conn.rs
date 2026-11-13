@@ -116,7 +116,7 @@ mod tests {
 
     use lossless_daemon::{Daemon, bind};
     use lossless_engine::Player;
-    use lossless_engine::fixtures::{Dir, PacedSink};
+    use lossless_engine::fixtures::{BLOCK, Dir, PacedSink, flac_at};
     use lossless_proto::{Body, Event, Outcome};
 
     use super::*;
@@ -231,6 +231,16 @@ mod tests {
     fn switch_moves_to_another_daemon() {
         let a = Server::new();
         let b = Server::new();
+        let track = flac_at(&b.dir.path("music/one.flac"), 44_100, 16, 2, BLOCK).path;
+        let (btx, brx) = mpsc::channel();
+        let mut seed = Conn::connect(&b.sock(), btx).unwrap();
+        let id = seed
+            .send(Command::Add {
+                paths: vec![track.to_string_lossy().into_owned()],
+                at: None,
+            })
+            .unwrap();
+        assert!(is_done(&reply(&brx, 1, id)));
         let (tx, rx) = mpsc::channel();
         let mut c = Conn::connect(&a.sock(), tx).unwrap();
         assert_eq!(c.generation(), 1);
@@ -238,7 +248,10 @@ mod tests {
         assert_eq!(c.generation(), 2);
         assert!(is_done(&reply(&rx, 2, r.subscribe)));
         reply(&rx, 2, r.status);
-        reply(&rx, 2, r.queue);
+        let Outcome::Ok(Body::Queue(tracks)) = reply(&rx, 2, r.queue) else {
+            panic!("queue reply")
+        };
+        assert_eq!(tracks.len(), 1);
         let id = c.send(Command::Clear).unwrap();
         assert!(is_done(&reply(&rx, 2, id)));
         queue_changed(&rx, 2);
