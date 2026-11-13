@@ -9,6 +9,8 @@ mod conn;
 #[allow(dead_code)]
 mod keys;
 mod term;
+#[allow(dead_code)]
+mod ui;
 
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
