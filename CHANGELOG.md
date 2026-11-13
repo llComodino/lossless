@@ -48,6 +48,9 @@ First development version, not yet tagged.
   default) and `losslessd --log-level`.
 - State file (`$XDG_STATE_HOME/lossless/state.json`): the queue, position
   and modes survive a restart, restored paused with the device closed.
+- Profiles: `losslessd --profile NAME` runs one daemon per output, each with
+  its own config (`NAME.toml`), state and socket; `lossless -p NAME` talks
+  to it. Without a profile every path is as before.
 - TOML config (`device`, `music_dir`, `socket`, `log_level`, `mixer`,
   `mixer_control`) with strict validation.
 - `lossless`: command line client (`status`, `queue`, `add`, `play`,
