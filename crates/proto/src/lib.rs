@@ -711,19 +711,20 @@ mod props {
 /// Pad or cut `s` to exactly `width` terminal columns; a wide character
 /// that does not fit is replaced by a space.
 pub fn fit(s: &str, width: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
     use unicode_width::UnicodeWidthStr;
-    let cols = |c: char| c.encode_utf8(&mut [0; 4]).width();
-    let total: usize = s.chars().map(cols).sum();
+    let total: usize = s.graphemes(true).map(|g| g.width()).sum();
     let ellipsis = total > width && width >= 3;
     let limit = if ellipsis { width - 3 } else { width };
     let mut out = String::new();
     let mut used = 0;
-    for c in s.chars() {
-        if used + cols(c) > limit || (limit == 0 && cols(c) == 0) {
+    for g in s.graphemes(true) {
+        let w = g.width();
+        if used + w > limit || (limit == 0 && w == 0) {
             break;
         }
-        used += cols(c);
-        out.push(c);
+        used += w;
+        out.push_str(g);
     }
     if ellipsis {
         out.push_str("...");
@@ -770,6 +771,14 @@ mod fit_tests {
         assert_eq!(fit("🎵🎵🎵🎵", 7), "🎵🎵...");
         assert_eq!(fit("e\u{301}x", 2), "e\u{301}x");
         assert_eq!(fit("e\u{301}", 3), "e\u{301}  ");
+        assert_eq!(fit("\u{2764}\u{fe0f}", 2), "\u{2764}\u{fe0f}");
+        assert_eq!(fit("\u{2764}\u{fe0f}", 4), "\u{2764}\u{fe0f}  ");
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+        assert_eq!(fit(family, 2), family);
+        assert_eq!(fit(family, 5), format!("{family}   "));
+        let flag = "\u{1f1ef}\u{1f1f5}";
+        assert_eq!(fit(flag, 2), flag);
+        assert_eq!(fit(&format!("{flag}{flag}"), 3), "...");
         for w in 0..12 {
             for s in [
                 "",
