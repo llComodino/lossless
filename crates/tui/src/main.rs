@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+#[allow(dead_code)]
+mod clock;
 mod term;
 
 use std::os::unix::net::UnixStream;
