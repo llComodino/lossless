@@ -33,5 +33,9 @@ fn bad_profile_exits_2() {
 fn help_prints_usage() {
     let out = tui().arg("--help").output().unwrap();
     assert_eq!(out.status.code(), Some(0));
-    assert!(String::from_utf8(out.stdout).unwrap().starts_with("usage: losslessd-tui"));
+    assert!(
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .starts_with("usage: losslessd-tui")
+    );
 }
