@@ -1,7 +1,9 @@
+mod columns;
 mod footer;
 mod header;
 mod help;
 mod queue;
+mod search;
 
 use std::time::Instant;
 
@@ -9,7 +11,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::Block;
 
 use crate::app::{App, View};
 
@@ -26,10 +28,9 @@ pub fn draw(app: &App, f: &mut Frame) {
     f.render_widget(block, body);
     match app.view {
         View::Queue => queue::draw(app, f, inner),
-        view => f.render_widget(
-            Paragraph::new(format!("{} (not implemented yet)", label(view))),
-            inner,
-        ),
+        View::Directories => columns::draw(&app.dirs, f, inner),
+        View::Artists => columns::draw(&app.artists, f, inner),
+        View::Search => search::draw(app, f, inner),
     }
     footer::draw(app, f, foot);
     if app.help {
@@ -66,13 +67,14 @@ mod tests {
     use std::time::Instant;
 
     use lossless_proto::profile::Profile;
-    use lossless_proto::{PlayState, Repeat, Status, StreamFormat, Track};
+    use lossless_proto::{Entry, PlayState, Repeat, Status, StreamFormat, Track};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::style::Modifier;
+    use unicode_width::UnicodeWidthStr;
 
     use super::draw;
-    use crate::app::App;
+    use crate::app::{App, View};
     use crate::clock::Clock;
 
     fn track(artist: &str, title: &str) -> Track {
@@ -274,5 +276,225 @@ mod tests {
         ] {
             assert!(keys.contains(k), "{k} not in the key table");
         }
+    }
+
+    fn sized(app: &App, w: u16, h: u16) -> (Vec<String>, Terminal<TestBackend>) {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| draw(app, f)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let lines = (0..h)
+            .map(|y| {
+                let mut row = String::new();
+                let mut skip = 0;
+                for x in 0..w {
+                    if skip > 0 {
+                        skip -= 1;
+                        continue;
+                    }
+                    let sym = buf[(x, y)].symbol();
+                    skip = UnicodeWidthStr::width(sym).saturating_sub(1);
+                    row.push_str(sym);
+                }
+                row
+            })
+            .collect();
+        (lines, t)
+    }
+
+    fn col_of(row: &str, marker: &str) -> Option<usize> {
+        row.find(marker).map(|i| UnicodeWidthStr::width(&row[..i]))
+    }
+
+    fn entry_dir(name: &str, path: &str) -> Entry {
+        Entry::Dir {
+            name: name.into(),
+            path: path.into(),
+        }
+    }
+
+    fn browsing(view: View) -> App {
+        let mut a = app("default", None);
+        a.view = view;
+        let cols = match view {
+            View::Artists => &mut a.artists,
+            _ => &mut a.dirs,
+        };
+        cols.path = vec!["Rock".into()];
+        cols.parent = vec![entry_dir("Jazz", "Jazz"), entry_dir("Rock", "Rock")];
+        cols.items = vec![
+            entry_dir("Album One", "Rock/Album One"),
+            entry_dir("Two", "Rock/Two"),
+        ];
+        cols.selected = 1;
+        cols.preview = (0..2)
+            .map(|_| Entry::Track(track("Kenshi Yonezu", "PREVIEWTRACK")))
+            .collect();
+        a
+    }
+
+    #[test]
+    fn directories_show_three_columns() {
+        let a = browsing(View::Directories);
+        let (l, t) = sized(&a, 100, 24);
+        let row = l.iter().find(|r| r.contains("Two/")).expect("current row");
+        let (p, c, v) = (
+            col_of(row, "Rock/").unwrap(),
+            col_of(row, "Two/").unwrap(),
+            col_of(row, "Kenshi").unwrap(),
+        );
+        assert!(p < c && c < v, "{row:?}");
+        assert!(row.contains("Jazz") || l.iter().any(|r| r.contains("Jazz/")));
+        assert!(l.iter().any(|r| r.contains("Album One/")));
+        let y = l.iter().position(|r| r.contains("Two/")).unwrap() as u16;
+        assert!(
+            t.backend().buffer()[(c as u16, y)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert!(
+            !t.backend().buffer()[(v as u16, y)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+    }
+
+    #[test]
+    fn narrow_panes_show_only_the_current_column() {
+        let a = browsing(View::Directories);
+        let (l, _) = sized(&a, 50, 24);
+        assert!(l.iter().any(|r| r.contains("Two/")));
+        assert!(
+            !l.iter()
+                .any(|r| r.contains("Jazz") || r.contains("PREVIEWTRACK"))
+        );
+    }
+
+    #[test]
+    fn artists_show_artist_album_tracks() {
+        let mut a = browsing(View::Artists);
+        a.artists.path = vec!["Rock".into(), "Album One".into()];
+        a.artists.parent = vec![
+            entry_dir("Album One", "Album One"),
+            entry_dir("Other", "Other"),
+        ];
+        a.artists.items = vec![Entry::Track(track("Kenshi Yonezu", "IRIS OUT"))];
+        a.artists.selected = 0;
+        a.artists.preview = vec![];
+        let (l, _) = sized(&a, 100, 24);
+        let row = l
+            .iter()
+            .find(|r| r.contains("Kenshi Yonezu - IRIS OUT"))
+            .unwrap();
+        assert!(
+            col_of(row, "Album One/").is_none()
+                || col_of(row, "Album One/") < col_of(row, "Kenshi")
+        );
+        assert!(l.iter().any(|r| r.contains("Album One/")));
+        assert!(l.iter().any(|r| r.contains("3 Artists")));
+    }
+
+    #[test]
+    fn search_shows_query_and_results() {
+        let mut a = app("default", None);
+        a.view = View::Search;
+        a.search.query = "iris".into();
+        a.search.editing = true;
+        a.search.results = vec![track("Kenshi Yonezu", "IRIS OUT"), track("X", "Other")];
+        a.search.selected = 1;
+        let (l, t) = sized(&a, 80, 24);
+        let q = l
+            .iter()
+            .find(|r| r.contains("/ iris_"))
+            .expect("query line");
+        assert!(q.starts_with('\u{2502}'), "{q:?}");
+        let r = l
+            .iter()
+            .find(|r| r.contains("Kenshi Yonezu - IRIS OUT"))
+            .unwrap();
+        assert!(r.contains("2:31") && r.contains("24-bit/48 kHz"), "{r:?}");
+        let y = l.iter().position(|r| r.contains("X - Other")).unwrap() as u16;
+        assert!(
+            t.backend().buffer()[(10, y)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+        a.search.editing = false;
+        let (l, _) = sized(&a, 80, 24);
+        assert!(l.iter().any(|r| r.contains("/ iris")) && !l.iter().any(|r| r.contains("/ iris_")));
+    }
+
+    #[test]
+    fn tiny_terminals_render_without_panicking() {
+        for (w, h) in [(40, 12), (20, 6), (1, 1), (0, 0), (5, 0), (0, 5), (3, 3)] {
+            for view in View::ALL {
+                for help in [false, true] {
+                    let mut a = browsing(view);
+                    a.view = view;
+                    a.help = help;
+                    a.footer = Some("a long footer message that overflows".into());
+                    a.search.query = "q".into();
+                    a.search.results = vec![track("A", "B")];
+                    a.queue_selected = 1;
+                    sized(&a, w, h);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn long_header_lines_truncate_by_columns() {
+        let mut a = app("default", Some(50));
+        a.status.as_mut().unwrap().track = Some(track("\u{65e5}\u{672c}\u{8a9e}", &"x".repeat(80)));
+        let (l, _) = sized(&a, 30, 12);
+        for r in &l {
+            assert!(UnicodeWidthStr::width(r.as_str()) <= 30, "{r:?}");
+        }
+    }
+
+    #[test]
+    fn wide_titles_keep_columns_aligned() {
+        let titles = [
+            "plain",
+            "\u{65e5}\u{672c}\u{8a9e}\u{306e}\u{30bf}\u{30a4}\u{30c8}\u{30eb}",
+            "love \u{2764}\u{fe0f} you",
+            "caf\u{e9}",
+            "cafe\u{301} au lait",
+            "\u{1f3b5}\u{1f3b6}",
+        ];
+        let mut a = app("default", None);
+        a.queue = titles.iter().map(|t| track("Art", t)).collect();
+        a.search.results = a.queue.clone();
+        a.view = View::Queue;
+        let (q, _) = sized(&a, 80, 24);
+        a.view = View::Search;
+        let (s, _) = sized(&a, 80, 24);
+        for lines in [&q, &s] {
+            let rows: Vec<&String> = lines.iter().filter(|r| r.contains("Art - ")).collect();
+            assert_eq!(rows.len(), titles.len(), "{lines:#?}");
+            let want = col_of(rows[0], "2:31").unwrap();
+            let fmt = col_of(rows[0], "24-bit").unwrap();
+            for r in rows {
+                assert_eq!(col_of(r, "2:31"), Some(want), "{r:?}");
+                assert_eq!(col_of(r, "24-bit"), Some(fmt), "{r:?}");
+            }
+        }
+        let mut b = browsing(View::Directories);
+        let names = [
+            "ascii",
+            "\u{65e5}\u{672c}\u{8a9e}",
+            "\u{2764}\u{fe0f}x",
+            "e\u{301}e\u{301}e\u{301}",
+            "\u{1f3b5}",
+        ];
+        b.dirs.items = names.iter().map(|n| entry_dir(n, n)).collect();
+        b.dirs.preview = vec![Entry::Track(track("Zed", "PREV"))];
+        let mut xs = Vec::new();
+        for i in 0..names.len() {
+            b.dirs.selected = i;
+            let (l, _) = sized(&b, 100, 24);
+            let row = l.iter().find(|r| r.contains("Zed - PREV")).unwrap();
+            xs.push(col_of(row, "Zed - PREV").unwrap());
+        }
+        assert!(xs.iter().all(|x| *x == xs[0]), "{xs:?}");
     }
 }

@@ -1,4 +1,4 @@
-use lossless_proto::{clock, describe, fit, rate_str};
+use lossless_proto::{Track, clock, describe, fit, rate_str};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -8,12 +8,23 @@ use ratatui::widgets::Paragraph;
 use crate::app::App;
 
 pub fn draw(app: &App, f: &mut Frame, area: Rect) {
-    let height = usize::from(area.height);
-    let offset = (app.queue_selected + 1).saturating_sub(height);
     let playing = app.status.as_ref().and_then(|s| s.index);
+    track_rows(&app.queue, app.queue_selected, playing, f, area);
+}
+
+/// Numbered track rows (title, duration, format), `selected` reversed and
+/// `playing` marked.
+pub fn track_rows(
+    tracks: &[Track],
+    selected: usize,
+    playing: Option<usize>,
+    f: &mut Frame,
+    area: Rect,
+) {
+    let height = usize::from(area.height);
+    let offset = (selected + 1).saturating_sub(height);
     let width = usize::from(area.width);
-    let lines: Vec<Line> = app
-        .queue
+    let lines: Vec<Line> = tracks
         .iter()
         .enumerate()
         .skip(offset)
@@ -25,7 +36,7 @@ pub fn draw(app: &App, f: &mut Frame, area: Rect) {
             let tail = format!("  {dur:>6}  {fmt:<14}");
             let title = width.saturating_sub(7 + tail.chars().count());
             let row = format!("{mark} {:>3}  {}{tail}", i + 1, fit(&describe(t), title));
-            let style = if i == app.queue_selected {
+            let style = if i == selected {
                 Style::new().add_modifier(Modifier::REVERSED)
             } else {
                 Style::new()

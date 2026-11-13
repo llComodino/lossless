@@ -18,3 +18,4 @@ lossless-proto.workspace = true
 [dev-dependencies]
 lossless-daemon = { path = "../daemon" }
 lossless-engine = { workspace = true, features = ["fixtures"] }
+unicode-width = "0.2"

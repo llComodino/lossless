@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use lossless_proto::{PlayState, Repeat, clock, describe, rate_str};
+use lossless_proto::{PlayState, Repeat, clock, describe, fit, rate_str};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::widgets::Paragraph;
@@ -29,12 +29,19 @@ pub fn draw(app: &App, now: Instant, f: &mut Frame, area: Rect) {
     if let Some(v) = s.volume {
         line.push_str(&format!("  vol {v}%"));
     }
-    f.render_widget(Paragraph::new(line), l1);
-    if let Some(o) = &s.output {
-        f.render_widget(Paragraph::new(rate_str(o)).alignment(Alignment::Right), l1);
+    let width = usize::from(l1.width);
+    let output = s
+        .output
+        .as_ref()
+        .map(rate_str)
+        .filter(|o| width > o.len() + 40);
+    let room = width.saturating_sub(output.as_ref().map_or(0, |o| o.len() + 1));
+    f.render_widget(Paragraph::new(fit(&line, room)), l1);
+    if let Some(o) = output {
+        f.render_widget(Paragraph::new(o).alignment(Alignment::Right), l1);
     }
     if let Some(t) = &s.track {
-        f.render_widget(Paragraph::new(describe(t)), l2);
+        f.render_widget(Paragraph::new(fit(&describe(t), usize::from(l2.width))), l2);
     }
     let pos = app.clock.position(now);
     let dur = s.duration_ms;
@@ -44,6 +51,7 @@ pub fn draw(app: &App, now: Instant, f: &mut Frame, area: Rect) {
         dur.map_or_else(|| "?".into(), clock)
     );
     let width = usize::from(l3.width).saturating_sub(label.chars().count());
+    let total = usize::from(l3.width);
     let filled = dur.filter(|&d| d > 0).map_or(0, |d| {
         (u128::from(pos.min(d)) * width as u128 / u128::from(d)) as usize
     });
@@ -52,5 +60,5 @@ pub fn draw(app: &App, now: Instant, f: &mut Frame, area: Rect) {
         "\u{2501}".repeat(filled),
         "\u{2500}".repeat(width - filled)
     );
-    f.render_widget(Paragraph::new(bar), l3);
+    f.render_widget(Paragraph::new(fit(&bar, total)), l3);
 }
