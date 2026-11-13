@@ -3,6 +3,7 @@
 use std::process::ExitCode;
 
 use lossless_daemon::LogLevel;
+use lossless_proto::profile::{Dirs, Profile};
 
 const USAGE: &str = "usage: losslessd [--log-level off|warn|info|debug]";
 
@@ -19,10 +20,12 @@ fn main() -> ExitCode {
     if args.next().is_some() {
         return usage();
     }
+    let dirs = Dirs::from_env();
+    let profile = Profile::default();
     lossless_daemon::run(
-        &lossless_daemon::config_path(),
-        lossless_proto::default_socket(),
-        lossless_daemon::state::state_path(),
+        &dirs.config_path(&profile),
+        dirs.socket(&profile),
+        dirs.state_path(&profile),
         level,
     )
     .map_or_else(fatal, |()| ExitCode::SUCCESS)

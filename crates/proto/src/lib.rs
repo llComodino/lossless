@@ -4,6 +4,8 @@
 //! Clients send `Request`s; the server sends `ServerMessage`s (replies, and
 //! events once the client has sent `Subscribe`).
 
+pub mod profile;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -244,13 +246,7 @@ pub struct Track {
 
 /// `$XDG_RUNTIME_DIR/lossless.sock`, else `/tmp/lossless-$USER.sock`.
 pub fn default_socket() -> std::path::PathBuf {
-    match std::env::var_os("XDG_RUNTIME_DIR") {
-        Some(dir) => std::path::Path::new(&dir).join("lossless.sock"),
-        None => {
-            let user = std::env::var("USER").unwrap_or_else(|_| "user".into());
-            std::env::temp_dir().join(format!("lossless-{user}.sock"))
-        }
-    }
+    profile::Dirs::from_env().socket(&profile::Profile::default())
 }
 
 /// Serialize as one protocol line, newline included.

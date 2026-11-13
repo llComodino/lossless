@@ -101,12 +101,6 @@ pub(crate) fn expand_tilde(p: &Path) -> PathBuf {
     }
 }
 
-pub fn config_path() -> PathBuf {
-    let base =
-        std::env::var_os("XDG_CONFIG_HOME").map_or_else(|| home().join(".config"), PathBuf::from);
-    base.join("lossless/config.toml")
-}
-
 /// Largest accepted config file. Real configs are a few lines.
 pub const MAX_CONFIG: u64 = 64 * 1024;
 

@@ -6,8 +6,6 @@ use std::path::{Path, PathBuf};
 use lossless_proto::Repeat;
 use serde::{Deserialize, Serialize};
 
-use crate::config::home;
-
 /// What survives a restart: the queue, where in it, and the modes.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct Saved {
@@ -64,16 +62,6 @@ pub enum StateError {
 
 /// Largest accepted state file. A queue of 100k entries is a few MiB.
 pub const MAX_STATE: u64 = 16 * 1024 * 1024;
-
-/// `$XDG_STATE_HOME/lossless/state.json` (only if absolute), else
-/// `~/.local/state/lossless/state.json`.
-pub fn state_path() -> PathBuf {
-    std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .unwrap_or_else(|| home().join(".local/state"))
-        .join("lossless/state.json")
-}
 
 /// Write `bytes` to `<path>.tmp`, created afresh (owner-only, never through
 /// a symlink or with a stale file's permissions) and synced. A failed write
