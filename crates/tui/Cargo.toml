@@ -13,3 +13,7 @@ path = "src/main.rs"
 [dependencies]
 crossterm = "0.29.0"
 lossless-proto.workspace = true
+
+[dev-dependencies]
+lossless-daemon = { path = "../daemon" }
+lossless-engine = { workspace = true, features = ["fixtures"] }

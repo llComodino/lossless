@@ -545,6 +545,8 @@ name = "lossless-tui"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "lossless-daemon",
+ "lossless-engine",
  "lossless-proto",
 ]
 

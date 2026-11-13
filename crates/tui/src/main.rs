@@ -2,6 +2,8 @@
 
 #[allow(dead_code)]
 mod clock;
+#[allow(dead_code)]
+mod conn;
 mod term;
 
 use std::os::unix::net::UnixStream;
