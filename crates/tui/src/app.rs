@@ -14,6 +14,7 @@ use crate::keys::{self, Action};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Col {
+    Parent,
     Current,
     Preview,
 }
@@ -51,11 +52,13 @@ pub enum Out {
     Switch,
 }
 
-/// Miller columns: `items` lists `path`, `preview` the selected item.
+/// Miller columns: `items` lists `path`, `parent` the path without its
+/// last name (empty at the top), `preview` the selected item.
 /// Artists and albums are `Entry::Dir` named after them.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Columns<T> {
     pub path: Vec<String>,
+    pub parent: Vec<T>,
     pub items: Vec<T>,
     pub selected: usize,
     pub preview: Vec<Entry>,
@@ -65,6 +68,7 @@ impl<T> Default for Columns<T> {
     fn default() -> Self {
         Self {
             path: Vec::new(),
+            parent: Vec::new(),
             items: Vec::new(),
             selected: 0,
             preview: Vec::new(),
@@ -164,6 +168,7 @@ impl App {
         self.queue.clear();
         self.queue_selected = 0;
         for cols in [&mut self.dirs, &mut self.artists] {
+            cols.parent.clear();
             cols.items.clear();
             cols.preview.clear();
             cols.selected = 0;
@@ -382,7 +387,7 @@ impl App {
         match cols.items.get(cols.selected) {
             Some(Entry::Dir { name, .. }) => {
                 cols.path.push(name.clone());
-                cols.items = std::mem::take(&mut cols.preview);
+                cols.parent = std::mem::replace(&mut cols.items, std::mem::take(&mut cols.preview));
                 cols.selected = 0;
                 vec![list(view, cols.path.clone(), Col::Current, None)]
             }
@@ -401,8 +406,19 @@ impl App {
             return vec![];
         };
         cols.preview = std::mem::take(&mut cols.items);
-        cols.selected = 0;
-        vec![list(view, cols.path.clone(), Col::Current, Some(name))]
+        let loaded = !cols.parent.is_empty();
+        cols.items = std::mem::take(&mut cols.parent);
+        cols.selected = cols
+            .items
+            .iter()
+            .position(|e| matches!(e, Entry::Dir { name: n, .. } if *n == name))
+            .unwrap_or(0);
+        let mut outs = Vec::new();
+        if !loaded {
+            outs.push(list(view, cols.path.clone(), Col::Current, Some(name)));
+        }
+        outs.extend(parent_of(view, &cols.path));
+        outs
     }
 
     /// Fetches the preview of the selected folder, artist or album.
@@ -420,10 +436,13 @@ impl App {
     }
 
     fn refetch(&mut self) -> Vec<Out> {
-        [View::Directories, View::Artists]
-            .into_iter()
-            .map(|v| list(v, self.columns(v).path.clone(), Col::Current, None))
-            .collect()
+        let mut outs = Vec::new();
+        for v in [View::Directories, View::Artists] {
+            let path = self.columns(v).path.clone();
+            outs.extend(parent_of(v, &path));
+            outs.push(list(v, path, Col::Current, None));
+        }
+        outs
     }
 
     fn reply(&mut self, id: u64, result: Outcome, now: Instant) -> Vec<Out> {
@@ -514,6 +533,12 @@ impl App {
                 }
                 vec![]
             }
+            Col::Parent => {
+                if cols.path.split_last().map(|(_, p)| p) == Some(path.as_slice()) {
+                    cols.parent = entries;
+                }
+                vec![]
+            }
             Col::Current => vec![],
         }
     }
@@ -596,6 +621,11 @@ fn find(artist: Option<String>, album: Option<String>, op: Op) -> Vec<Out> {
         Command::Find { artist, album },
         Pending::Then(op),
     )]
+}
+
+fn parent_of(view: View, path: &[String]) -> Option<Out> {
+    let (_, up) = path.split_last()?;
+    Some(list(view, up.to_vec(), Col::Parent, None))
 }
 
 /// The request that lists a Directories or Artists column at `path`.
@@ -930,10 +960,8 @@ mod tests {
         assert_eq!(
             run(&mut app, ch('h')),
             [Out::Send(
-                Albums {
-                    artist: Some("Ann".into())
-                },
-                list(View::Artists, &["Ann"], Col::Current, Some("Red"))
+                Artists,
+                list(View::Artists, &[], Col::Parent, None)
             )]
         );
         let mut app = super::tests::app();
@@ -1182,6 +1210,104 @@ mod tests {
     }
 
     #[test]
+    fn right_moves_current_to_parent() {
+        let mut app = app();
+        app.view = View::Directories;
+        app.dirs.preview = vec![dir("b", "a/b")];
+        run(&mut app, ch('l'));
+        assert_eq!(
+            app.dirs.parent,
+            [dir("a", "a"), dir("b", "b"), Entry::Track(track("x.flac"))]
+        );
+        assert_eq!(app.dirs.items, [dir("b", "a/b")]);
+    }
+
+    #[test]
+    fn left_requests_the_grandparent() {
+        let mut app = app();
+        app.view = View::Directories;
+        app.dirs.path = paths(&["a", "b"]);
+        app.dirs.parent = vec![dir("b", "a/b"), dir("c", "a/c")];
+        app.dirs.items = vec![Entry::Track(track("a/b/t.flac"))];
+        let outs = run(&mut app, ch('h'));
+        assert_eq!(
+            outs,
+            [Out::Send(
+                Command::Browse { path: "".into() },
+                list(View::Directories, &[], Col::Parent, None)
+            )]
+        );
+        assert_eq!(app.dirs.items, [dir("b", "a/b"), dir("c", "a/c")]);
+        assert_eq!(app.dirs.selected, 0);
+        assert_eq!(app.dirs.preview, [Entry::Track(track("a/b/t.flac"))]);
+        assert!(app.dirs.parent.is_empty());
+        app.expect(7, list(View::Directories, &[], Col::Parent, None));
+        let top = vec![named("0"), dir("a", "a")];
+        run(
+            &mut app,
+            reply(1, 7, Outcome::Ok(Body::Entries(top.clone()))),
+        );
+        assert_eq!(app.dirs.parent, top);
+    }
+
+    #[test]
+    fn artists_parent_follows_depth() {
+        let mut app = app();
+        app.view = View::Artists;
+        app.artists.path = paths(&["Ann", "Alb"]);
+        app.artists.parent = vec![named("Alb")];
+        app.artists.items = vec![Entry::Track(track("t"))];
+        assert_eq!(
+            run(&mut app, ch('h')),
+            [Out::Send(
+                Command::Artists,
+                list(View::Artists, &[], Col::Parent, None)
+            )]
+        );
+        assert!(run(&mut app, ch('h')).len() <= 1);
+        assert!(app.artists.parent.is_empty());
+    }
+
+    #[test]
+    fn stale_parent_replies_are_ignored() {
+        let mut app = app();
+        app.view = View::Directories;
+        app.dirs.path = paths(&["a", "b"]);
+        app.expect(8, list(View::Directories, &["a"], Col::Parent, None));
+        app.expect(9, list(View::Directories, &[], Col::Parent, None));
+        let stale = vec![named("zzz")];
+        run(&mut app, reply(1, 9, Outcome::Ok(Body::Entries(stale))));
+        assert!(app.dirs.parent.is_empty());
+        let good = vec![dir("b", "a/b")];
+        run(
+            &mut app,
+            reply(1, 8, Outcome::Ok(Body::Entries(good.clone()))),
+        );
+        assert_eq!(app.dirs.parent, good);
+        app.dirs.path = paths(&["a"]);
+        app.expect(10, list(View::Directories, &["a"], Col::Parent, None));
+        run(
+            &mut app,
+            reply(1, 10, Outcome::Ok(Body::Entries(vec![named("q")]))),
+        );
+        assert_eq!(app.dirs.parent, good);
+    }
+
+    #[test]
+    fn refetch_also_fetches_the_parent() {
+        let mut app = app();
+        app.dirs.path = paths(&["a", "b"]);
+        let outs = run(&mut app, event(1, Event::LibraryChanged { tracks: 0 }));
+        assert!(
+            outs.contains(&Out::Send(
+                Command::Browse { path: "a".into() },
+                list(View::Directories, &["a"], Col::Parent, None)
+            )),
+            "{outs:?}"
+        );
+    }
+
+    #[test]
     fn events_update_status_and_clock() {
         let mut app = app();
         let t = Instant::now();
@@ -1325,8 +1451,16 @@ mod tests {
             run(&mut app, reply(2, 10, Outcome::Ok(Body::Done))),
             [
                 Out::Send(
+                    Command::Browse { path: "".into() },
+                    list(View::Directories, &[], Col::Parent, None)
+                ),
+                Out::Send(
                     Command::Browse { path: "a".into() },
                     list(View::Directories, &["a"], Col::Current, None)
+                ),
+                Out::Send(
+                    Command::Artists,
+                    list(View::Artists, &[], Col::Parent, None)
                 ),
                 Out::Send(
                     Command::Albums {
