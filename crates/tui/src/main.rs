@@ -1,9 +1,13 @@
 #![forbid(unsafe_code)]
 
 #[allow(dead_code)]
+mod app;
+#[allow(dead_code)]
 mod clock;
 #[allow(dead_code)]
 mod conn;
+#[allow(dead_code)]
+mod keys;
 mod term;
 
 use std::os::unix::net::UnixStream;
