@@ -1,0 +1,22 @@
+[package]
+name = "lossless-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "losslessd-tui"
+path = "src/main.rs"
+
+[dependencies]
+crossterm = "0.29.0"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29"] }
+lossless-proto.workspace = true
+
+[dev-dependencies]
+lossless-daemon = { path = "../daemon" }
+lossless-engine = { workspace = true, features = ["fixtures"] }
+portable-pty = "0.9.0"
+unicode-width = "0.2"

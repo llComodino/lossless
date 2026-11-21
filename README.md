@@ -9,7 +9,7 @@ converter in the signal path.
 
 - `losslessd`: the daemon
 - `lossless`: a command line client
-- `losslessd-tui`: a terminal UI (planned, see [Roadmap](#roadmap))
+- `losslessd-tui`: a terminal UI
 
 > **Status: early.** Playback, the library and the CLI work and are tested,
 > and the daemon is in daily use on one machine. The protocol will change
@@ -73,7 +73,7 @@ is the only thing the playback path knows how to do.
 | Browse by folder, artist, album | yes | `browse`, `artists`, `albums`, `find` |
 | Volume: DAC hardware mixer, or software gain on the PipeWire path | yes | the bit-perfect path never scales samples; changes from `alsamixer` are reported |
 | Queue and position restored after restart | yes | paused where it was; vanished files dropped |
-| Terminal UI (`losslessd-tui`) | planned | |
+| Terminal UI (`losslessd-tui`) | yes | queue, directories, artists, search; switches profiles |
 | MPRIS (media keys, bars) | planned | |
 | Other formats (ALAC, WAV, AIFF, Opus, Vorbis) | later | via symphonia |
 | DSD (DoP / native) | not yet | |
@@ -254,6 +254,17 @@ parameters while playing:
 cat /proc/asound/PRO2/pcm0p/sub0/hw_params   # format S24_3LE, rate 96000
 ```
 
+### Terminal UI
+
+```sh
+losslessd-tui                    # the default profile's daemon
+losslessd-tui -p pw              # another profile (--socket PATH wins)
+```
+
+`?` lists the keys. Views are `1` Queue, `2` Directories, `3` Artists and
+`4` Search; `o` switches to the next profile. The UI is event-driven: it
+redraws only on input, daemon events and whole-second progress while playing.
+
 ### Running under a supervisor
 
 `losslessd` stays in the foreground and exits non-zero on fatal errors, so
@@ -368,9 +379,7 @@ cargo reldeps      # what the release binaries link
 
 ## Roadmap
 
-1. `losslessd-tui`: an rmpc-style terminal UI (queue, directories,
-   artists/albums, search).
-2. MPRIS bridge.
+1. MPRIS bridge.
 
 ## License
 

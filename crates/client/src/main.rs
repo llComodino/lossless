@@ -7,9 +7,10 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, anyhow, bail};
 use lossless_proto::profile::{Dirs, Profile};
 use lossless_proto::{
-    Body, Command, Entry, Event, Outcome, PlayState, Repeat, Request, ServerMessage, Status,
-    StreamFormat, Track, decode, encode,
+    Body, Command, Entry, Event, Outcome, PlayState, Repeat, Request, ServerMessage, Status, Track,
+    decode, encode,
 };
+use lossless_proto::{clock, describe, fit, format_str};
 
 /// `println!` that exits quietly when stdout is closed (e.g. piped to `head`)
 /// instead of panicking.
@@ -269,24 +270,6 @@ fn volume(v: Volume, reader: &mut impl BufRead, writer: &mut impl Write, json: b
     ask(reader, writer, 2, Command::SetVolume { percent }, json).map(drop)
 }
 
-fn clock(ms: u64) -> String {
-    let s = ms / 1000;
-    if s >= 3600 {
-        format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
-    } else {
-        format!("{}:{:02}", s / 60, s % 60)
-    }
-}
-
-fn format_str(f: &StreamFormat) -> String {
-    format!(
-        "{}-bit/{} kHz/{}ch",
-        f.bits,
-        f64::from(f.rate) / 1000.0,
-        f.channels
-    )
-}
-
 fn modes(repeat: Repeat, random: bool) -> String {
     let repeat = match repeat {
         Repeat::Off => "off",
@@ -317,37 +300,6 @@ fn print_status(s: &Status) {
     );
     if let Some(t) = &s.track {
         out!("{}", describe(t));
-    }
-}
-
-/// "Artist - Title (Album)", falling back to the file name.
-fn describe(t: &Track) -> String {
-    let name = || {
-        std::path::Path::new(&t.path)
-            .file_name()
-            .map_or_else(|| t.path.clone(), |n| n.to_string_lossy().into_owned())
-    };
-    let mut s = match (&t.artist, &t.title) {
-        (Some(a), Some(ti)) => format!("{a} - {ti}"),
-        (None, Some(ti)) => ti.clone(),
-        _ => name(),
-    };
-    if let Some(album) = &t.album {
-        s.push_str(&format!(" ({album})"));
-    }
-    s
-}
-
-/// Pad or cut `s` to exactly `width` characters.
-fn fit(s: &str, width: usize) -> String {
-    let len = s.chars().count();
-    if len <= width {
-        format!("{s}{}", " ".repeat(width - len))
-    } else if width < 3 {
-        s.chars().take(width).collect()
-    } else {
-        let cut: String = s.chars().take(width - 3).collect();
-        format!("{cut}...")
     }
 }
 
@@ -474,6 +426,7 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lossless_proto::StreamFormat;
 
     #[test]
     fn times() {
@@ -484,15 +437,6 @@ mod tests {
         for bad in ["inf", "-inf", "NaN", "1e400", "1:-5", "-0", "1::2", ""] {
             assert!(parse_time(bad).is_err(), "{bad:?} accepted");
         }
-    }
-
-    #[test]
-    fn fit_pads_and_cuts_by_chars() {
-        assert_eq!(fit("ab", 4), "ab  ");
-        assert_eq!(fit("Earl\u{2019}s Court 2004", 10), "Earl\u{2019}s ...");
-        assert_eq!(fit("Earl\u{2019}s Court 2004", 10).chars().count(), 10);
-        assert_eq!(fit("abcdef", 2), "ab", "too narrow for an ellipsis");
-        assert_eq!(fit("abcdef", 0), "");
     }
 
     fn track(path: &str, artist: Option<&str>, title: Option<&str>, album: Option<&str>) -> Track {
@@ -712,14 +656,9 @@ mod tests {
 mod props {
     use proptest::prelude::*;
 
-    use super::{fit, parse, parse_time};
+    use super::{parse, parse_time};
 
     proptest! {
-        #[test]
-        fn fit_is_always_exactly_the_width(s in ".{0,80}", width in 0usize..100) {
-            prop_assert_eq!(fit(&s, width).chars().count(), width);
-        }
-
         #[test]
         fn parse_time_reads_clock_times(h in 0u64..100, m in 0u64..60, s in 0u64..60) {
             let ms = ((h * 60 + m) * 60 + s) * 1000;

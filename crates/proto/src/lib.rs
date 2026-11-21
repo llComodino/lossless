@@ -4,7 +4,10 @@
 //! Clients send `Request`s; the server sends `ServerMessage`s (replies, and
 //! events once the client has sent `Subscribe`).
 
+mod display;
 pub mod profile;
+
+pub use display::{clock, describe, format_str, rate_str};
 
 use serde::{Deserialize, Serialize};
 
@@ -704,6 +707,91 @@ mod props {
             extra in "[ -~]{0,40}",
         ) {
             let _ = decode::<Request>(&format!("{{\"id\":1,\"cmd\":\"{cmd}\"{extra}}}"));
+        }
+    }
+}
+
+/// Pad or cut `s` to exactly `width` terminal columns; a wide character
+/// that does not fit is replaced by a space.
+pub fn fit(s: &str, width: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    let total: usize = s.graphemes(true).map(|g| g.width()).sum();
+    let ellipsis = total > width && width >= 3;
+    let limit = if ellipsis { width - 3 } else { width };
+    let mut out = String::new();
+    let mut used = 0;
+    for g in s.graphemes(true) {
+        let w = g.width();
+        if used + w > limit || (limit == 0 && w == 0) {
+            break;
+        }
+        used += w;
+        out.push_str(g);
+    }
+    if ellipsis {
+        out.push_str("...");
+        used += 3;
+    }
+    out.push_str(&" ".repeat(width - used));
+    out
+}
+
+#[cfg(test)]
+mod fit_tests {
+    use super::fit;
+    use unicode_width::UnicodeWidthStr;
+
+    proptest::proptest! {
+        #[test]
+        fn fit_is_always_exactly_the_width(s in ".{0,80}", width in 0usize..100) {
+            proptest::prop_assert_eq!(fit(&s, width).width(), width);
+        }
+    }
+
+    #[test]
+    fn fit_pads_and_cuts_by_columns() {
+        assert_eq!(fit("ab", 4), "ab  ");
+        assert_eq!(fit("Earl\u{2019}s Court 2004", 10), "Earl\u{2019}s ...");
+        assert_eq!(fit("abcdef", 2), "ab", "too narrow for an ellipsis");
+        assert_eq!(fit("abcdef", 0), "");
+        assert_eq!(fit("abcdef", 6), "abcdef");
+    }
+
+    #[test]
+    fn fit_counts_wide_and_combining() {
+        assert_eq!(fit("米津玄師", 8), "米津玄師");
+        assert_eq!(fit("米津玄師", 10), "米津玄師  ");
+        assert_eq!(fit("米津玄師", 7), "米津...", "cut on a column boundary");
+        assert_eq!(
+            fit("米津玄師", 6),
+            "米... ",
+            "wide char does not fit: space"
+        );
+        assert_eq!(fit("米津玄師", 1), " ");
+        assert_eq!(fit("a米", 2), "a ");
+        assert_eq!(fit("🎵🎵🎵", 6), "🎵🎵🎵");
+        assert_eq!(fit("🎵🎵🎵🎵", 7), "🎵🎵...");
+        assert_eq!(fit("e\u{301}x", 2), "e\u{301}x");
+        assert_eq!(fit("e\u{301}", 3), "e\u{301}  ");
+        assert_eq!(fit("\u{2764}\u{fe0f}", 2), "\u{2764}\u{fe0f}");
+        assert_eq!(fit("\u{2764}\u{fe0f}", 4), "\u{2764}\u{fe0f}  ");
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+        assert_eq!(fit(family, 2), family);
+        assert_eq!(fit(family, 5), format!("{family}   "));
+        let flag = "\u{1f1ef}\u{1f1f5}";
+        assert_eq!(fit(flag, 2), flag);
+        assert_eq!(fit(&format!("{flag}{flag}"), 3), "...");
+        for w in 0..12 {
+            for s in [
+                "",
+                "abc",
+                "米津玄師 - IRIS OUT",
+                "🎵 e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}",
+                "a米b米c米d米",
+            ] {
+                assert_eq!(fit(s, w).width(), w, "{s:?} at {w}");
+            }
         }
     }
 }
