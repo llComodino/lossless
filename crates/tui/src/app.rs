@@ -694,10 +694,20 @@ impl App {
         self.rebuild_artists(None);
         let mut outs = self.refilter(View::Search, false);
         outs.extend(match delta {
-            Delta::Refetch => vec![Out::Send(Command::Tracks, Pending::Tracks)],
+            Delta::Refetch => self.fetch_library(),
             _ => self.refetch(),
         });
         outs
+    }
+
+    /// One `Tracks` in flight at a time: a newer one would only repeat it,
+    /// and `Local` refetches if its reply comes back too old.
+    fn fetch_library(&self) -> Vec<Out> {
+        if self.pending.values().any(|p| *p == Pending::Tracks) {
+            vec![]
+        } else {
+            vec![Out::Send(Command::Tracks, Pending::Tracks)]
+        }
     }
 
     fn reply(&mut self, id: u64, result: Outcome, now: Instant) -> Vec<Out> {
@@ -714,7 +724,7 @@ impl App {
         match (pending, body) {
             (Pending::Subscribe, _) => {
                 let mut outs = self.refetch();
-                outs.push(Out::Send(Command::Tracks, Pending::Tracks));
+                outs.extend(self.fetch_library());
                 outs
             }
             (Pending::Status, Body::Status(s)) => {
@@ -2041,6 +2051,32 @@ mod tests {
         };
         assert_eq!(run(&mut app, reply(1, 3, Outcome::Ok(old))), []);
         assert_eq!(app.library.tracks.len(), 2);
+    }
+
+    #[test]
+    fn one_library_fetch_at_a_time() {
+        let mut app = app();
+        app.library.replace(4, vec![track("/m/a.flac")]);
+        let gap = |generation| Event::LibraryChanged {
+            generation,
+            tracks: 0,
+            added: vec![],
+            removed: vec![],
+        };
+        assert_eq!(
+            run(&mut app, event(1, gap(6))),
+            [Out::Send(Command::Tracks, Pending::Tracks)]
+        );
+        app.expect(3, Pending::Tracks);
+        assert_eq!(run(&mut app, event(1, gap(7))), []);
+        let older = Body::Library {
+            generation: 6,
+            tracks: vec![],
+        };
+        assert_eq!(
+            run(&mut app, reply(1, 3, Outcome::Ok(older))),
+            [Out::Send(Command::Tracks, Pending::Tracks)]
+        );
     }
 
     #[test]
