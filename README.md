@@ -334,7 +334,8 @@ recovered from by itself, as `{code, message}`, cleared once a track loads
 cleanly).
 
 After `{"id":4,"cmd":"subscribe"}` the connection also receives events.
-A subscriber that falls 256 events behind (stopped reading) is dropped:
+A subscriber that falls about 256 events behind (stopped reading) is
+disconnected; it resyncs on reconnect:
 
 ```json
 {"type":"event","event":"state","state":"paused","position_ms":61250}
