@@ -126,6 +126,16 @@ mod tests {
     }
 
     #[test]
+    fn fzf_syntax() {
+        let lines = ["ABBA - Mamma Mia", "Queen - Mamma Mia cover", "abbaq - x"];
+        let mut r = Ranker::new();
+        assert_eq!(r.rank("^queen", lines), [1]);
+        assert_eq!(r.rank("mamma !queen", lines), [0]);
+        assert_eq!(r.rank("'abbaq", lines), [2]);
+        assert_eq!(r.rank("cover$", lines), [1]);
+    }
+
+    #[test]
     fn real_and_position_round_trip() {
         let none = Filter::default();
         assert_eq!(none.len(5), 5);
