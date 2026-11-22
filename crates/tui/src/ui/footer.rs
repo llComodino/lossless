@@ -11,11 +11,25 @@ const HINT: &str = "?: keys";
 /// Narrower than this the hint gives way to the message.
 const HINT_MIN_WIDTH: u16 = 24;
 
+/// The current view's query, while editing or with a filter active.
+fn query(app: &App) -> Option<String> {
+    let f = &app.filters[app.view.index()];
+    if f.editing {
+        Some(format!("/ {}_", f.query))
+    } else {
+        let n = f.hits.as_ref()?.len();
+        let total = app.total(app.view);
+        Some(format!("/ {}  {n} of {total}", f.query))
+    }
+}
+
 pub fn draw(app: &App, f: &mut Frame, area: Rect) {
-    let text = match (&app.footer, app.connected) {
-        (Some(t), _) => t.as_str(),
-        (None, false) => "disconnected",
-        (None, true) => "",
+    let query = query(app);
+    let text = match (&app.footer, &query, app.connected) {
+        (Some(t), ..) => t.as_str(),
+        (None, Some(q), _) => q.as_str(),
+        (None, None, false) => "disconnected",
+        (None, None, true) => "",
     };
     let hint = HINT.len() as u16;
     let message = if area.width >= HINT_MIN_WIDTH {
@@ -27,6 +41,8 @@ pub fn draw(app: &App, f: &mut Frame, area: Rect) {
     };
     let style = if text.starts_with("error: ") {
         Style::new().fg(theme::RED)
+    } else if app.footer.is_none() && query.is_some() {
+        Style::new().fg(theme::YELLOW)
     } else {
         Style::new()
     };

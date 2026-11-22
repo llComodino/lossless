@@ -4,13 +4,14 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::app::App;
+use crate::app::{App, View};
 use crate::theme;
 
 pub fn draw(app: &App, f: &mut Frame, area: Rect) {
     let playing = app.status.as_ref().and_then(|s| s.index);
+    let rows = app.filters[View::Queue.index()].visible(&app.queue);
     track_rows(
-        &app.queue,
+        &rows,
         app.queue_selected,
         app.queue_offset,
         playing,
@@ -19,10 +20,11 @@ pub fn draw(app: &App, f: &mut Frame, area: Rect) {
     );
 }
 
-/// Numbered track rows (title, duration, format), `selected` highlighted and
-/// `playing` marked.
+/// Track rows as shown, `(real index, track)`: numbered by the real index,
+/// the row at position `selected` highlighted and the real index `playing`
+/// marked.
 pub fn track_rows(
-    tracks: &[Track],
+    rows: &[(usize, &Track)],
     selected: usize,
     offset: usize,
     playing: Option<usize>,
@@ -31,12 +33,12 @@ pub fn track_rows(
 ) {
     let height = usize::from(area.height);
     let width = usize::from(area.width);
-    let lines: Vec<Line> = tracks
+    let lines: Vec<Line> = rows
         .iter()
         .enumerate()
         .skip(offset)
         .take(height)
-        .map(|(i, t)| {
+        .map(|(pos, &(i, t))| {
             let mark = if playing == Some(i) { '\u{25b6}' } else { ' ' };
             let dur = t.duration_ms.map_or_else(|| "?".into(), clock);
             let fmt = t.format.as_ref().map_or_else(String::new, rate_str);
@@ -44,7 +46,7 @@ pub fn track_rows(
             let title = width.saturating_sub(7 + tail.chars().count());
             let head = format!("{mark} {:>3}  {}", i + 1, fit(&describe(t), title));
             let row = fit(&format!("{head}{tail}"), width);
-            let (style, tail_style) = if i == selected {
+            let (style, tail_style) = if pos == selected {
                 (theme::selected(), theme::selected())
             } else if playing == Some(i) {
                 (theme::playing(), theme::dim())

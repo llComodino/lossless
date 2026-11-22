@@ -32,8 +32,8 @@ pub fn draw(app: &App, f: &mut Frame) {
     f.render_widget(block, body);
     match app.view {
         View::Queue => queue::draw(app, f, inner),
-        View::Directories => columns::draw(&app.dirs, f, inner),
-        View::Artists => columns::draw(&app.artists, f, inner),
+        View::Directories => columns::draw(&app.dirs, &app.filters[1], f, inner),
+        View::Artists => columns::draw(&app.artists, &app.filters[2], f, inner),
         View::Search => search::draw(app, f, inner),
     }
     footer::draw(app, f, foot);
@@ -79,6 +79,7 @@ mod tests {
     use super::draw;
     use crate::app::{App, View};
     use crate::clock::Clock;
+    use crate::filter::Filter;
     use crate::theme;
 
     fn track(artist: &str, title: &str) -> Track {
@@ -327,6 +328,7 @@ mod tests {
             "r / z",
             "+/-",
             "/",
+            "Esc",
             "u",
             "o",
             "?",
@@ -460,6 +462,43 @@ mod tests {
         assert!(r.contains("2:31") && r.contains("24-bit/48 kHz"), "{r:?}");
         let y = l.iter().position(|r| r.contains("X - Other")).unwrap() as u16;
         assert_eq!(t.backend().buffer()[(10, y)].bg, theme::SELECTED_BG);
+    }
+
+    fn filtered(hits: Vec<usize>) -> Filter {
+        Filter {
+            query: "k".into(),
+            editing: false,
+            hits: Some(hits),
+        }
+    }
+
+    #[test]
+    fn filtered_rows_keep_their_real_numbers() {
+        let mut a = app("default", None);
+        a.filters[View::Queue.index()] = filtered(vec![1]);
+        a.queue_selected = 0;
+        let (l, t) = render(&a);
+        let y = l
+            .iter()
+            .position(|r| r.contains("   2  Kenshi Yonezu - KICK BACK"))
+            .unwrap();
+        assert_eq!(t.backend().buffer()[(10, y as u16)].bg, theme::SELECTED_BG);
+        assert!(!l.iter().any(|r| r.contains("Kenshi Yonezu - IRIS OUT (")));
+        assert!(l[23].starts_with("/ k  1 of 2 "), "{:?}", l[23]);
+        assert_eq!(t.backend().buffer()[(0, 23)].fg, theme::YELLOW);
+    }
+
+    #[test]
+    fn columns_show_the_current_column_filtered() {
+        let mut a = browsing(View::Directories);
+        a.filters[View::Directories.index()] = filtered(vec![1]);
+        a.dirs.selected = 0;
+        let (l, t) = sized(&a, 100, 24);
+        assert!(!l.iter().any(|r| r.contains("Album One/")));
+        let y = l.iter().position(|r| r.contains("Two/")).unwrap() as u16;
+        let x = col_of(&l[y as usize], "Two/").unwrap() as u16;
+        assert_eq!(t.backend().buffer()[(x, y)].bg, theme::SELECTED_BG);
+        assert!(l.iter().any(|r| r.contains("Jazz/")));
     }
 
     #[test]

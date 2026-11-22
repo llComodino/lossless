@@ -55,9 +55,10 @@ pub enum Action {
     Backspace,
     Submit,
     Cancel,
+    ClearFilter,
 }
 
-pub fn action(view: View, key: KeyEvent, searching: bool) -> Option<Action> {
+pub fn action(view: View, key: KeyEvent, editing: bool) -> Option<Action> {
     use Action::*;
     use KeyCode::Char;
     if key.kind == KeyEventKind::Release {
@@ -67,9 +68,13 @@ pub fn action(view: View, key: KeyEvent, searching: bool) -> Option<Action> {
     let plain = !key
         .modifiers
         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
-    if searching {
+    if editing {
         return match key.code {
+            Char('n') if ctrl => Some(Down),
+            Char('p') if ctrl => Some(Up),
             Char(c) if plain => Some(Type(c)),
+            KeyCode::Down => Some(Down),
+            KeyCode::Up => Some(Up),
             KeyCode::Backspace => Some(Backspace),
             KeyCode::Enter => Some(Submit),
             KeyCode::Esc => Some(Cancel),
@@ -92,6 +97,7 @@ pub fn action(view: View, key: KeyEvent, searching: bool) -> Option<Action> {
         KeyCode::Tab => NextView,
         KeyCode::BackTab => PrevView,
         KeyCode::Enter => Enter,
+        KeyCode::Esc => ClearFilter,
         Char('a') if !queue => Add,
         Char('A') if !queue => AddNext,
         Char('d') if queue => Remove,
@@ -176,6 +182,9 @@ mod tests {
             (View::Queue, c('?'), Some(Help)),
             (View::Queue, c('q'), Some(Quit)),
             (View::Queue, key(KeyCode::Down, none), None),
+            (View::Queue, key(KeyCode::Esc, none), Some(ClearFilter)),
+            (View::Directories, c('/'), Some(EditQuery)),
+            (View::Artists, key(KeyCode::Esc, none), Some(ClearFilter)),
         ];
         for (view, k, want) in rows {
             assert_eq!(action(view, k, false), want, "{view:?} {k:?}");
@@ -196,9 +205,16 @@ mod tests {
             (key(KeyCode::Enter, none), Some(Submit)),
             (key(KeyCode::Esc, none), Some(Cancel)),
             (key(KeyCode::Tab, none), None),
+            (key(KeyCode::Down, none), Some(Down)),
+            (key(KeyCode::Up, none), Some(Up)),
+            (key(KeyCode::Char('n'), KeyModifiers::CONTROL), Some(Down)),
+            (key(KeyCode::Char('p'), KeyModifiers::CONTROL), Some(Up)),
+            (key(KeyCode::Char('x'), KeyModifiers::CONTROL), None),
         ];
-        for (k, want) in rows {
-            assert_eq!(action(View::Search, k, true), want, "{k:?}");
+        for view in View::ALL {
+            for (k, want) in rows {
+                assert_eq!(action(view, k, true), want, "{view:?} {k:?}");
+            }
         }
     }
 

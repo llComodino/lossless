@@ -3,7 +3,6 @@
 mod app;
 mod clock;
 mod conn;
-#[cfg_attr(not(test), allow(dead_code))]
 mod filter;
 mod input;
 mod keys;

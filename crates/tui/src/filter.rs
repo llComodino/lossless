@@ -54,6 +54,14 @@ impl Filter {
         }
     }
 
+    /// `items` as shown: `(real index, item)` in filter order.
+    pub fn visible<'a, T>(&self, items: &'a [T]) -> Vec<(usize, &'a T)> {
+        match &self.hits {
+            Some(h) => h.iter().filter_map(|&i| Some((i, items.get(i)?))).collect(),
+            None => items.iter().enumerate().collect(),
+        }
+    }
+
     pub fn position(&self, real: usize) -> Option<usize> {
         match &self.hits {
             Some(h) => h.iter().position(|&r| r == real),
@@ -128,5 +136,9 @@ mod tests {
         for p in 0..3 {
             assert_eq!(f.position(f.real(p, 5).unwrap()), Some(p));
         }
+        let items = ["a", "b", "c", "d", "e"];
+        assert_eq!(f.visible(&items), [(4, &"e"), (1, &"b"), (3, &"d")]);
+        assert_eq!(none.visible(&items[..2]), [(0, &"a"), (1, &"b")]);
+        assert_eq!(f.visible(&items[..2]), [(1, &"b")]);
     }
 }

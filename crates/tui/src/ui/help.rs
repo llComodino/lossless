@@ -4,7 +4,7 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 
 use crate::theme;
 
-pub(super) const KEYS: [(&str, &str); 17] = [
+pub(super) const KEYS: [(&str, &str); 18] = [
     ("j/k, g/G, Ctrl-d/Ctrl-u", "move, first/last, half page"),
     ("h/l", "column left/right; l on a track adds it"),
     ("1-4, Tab/S-Tab", "switch view"),
@@ -18,7 +18,8 @@ pub(super) const KEYS: [(&str, &str); 17] = [
     ("f/b", "seek +-5 s"),
     ("r / z", "cycle repeat / toggle random"),
     ("+/-", "volume +-5"),
-    ("/", "Search view, edit query"),
+    ("/", "filter this tab (fuzzy)"),
+    ("Esc", "clear the filter"),
     ("u", "update library"),
     ("o", "switch to the next profile"),
     ("?, q", "key help, quit"),

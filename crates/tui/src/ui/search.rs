@@ -2,9 +2,10 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 
 use super::queue::track_rows;
-use crate::app::App;
+use crate::app::{App, View};
 
 pub fn draw(app: &App, f: &mut Frame, area: Rect) {
     let s = &app.search;
-    track_rows(&app.library.tracks, s.selected, s.offset, None, f, area);
+    let rows = app.filters[View::Search.index()].visible(&app.library.tracks);
+    track_rows(&rows, s.selected, s.offset, None, f, area);
 }
