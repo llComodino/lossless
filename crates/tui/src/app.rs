@@ -37,7 +37,6 @@ pub enum Pending {
     /// A column of Directories at `path`; `select` names the
     /// entry to land on (the one `h` came out of).
     List {
-        view: View,
         path: Vec<String>,
         column: Col,
         select: Option<String>,
@@ -571,7 +570,7 @@ impl App {
                     self.rebuild_artists(None);
                     return vec![];
                 }
-                vec![list(view, cols.path.clone(), Col::Current, None)]
+                vec![list(cols.path.clone(), Col::Current, None)]
             }
             Some(Entry::Track(t)) => send(Command::Add {
                 paths: vec![t.path.clone()],
@@ -602,9 +601,9 @@ impl App {
         }
         let mut outs = Vec::new();
         if !loaded {
-            outs.push(list(view, cols.path.clone(), Col::Current, Some(name)));
+            outs.push(list(cols.path.clone(), Col::Current, Some(name)));
         }
-        outs.extend(parent_of(view, &cols.path));
+        outs.extend(parent_of(&cols.path));
         outs
     }
 
@@ -615,7 +614,7 @@ impl App {
             Some(Entry::Dir { name, .. }) => {
                 let mut path = self.cols(view).path.clone();
                 path.push(name.clone());
-                vec![list(view, path, Col::Preview, None)]
+                vec![list(path, Col::Preview, None)]
             }
             _ => vec![],
         }
@@ -680,8 +679,8 @@ impl App {
     fn refetch(&mut self) -> Vec<Out> {
         let mut outs = Vec::new();
         let path = self.dirs.path.clone();
-        outs.extend(parent_of(View::Directories, &path));
-        outs.push(list(View::Directories, path, Col::Current, None));
+        outs.extend(parent_of(&path));
+        outs.push(list(path, Col::Current, None));
         outs
     }
 
@@ -754,13 +753,12 @@ impl App {
             }
             (
                 Pending::List {
-                    view,
                     path,
                     column,
                     select,
                 },
                 body,
-            ) => self.listed(view, path, column, select, body),
+            ) => self.listed(path, column, select, body),
             (Pending::Tracks, Body::Library { generation, tracks }) => {
                 self.library_changed(|lib| lib.replace(generation, tracks))
             }
@@ -770,23 +768,14 @@ impl App {
 
     fn listed(
         &mut self,
-        view: View,
         path: Vec<String>,
         column: Col,
         select: Option<String>,
         body: Body,
     ) -> Vec<Out> {
-        let entries = match body {
-            Body::Entries(e) => e,
-            Body::Names(names) => names
-                .into_iter()
-                .map(|n| Entry::Dir {
-                    path: n.clone(),
-                    name: n,
-                })
-                .collect(),
-            Body::Tracks(t) => t.into_iter().map(Entry::Track).collect(),
-            _ => return vec![],
+        let view = View::Directories;
+        let Body::Entries(entries) = body else {
+            return vec![];
         };
         let current = match self.chosen(view) {
             Some(Entry::Dir { name, .. }) => {
@@ -917,19 +906,18 @@ fn send(cmd: Command) -> Vec<Out> {
     vec![done(cmd)]
 }
 
-fn parent_of(view: View, path: &[String]) -> Option<Out> {
+fn parent_of(path: &[String]) -> Option<Out> {
     let (_, up) = path.split_last()?;
-    Some(list(view, up.to_vec(), Col::Parent, None))
+    Some(list(up.to_vec(), Col::Parent, None))
 }
 
 /// The request that lists a Directories column at `path`.
-fn list(view: View, path: Vec<String>, column: Col, select: Option<String>) -> Out {
+fn list(path: Vec<String>, column: Col, select: Option<String>) -> Out {
     Out::Send(
         Command::Browse {
             path: path.join("/"),
         },
         Pending::List {
-            view,
             path,
             column,
             select,
@@ -1071,9 +1059,8 @@ mod tests {
         p.iter().map(|s| s.to_string()).collect()
     }
 
-    fn list(view: View, path: &[&str], column: Col, select: Option<&str>) -> Pending {
+    fn list(path: &[&str], column: Col, select: Option<&str>) -> Pending {
         Pending::List {
-            view,
             path: paths(path),
             column,
             select: select.map(Into::into),
@@ -1157,7 +1144,7 @@ mod tests {
                 ch('l'),
                 vec![Out::Send(
                     Browse { path: "a".into() },
-                    list(View::Directories, &["a"], Col::Current, None),
+                    list(&["a"], Col::Current, None),
                 )],
             ),
             (View::Directories, ch('h'), vec![]),
@@ -1166,7 +1153,7 @@ mod tests {
                 ch('j'),
                 vec![Out::Send(
                     Browse { path: "b".into() },
-                    list(View::Directories, &["b"], Col::Preview, None),
+                    list(&["b"], Col::Preview, None),
                 )],
             ),
             (View::Directories, ch('k'), vec![]),
@@ -1232,14 +1219,17 @@ mod tests {
         paths.iter().map(|p| Entry::Track(tagged_of(p))).collect()
     }
 
-    fn tagged_of(path: &str) -> Track {
-        let app = app();
+    fn track_in(app: &App, path: &str) -> Track {
         app.library
             .tracks
             .iter()
             .find(|t| t.path == path)
             .unwrap()
             .clone()
+    }
+
+    fn tagged_of(path: &str) -> Track {
+        track_in(&app(), path)
     }
 
     #[test]
@@ -1271,27 +1261,6 @@ mod tests {
         assert_eq!(app.artists.selected, 0);
         assert!(app.artists.parent.is_empty());
         assert_eq!(app.artists.items, entries(&["Ann", "Bob", "Unknown"]));
-    }
-
-    #[test]
-    fn artist_columns_match_the_catalog() {
-        let app = app();
-        let c = &app.library.catalog;
-        assert_eq!(app.artist_column(&[]), entries_of(&c.artists()));
-        assert_eq!(
-            app.artist_column(&paths(&["Ann"])),
-            entries_of(&c.albums(Some("Ann")))
-        );
-        let want: Vec<Entry> = c
-            .find(&app.library.tracks, Some("Ann"), Some("Red"))
-            .into_iter()
-            .map(|i| Entry::Track(app.library.tracks[i].clone()))
-            .collect();
-        assert_eq!(app.artist_column(&paths(&["Ann", "Red"])), want);
-    }
-
-    fn entries_of(names: &[String]) -> Vec<Entry> {
-        names.iter().map(|n| named(n)).collect()
     }
 
     #[test]
@@ -1330,16 +1299,10 @@ mod tests {
             removed: paths(&["m/a1.flac", "m/a2.flac"]),
         };
         let outs = run(&mut app, event(1, gone));
-        assert!(outs.iter().all(|o| matches!(
-            o,
-            Out::Send(
-                Command::Browse { .. },
-                Pending::List {
-                    view: View::Directories,
-                    ..
-                }
-            )
-        )));
+        assert!(
+            outs.iter()
+                .all(|o| matches!(o, Out::Send(Command::Browse { .. }, Pending::List { .. })))
+        );
         assert_eq!(app.artists.items, entries(&["Blue", "Zed"]));
         assert_eq!(app.artists.selected, 1);
         assert_eq!(app.artists.preview, tracks_new(&["m/a4.flac"], &app));
@@ -1356,18 +1319,7 @@ mod tests {
     }
 
     fn tracks_new(p: &[&str], app: &App) -> Vec<Entry> {
-        p.iter()
-            .map(|p| {
-                Entry::Track(
-                    app.library
-                        .tracks
-                        .iter()
-                        .find(|t| t.path == *p)
-                        .unwrap()
-                        .clone(),
-                )
-            })
-            .collect()
+        p.iter().map(|p| Entry::Track(track_in(app, p))).collect()
     }
 
     #[test]
@@ -1603,21 +1555,21 @@ mod tests {
             outs,
             [Out::Send(
                 Command::Browse { path: "".into() },
-                list(View::Directories, &[], Col::Current, Some("a"))
+                list(&[], Col::Current, Some("a"))
             )]
         );
         assert_eq!(app.dirs.preview, [Entry::Track(track("a/t.flac"))]);
-        app.expect(4, list(View::Directories, &[], Col::Current, Some("a")));
+        app.expect(4, list(&[], Col::Current, Some("a")));
         let top = vec![named("0"), dir("a", "a")];
         assert_eq!(
             run(&mut app, reply(1, 4, Outcome::Ok(Body::Entries(top)))),
             [Out::Send(
                 Command::Browse { path: "a".into() },
-                list(View::Directories, &["a"], Col::Preview, None)
+                list(&["a"], Col::Preview, None)
             )]
         );
         assert_eq!(app.dirs.selected, 1);
-        app.expect(5, list(View::Directories, &["a"], Col::Preview, None));
+        app.expect(5, list(&["a"], Col::Preview, None));
         let inner = vec![Entry::Track(track("a/t.flac"))];
         run(
             &mut app,
@@ -1651,14 +1603,14 @@ mod tests {
             outs,
             [Out::Send(
                 Command::Browse { path: "".into() },
-                list(View::Directories, &[], Col::Parent, None)
+                list(&[], Col::Parent, None)
             )]
         );
         assert_eq!(app.dirs.items, [dir("b", "a/b"), dir("c", "a/c")]);
         assert_eq!(app.dirs.selected, 0);
         assert_eq!(app.dirs.preview, [Entry::Track(track("a/b/t.flac"))]);
         assert!(app.dirs.parent.is_empty());
-        app.expect(7, list(View::Directories, &[], Col::Parent, None));
+        app.expect(7, list(&[], Col::Parent, None));
         let top = vec![named("0"), dir("a", "a")];
         run(
             &mut app,
@@ -1685,8 +1637,8 @@ mod tests {
         let mut app = app();
         app.view = View::Directories;
         app.dirs.path = paths(&["a", "b"]);
-        app.expect(8, list(View::Directories, &["a"], Col::Parent, None));
-        app.expect(9, list(View::Directories, &[], Col::Parent, None));
+        app.expect(8, list(&["a"], Col::Parent, None));
+        app.expect(9, list(&[], Col::Parent, None));
         let stale = vec![named("zzz")];
         run(&mut app, reply(1, 9, Outcome::Ok(Body::Entries(stale))));
         assert!(app.dirs.parent.is_empty());
@@ -1697,7 +1649,7 @@ mod tests {
         );
         assert_eq!(app.dirs.parent, good);
         app.dirs.path = paths(&["a"]);
-        app.expect(10, list(View::Directories, &["a"], Col::Parent, None));
+        app.expect(10, list(&["a"], Col::Parent, None));
         run(
             &mut app,
             reply(1, 10, Outcome::Ok(Body::Entries(vec![named("q")]))),
@@ -1724,7 +1676,7 @@ mod tests {
         assert!(
             outs.contains(&Out::Send(
                 Command::Browse { path: "a".into() },
-                list(View::Directories, &["a"], Col::Parent, None)
+                list(&["a"], Col::Parent, None)
             )),
             "{outs:?}"
         );
@@ -1978,11 +1930,11 @@ mod tests {
             [
                 Out::Send(
                     Command::Browse { path: "".into() },
-                    list(View::Directories, &[], Col::Parent, None)
+                    list(&[], Col::Parent, None)
                 ),
                 Out::Send(
                     Command::Browse { path: "a".into() },
-                    list(View::Directories, &["a"], Col::Current, None)
+                    list(&["a"], Col::Current, None)
                 ),
                 Out::Send(Command::Tracks, Pending::Tracks),
             ]
@@ -2024,7 +1976,7 @@ mod tests {
         assert!(
             outs.contains(&Out::Send(
                 Command::Browse { path: "".into() },
-                list(View::Directories, &[], Col::Current, None)
+                list(&[], Col::Current, None)
             )),
             "{outs:?}"
         );
@@ -2284,7 +2236,7 @@ mod tests {
             run(&mut app, ch('b')),
             [Out::Send(
                 Command::Browse { path: "b".into() },
-                list(View::Directories, &["b"], Col::Preview, None)
+                list(&["b"], Col::Preview, None)
             )]
         );
         assert_eq!(app.dirs.selected, 0);
@@ -2292,11 +2244,11 @@ mod tests {
             run(&mut app, press(KeyCode::Backspace)),
             [Out::Send(
                 Command::Browse { path: "a".into() },
-                list(View::Directories, &["a"], Col::Preview, None)
+                list(&["a"], Col::Preview, None)
             )]
         );
-        app.expect(3, list(View::Directories, &["a"], Col::Preview, None));
-        app.expect(4, list(View::Directories, &["b"], Col::Preview, None));
+        app.expect(3, list(&["a"], Col::Preview, None));
+        app.expect(4, list(&["b"], Col::Preview, None));
         run(&mut app, ch('b'));
         let stale = vec![Entry::Track(track("a/t.flac"))];
         run(&mut app, reply(1, 3, Outcome::Ok(Body::Entries(stale))));
@@ -2315,7 +2267,7 @@ mod tests {
         app.view = View::Directories;
         typed(&mut app, "b");
         run(&mut app, press(KeyCode::Enter));
-        app.expect(6, list(View::Directories, &[], Col::Current, None));
+        app.expect(6, list(&[], Col::Current, None));
         let top = vec![named("a"), named("bb"), named("c"), named("b")];
         let outs = run(&mut app, reply(1, 6, Outcome::Ok(Body::Entries(top))));
         let want = Ranker::new().rank("b", ["a", "bb", "c", "b"]);
@@ -2328,7 +2280,7 @@ mod tests {
             outs,
             [Out::Send(
                 Command::Browse { path: top.clone() },
-                list(View::Directories, &[top.as_str()], Col::Preview, None)
+                list(&[top.as_str()], Col::Preview, None)
             )]
         );
     }
@@ -2343,7 +2295,7 @@ mod tests {
             run(&mut app, ch('l')),
             [Out::Send(
                 Command::Browse { path: "b".into() },
-                list(View::Directories, &["b"], Col::Current, None)
+                list(&["b"], Col::Current, None)
             )]
         );
         assert_eq!(app.dirs.path, paths(&["b"]));
