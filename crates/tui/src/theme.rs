@@ -29,3 +29,7 @@ pub fn dim() -> Style {
 pub fn border() -> Style {
     Style::new().fg(GREY)
 }
+
+pub fn accent() -> Style {
+    Style::new().fg(NIAGARA)
+}

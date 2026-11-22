@@ -10,8 +10,6 @@ use ratatui::widgets::Paragraph;
 use crate::app::App;
 use crate::theme;
 
-const ACCENT: fn() -> Style = || Style::new().fg(theme::NIAGARA);
-
 /// `s` with each `(needle, skip)` match accented from `skip` bytes in.
 fn accent<'a>(s: &'a str, marks: &[(String, usize)]) -> Line<'a> {
     let mut ranges: Vec<(usize, usize)> = marks
@@ -26,7 +24,7 @@ fn accent<'a>(s: &'a str, marks: &[(String, usize)]) -> Line<'a> {
             continue;
         }
         spans.push(Span::raw(&s[at..a]));
-        spans.push(Span::styled(&s[a..b], ACCENT()));
+        spans.push(Span::styled(&s[a..b], theme::accent()));
         at = b;
     }
     spans.push(Span::raw(&s[at..]));

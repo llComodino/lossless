@@ -60,7 +60,7 @@ pub fn draw(cols: &Columns<Entry>, filter: &Filter, f: &mut Frame, area: Rect) {
         current,
     );
     let preview_items: Vec<&Entry> = cols.preview.iter().collect();
-    list(&preview_items, None, 0, theme::selected(), f, preview);
+    list(&preview_items, None, 0, Style::new(), f, preview);
 }
 
 fn label(e: &Entry) -> String {
