@@ -629,6 +629,7 @@ mod props {
             Just(Command::Update),
             any::<String>().prop_map(|path| Command::Browse { path }),
             Just(Command::Artists),
+            Just(Command::Tracks),
             of(any::<String>()).prop_map(|artist| Command::Albums { artist }),
             (of(any::<String>()), of(any::<String>()))
                 .prop_map(|(artist, album)| Command::Find { artist, album }),
