@@ -188,9 +188,16 @@ impl App {
         }
     }
 
+    fn stop_editing(&mut self) {
+        for f in &mut self.filters {
+            f.editing = false;
+        }
+    }
+
     fn reset(&mut self, generation: u32) {
         self.generation = generation;
         self.pending.clear();
+        self.stop_editing();
         self.status = None;
         self.clock = stopped();
         self.queue.clear();
@@ -368,7 +375,7 @@ impl App {
             self.help = false;
             return vec![];
         }
-        let editing = self.filters[self.view.index()].editing;
+        let editing = self.connected && self.filters[self.view.index()].editing;
         let action = keys::action(self.view, key, editing);
         if !self.connected {
             return match action {
@@ -922,6 +929,7 @@ pub fn update(app: &mut App, msg: Msg, now: Instant) -> Vec<Out> {
         Msg::Disconnected(_) => {
             app.connected = false;
             app.pending.clear();
+            app.stop_editing();
             app.stop_clock(now);
             app.footer = Some(DISCONNECTED.into());
             vec![]
@@ -1401,6 +1409,41 @@ mod tests {
         run(&mut app, press(KeyCode::BackTab));
         assert_eq!(app.view, View::Search);
         assert!(app.filters.iter().all(|f| !f.editing));
+    }
+
+    #[test]
+    fn quit_works_while_disconnected_with_a_filter_open() {
+        let mut app = app();
+        run(&mut app, ch('/'));
+        run(&mut app, ch('a'));
+        run(&mut app, ch('b'));
+        let g = app.generation;
+        run(&mut app, Msg::Disconnected(g));
+        assert!(!app.filters[app.view.index()].editing);
+        assert_eq!(app.filters[app.view.index()].query, "ab");
+        run(&mut app, ch('q'));
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn quit_works_after_a_failed_connect_with_a_filter_open() {
+        let mut app = app();
+        run(&mut app, ch('/'));
+        run(&mut app, ch('a'));
+        app.connect_failed(app.generation + 1);
+        assert!(app.filters.iter().all(|f| !f.editing));
+        run(&mut app, ch('q'));
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn escape_while_disconnected_only_reconnects() {
+        let mut app = app();
+        run(&mut app, ch('/'));
+        let g = app.generation;
+        run(&mut app, Msg::Disconnected(g));
+        assert_eq!(run(&mut app, press(KeyCode::Esc)), [Out::Reconnect]);
+        assert!(!app.quit);
     }
 
     #[test]

@@ -489,6 +489,16 @@ mod tests {
     }
 
     #[test]
+    fn disconnected_wins_over_the_filter_line() {
+        let mut a = app("default", None);
+        a.filters[View::Queue.index()] = filtered(vec![1]);
+        a.connected = false;
+        let (l, _) = render(&a);
+        assert!(l[23].contains("disconnected"), "{:?}", l[23]);
+        assert!(!l[23].contains("1 of 2"), "{:?}", l[23]);
+    }
+
+    #[test]
     fn columns_show_the_current_column_filtered() {
         let mut a = browsing(View::Directories);
         a.filters[View::Directories.index()] = filtered(vec![1]);

@@ -27,8 +27,8 @@ pub fn draw(app: &App, f: &mut Frame, area: Rect) {
     let query = query(app);
     let text = match (&app.footer, &query, app.connected) {
         (Some(t), ..) => t.as_str(),
-        (None, Some(q), _) => q.as_str(),
-        (None, None, false) => "disconnected",
+        (None, _, false) => "disconnected",
+        (None, Some(q), true) => q.as_str(),
         (None, None, true) => "",
     };
     let hint = HINT.len() as u16;
@@ -41,7 +41,7 @@ pub fn draw(app: &App, f: &mut Frame, area: Rect) {
     };
     let style = if text.starts_with("error: ") {
         Style::new().fg(theme::RED)
-    } else if app.footer.is_none() && query.is_some() {
+    } else if app.footer.is_none() && app.connected && query.is_some() {
         Style::new().fg(theme::YELLOW)
     } else {
         Style::new()
