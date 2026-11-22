@@ -678,17 +678,19 @@ impl App {
         outs
     }
 
+    /// `Applied` and `Refetch` may both follow a change to the copy, so
+    /// both rebuild Artists and re-apply the Search filter.
     fn library_delta(&mut self, delta: Delta) -> Vec<Out> {
-        match delta {
-            Delta::Applied => {
-                self.rebuild_artists(None);
-                let mut outs = self.refilter(View::Search, false);
-                outs.extend(self.refetch());
-                outs
-            }
-            Delta::Refetch => vec![Out::Send(Command::Tracks, Pending::Tracks)],
-            Delta::Stale => vec![],
+        if delta == Delta::Stale {
+            return vec![];
         }
+        self.rebuild_artists(None);
+        let mut outs = self.refilter(View::Search, false);
+        outs.extend(match delta {
+            Delta::Refetch => vec![Out::Send(Command::Tracks, Pending::Tracks)],
+            _ => self.refetch(),
+        });
+        outs
     }
 
     fn reply(&mut self, id: u64, result: Outcome, now: Instant) -> Vec<Out> {
@@ -2326,6 +2328,43 @@ mod tests {
             run(&mut app, press(KeyCode::Enter)),
             [done(Command::Replace {
                 paths: paths(&["m/z.flac"])
+            })]
+        );
+    }
+
+    #[test]
+    fn refetch_reapplies_the_search_filter() {
+        let mut app = app();
+        app.library
+            .replace(1, vec![titled("old/z.flac", "Zed", "Old")]);
+        app.view = View::Search;
+        typed(&mut app, "zed");
+        run(&mut app, press(KeyCode::Enter));
+        assert_eq!(app.filters[3].hits, Some(vec![0]));
+        app.library.clear();
+        let early = Event::LibraryChanged {
+            generation: 5,
+            tracks: 0,
+            added: vec![],
+            removed: vec![],
+        };
+        assert_eq!(run(&mut app, event(1, early)), []);
+        app.expect(7, Pending::Tracks);
+        let library = Body::Library {
+            generation: 4,
+            tracks: vec![titled("a.flac", "Ann", "A"), titled("z.flac", "Zed", "Zz")],
+        };
+        let outs = run(&mut app, reply(1, 7, Outcome::Ok(library)));
+        assert!(
+            outs.contains(&Out::Send(Command::Tracks, Pending::Tracks)),
+            "{outs:?}"
+        );
+        assert_eq!(app.filters[3].hits, Some(vec![1]));
+        assert_eq!(app.artists.items, entries(&["Ann", "Zed"]));
+        assert_eq!(
+            run(&mut app, press(KeyCode::Enter)),
+            [done(Command::Replace {
+                paths: paths(&["z.flac"])
             })]
         );
     }
