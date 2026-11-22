@@ -327,7 +327,16 @@ fn print_event(e: &Event) {
         },
         Event::QueueChanged => out!("queue changed"),
         Event::Mode { repeat, random } => out!("mode {}", modes(*repeat, *random)),
-        Event::LibraryChanged { tracks } => out!("library {tracks} tracks"),
+        Event::LibraryChanged {
+            tracks,
+            added,
+            removed,
+            ..
+        } => out!(
+            "library changed: {tracks} tracks (+{} -{})",
+            added.len(),
+            removed.len()
+        ),
         Event::Volume { percent } => out!("volume {percent}%"),
         Event::Error(e) => out!("error: {}", e.message),
     }
@@ -384,7 +393,9 @@ fn main() -> Result<()> {
                         match body {
                             Body::Done => {}
                             Body::Status(s) => print_status(&s),
-                            Body::Tracks(tracks) => print_tracks(&tracks),
+                            Body::Tracks(tracks) | Body::Library { tracks, .. } => {
+                                print_tracks(&tracks)
+                            }
                             Body::Names(names) => {
                                 for n in names {
                                     out!("{n}");

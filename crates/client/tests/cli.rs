@@ -336,6 +336,8 @@ fn watch_prints_events() {
     watch.wait_for("state Playing at 0:00");
     s.ok(&["stop"]);
     watch.wait_for("state Stopped");
+    s.ok(&["update"]);
+    watch.wait_for("library changed: 2 tracks (+2 -0)");
 }
 
 #[test]

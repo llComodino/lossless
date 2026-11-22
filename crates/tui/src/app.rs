@@ -1355,7 +1355,18 @@ mod tests {
     fn refetch_also_fetches_the_parent() {
         let mut app = app();
         app.dirs.path = paths(&["a", "b"]);
-        let outs = run(&mut app, event(1, Event::LibraryChanged { tracks: 0 }));
+        let outs = run(
+            &mut app,
+            event(
+                1,
+                Event::LibraryChanged {
+                    generation: 1,
+                    tracks: 0,
+                    added: vec![],
+                    removed: vec![],
+                },
+            ),
+        );
         assert!(
             outs.contains(&Out::Send(
                 Command::Browse { path: "a".into() },

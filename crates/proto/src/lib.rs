@@ -78,6 +78,8 @@ pub enum Command {
     },
     /// Rescan the music directory.
     Update,
+    /// The whole library, with its generation.
+    Tracks,
     /// Folders and tracks directly under a path relative to the music
     /// directory (empty for the top).
     Browse {
@@ -157,6 +159,11 @@ pub enum Body {
     Status(Box<Status>),
     Queue(Vec<Track>),
     Tracks(Vec<Track>),
+    /// The whole library as of `generation`.
+    Library {
+        generation: u64,
+        tracks: Vec<Track>,
+    },
     Entries(Vec<Entry>),
     Names(Vec<String>),
 }
@@ -185,8 +192,13 @@ pub enum Event {
         repeat: Repeat,
         random: bool,
     },
+    /// A rescan finished: `tracks` is the new total, and `added` (new or
+    /// changed) and `removed` (paths) patch the copy at `generation - 1`.
     LibraryChanged {
+        generation: u64,
         tracks: usize,
+        added: Vec<Track>,
+        removed: Vec<String>,
     },
     /// Sent on every `set_volume` and on changes made outside the daemon.
     Volume {
@@ -386,6 +398,45 @@ mod tests {
             reply(Body::Names(vec!["n".into()])),
             "{\"type\":\"reply\",\"id\":4,\"ok\":{\"kind\":\"names\",\"data\":[\"n\"]}}\n"
         );
+    }
+
+    #[test]
+    fn library_on_the_wire() {
+        assert_eq!(
+            encode(&Request {
+                id: 1,
+                command: Command::Tracks
+            })
+            .unwrap(),
+            "{\"id\":1,\"cmd\":\"tracks\"}\n"
+        );
+        let body = Body::Library {
+            generation: 3,
+            tracks: vec![],
+        };
+        let line = encode(&ServerMessage::Reply {
+            id: 4,
+            result: Outcome::Ok(body.clone()),
+        })
+        .unwrap();
+        assert_eq!(
+            line,
+            "{\"type\":\"reply\",\"id\":4,\"ok\":{\"kind\":\"library\",\"data\":{\"generation\":3,\"tracks\":[]}}}\n"
+        );
+        let ev = ServerMessage::Event {
+            event: Event::LibraryChanged {
+                generation: 2,
+                tracks: 5,
+                added: vec![],
+                removed: vec!["/m/a.flac".into()],
+            },
+        };
+        let line = encode(&ev).unwrap();
+        assert_eq!(
+            line,
+            "{\"type\":\"event\",\"event\":\"library_changed\",\"generation\":2,\"tracks\":5,\"added\":[],\"removed\":[\"/m/a.flac\"]}\n"
+        );
+        assert_eq!(decode::<ServerMessage>(&line).unwrap(), ev);
     }
 
     #[test]
@@ -649,7 +700,20 @@ mod props {
             of(any::<usize>()).prop_map(|index| Event::TrackChanged { index }),
             Just(Event::QueueChanged),
             (repeat(), any::<bool>()).prop_map(|(repeat, random)| Event::Mode { repeat, random }),
-            any::<usize>().prop_map(|tracks| Event::LibraryChanged { tracks }),
+            (
+                any::<u64>(),
+                any::<usize>(),
+                proptest::collection::vec(track(), 0..3),
+                proptest::collection::vec(any::<String>(), 0..3)
+            )
+                .prop_map(|(generation, tracks, added, removed)| {
+                    Event::LibraryChanged {
+                        generation,
+                        tracks,
+                        added,
+                        removed,
+                    }
+                }),
             any::<u8>().prop_map(|percent| Event::Volume { percent }),
             wire_error().prop_map(Event::Error),
         ]
@@ -661,6 +725,8 @@ mod props {
             status().prop_map(|s| Body::Status(Box::new(s))),
             proptest::collection::vec(track(), 0..3).prop_map(Body::Queue),
             proptest::collection::vec(track(), 0..3).prop_map(Body::Tracks),
+            (any::<u64>(), proptest::collection::vec(track(), 0..3))
+                .prop_map(|(generation, tracks)| Body::Library { generation, tracks }),
             proptest::collection::vec(entry(), 0..3).prop_map(Body::Entries),
             proptest::collection::vec(any::<String>(), 0..3).prop_map(Body::Names),
         ];

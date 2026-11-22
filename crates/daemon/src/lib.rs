@@ -136,6 +136,22 @@ impl Drop for ClearOnDrop {
     }
 }
 
+/// Install `new` as the library, bumping its generation, and describe the
+/// change. The write lock is released before this returns, so the caller
+/// broadcasts without blocking readers.
+fn swap(library: &RwLock<Library>, mut new: Library) -> Event {
+    let mut guard = library.write().unwrap_or_else(PoisonError::into_inner);
+    let changes = new.replaces(&guard);
+    let (generation, tracks) = (new.generation(), new.len());
+    *guard = new;
+    Event::LibraryChanged {
+        generation,
+        tracks,
+        added: changes.added,
+        removed: changes.removed,
+    }
+}
+
 /// Rescan `root` in the background unless a scan is already running. If the
 /// scan panics (say, on a malformed tag), the flag is still cleared so later
 /// updates aren't silently ignored.
@@ -152,10 +168,11 @@ fn spawn_scan(
         let _clear = ClearOnDrop(scanning);
         match Library::scan(&root) {
             Ok(lib) => {
-                let tracks = lib.len();
-                *library.write().unwrap_or_else(PoisonError::into_inner) = lib;
-                info!("library: {tracks} tracks in {}", root.display());
-                broadcast(&subscribers, Event::LibraryChanged { tracks });
+                let event = swap(&library, lib);
+                if let Event::LibraryChanged { tracks, .. } = &event {
+                    info!("library: {tracks} tracks in {}", root.display());
+                }
+                broadcast(&subscribers, event);
             }
             Err(e) => warn!("library: scan failed: {e}"),
         }
@@ -237,6 +254,13 @@ impl State {
                     .map(|p| self.track(p))
                     .collect(),
             )),
+            Command::Tracks => {
+                let lib = self.library.read().unwrap_or_else(PoisonError::into_inner);
+                Ok(Body::Library {
+                    generation: lib.generation(),
+                    tracks: lib.tracks().to_vec(),
+                })
+            }
             Command::Search { query } => {
                 let lib = self.library.read().unwrap_or_else(PoisonError::into_inner);
                 Ok(Body::Tracks(
@@ -580,13 +604,28 @@ mod tests {
     use lossless_library::{Library, collect};
     use lossless_proto::{PlayState, Repeat};
 
-    use super::{ClearOnDrop, Daemon, MAX_REQUEST, saved, serve, spawn_scan};
+    use super::{ClearOnDrop, Daemon, MAX_REQUEST, saved, serve, spawn_scan, swap};
 
     fn scan(root: PathBuf, busy: bool) -> (Option<std::thread::JoinHandle<()>>, Arc<AtomicBool>) {
         let flag = Arc::new(AtomicBool::new(busy));
         let library = Arc::new(RwLock::new(Library::default()));
         let subs = Arc::new(Mutex::new(Vec::new()));
         (spawn_scan(root, library, Arc::clone(&flag), subs), flag)
+    }
+
+    #[test]
+    fn swap_releases_the_write_lock_before_the_broadcast() {
+        let library = RwLock::new(Library::default());
+        let event = swap(&library, Library::default());
+        assert!(library.try_write().is_ok());
+        assert!(matches!(
+            event,
+            lossless_proto::Event::LibraryChanged {
+                generation: 1,
+                tracks: 0,
+                ..
+            }
+        ));
     }
 
     #[test]

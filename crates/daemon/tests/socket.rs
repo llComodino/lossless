@@ -294,7 +294,19 @@ fn update_scans_and_search_finds() {
     c.ok(Command::Subscribe);
     c.ok(Command::Update);
     let ev = c.wait_for(|e| matches!(e, Event::LibraryChanged { .. }));
-    assert_eq!(ev, Event::LibraryChanged { tracks: 2 });
+    let Event::LibraryChanged {
+        generation,
+        tracks,
+        added,
+        removed,
+    } = ev
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        (generation, tracks, added.len(), removed.len()),
+        (1, 2, 2, 0)
+    );
     let hits = match c.ok(Command::Search {
         query: "TWO".into(),
     }) {
@@ -310,6 +322,57 @@ fn update_scans_and_search_finds() {
         Body::Tracks(t) => assert!(t.is_empty()),
         other => panic!("{other:?}"),
     }
+}
+
+fn library(c: &mut Client) -> (u64, Vec<lossless_proto::Track>) {
+    match c.ok(Command::Tracks) {
+        Body::Library { generation, tracks } => (generation, tracks),
+        other => panic!("not a library: {other:?}"),
+    }
+}
+
+#[test]
+fn tracks_lists_the_library_with_its_generation() {
+    let s = Server::start(true);
+    let files = s.album(1);
+    let mut c = s.connect();
+    assert_eq!(library(&mut c), (0, vec![]));
+    c.ok(Command::Subscribe);
+    c.ok(Command::Update);
+    c.wait_for(|e| matches!(e, Event::LibraryChanged { .. }));
+    let (generation, tracks) = library(&mut c);
+    assert_eq!(generation, 1);
+    let mut paths: Vec<_> = tracks.into_iter().map(|t| t.path).collect();
+    paths.sort();
+    let want: Vec<_> = files.iter().map(|f| f.display().to_string()).collect();
+    assert_eq!(paths, want);
+}
+
+#[test]
+fn update_sends_the_delta() {
+    let s = Server::start(true);
+    let files = s.album(1);
+    let mut c = s.connect();
+    c.ok(Command::Subscribe);
+    c.ok(Command::Update);
+    c.wait_for(|e| matches!(e, Event::LibraryChanged { .. }));
+    std::fs::remove_file(&files[0]).unwrap();
+    let new = flac_at(&s.music().join("album/03 three.flac"), 44_100, 16, 2, BLOCK).path;
+    c.ok(Command::Update);
+    let Event::LibraryChanged {
+        generation,
+        tracks,
+        added,
+        removed,
+    } = c.wait_for(|e| matches!(e, Event::LibraryChanged { .. }))
+    else {
+        unreachable!()
+    };
+    assert_eq!((generation, tracks), (2, 2));
+    let added: Vec<_> = added.into_iter().map(|t| t.path).collect();
+    assert_eq!(added, [new.display().to_string()]);
+    assert_eq!(removed, [files[0].display().to_string()]);
+    assert_eq!(library(&mut c).0, 2);
 }
 
 #[test]
