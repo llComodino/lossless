@@ -3,6 +3,7 @@ use std::cmp::Reverse;
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Matcher, Utf32Str};
 
+/// fzf-style ranking, reusing its matcher and buffer across keystrokes.
 pub struct Ranker {
     matcher: Matcher,
     buf: Vec<char>,
@@ -16,6 +17,8 @@ impl Ranker {
         }
     }
 
+    /// Indices of the `lines` that match `query`, best first, ties in input
+    /// order. `query` must not be empty: an empty pattern matches everything.
     pub fn rank<S: AsRef<str>>(
         &mut self,
         query: &str,
@@ -35,6 +38,8 @@ impl Ranker {
     }
 }
 
+/// One view's filter. `hits` holds real indices in rank order, `None`
+/// while the query is empty (the whole list shows).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Filter {
     pub query: String,
@@ -43,10 +48,12 @@ pub struct Filter {
 }
 
 impl Filter {
+    /// Visible rows of a list of `total`.
     pub fn len(&self, total: usize) -> usize {
         self.hits.as_ref().map_or(total, Vec::len)
     }
 
+    /// The real index shown at visible `pos`, `None` past the end.
     pub fn real(&self, pos: usize, total: usize) -> Option<usize> {
         match &self.hits {
             Some(h) => h.get(pos).copied().filter(|&i| i < total),
@@ -62,6 +69,8 @@ impl Filter {
         }
     }
 
+    /// Where real index `real` shows; unbounded without a filter, so callers
+    /// clamp to the list.
     pub fn position(&self, real: usize) -> Option<usize> {
         match &self.hits {
             Some(h) => h.iter().position(|&r| r == real),
