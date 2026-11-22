@@ -444,19 +444,15 @@ mod tests {
     }
 
     #[test]
-    fn search_shows_query_and_results() {
+    fn search_lists_the_library() {
         let mut a = app("default", None);
         a.view = View::Search;
-        a.search.query = "iris".into();
-        a.search.editing = true;
-        a.search.results = vec![track("Kenshi Yonezu", "IRIS OUT"), track("X", "Other")];
+        a.library.replace(
+            0,
+            vec![track("Kenshi Yonezu", "IRIS OUT"), track("X", "Other")],
+        );
         a.search.selected = 1;
         let (l, t) = sized(&a, 80, 24);
-        let q = l
-            .iter()
-            .find(|r| r.contains("/ iris_"))
-            .expect("query line");
-        assert!(q.starts_with('\u{2502}'), "{q:?}");
         let r = l
             .iter()
             .find(|r| r.contains("Kenshi Yonezu - IRIS OUT"))
@@ -464,9 +460,6 @@ mod tests {
         assert!(r.contains("2:31") && r.contains("24-bit/48 kHz"), "{r:?}");
         let y = l.iter().position(|r| r.contains("X - Other")).unwrap() as u16;
         assert_eq!(t.backend().buffer()[(10, y)].bg, theme::SELECTED_BG);
-        a.search.editing = false;
-        let (l, _) = sized(&a, 80, 24);
-        assert!(l.iter().any(|r| r.contains("/ iris")) && !l.iter().any(|r| r.contains("/ iris_")));
     }
 
     #[test]
@@ -478,8 +471,7 @@ mod tests {
                     a.view = view;
                     a.help = help;
                     a.footer = Some("a long footer message that overflows".into());
-                    a.search.query = "q".into();
-                    a.search.results = vec![track("A", "B")];
+                    a.library.replace(0, vec![track("A", "B")]);
                     a.queue_selected = 1;
                     sized(&a, w, h);
                 }
@@ -509,7 +501,7 @@ mod tests {
         ];
         let mut a = app("default", None);
         a.queue = titles.iter().map(|t| track("Art", t)).collect();
-        a.search.results = a.queue.clone();
+        a.library.replace(0, a.queue.clone());
         a.view = View::Queue;
         let (q, _) = sized(&a, 80, 24);
         a.view = View::Search;

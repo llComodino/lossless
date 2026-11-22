@@ -32,7 +32,7 @@ pub enum Pending {
     Subscribe,
     Status,
     Queue,
-    /// A column of Directories or Artists at `path`; `select` names the
+    /// A column of Directories at `path`; `select` names the
     /// entry to land on (the one `h` came out of).
     List {
         view: View,
@@ -40,9 +40,6 @@ pub enum Pending {
         column: Col,
         select: Option<String>,
     },
-    /// `find` whose result paths become a `replace` or `add`.
-    Then(Op),
-    Search,
     Tracks,
     Done,
 }
@@ -56,7 +53,8 @@ pub enum Out {
 
 /// Miller columns: `items` lists `path`, `parent` the path without its
 /// last name (empty at the top), `preview` the selected item.
-/// Artists and albums are `Entry::Dir` named after them.
+/// Artists and albums are `Entry::Dir` named after them, built from the
+/// library copy.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Columns<T> {
     pub path: Vec<String>,
@@ -85,7 +83,6 @@ impl<T> Default for Columns<T> {
 pub struct Search {
     pub query: String,
     pub editing: bool,
-    pub results: Vec<Track>,
     pub selected: usize,
     pub offset: usize,
 }
@@ -200,7 +197,6 @@ impl App {
             cols.selected = 0;
             cols.offset = 0;
         }
-        self.search.results.clear();
         self.search.selected = 0;
         self.search.offset = 0;
         self.library.clear();
@@ -219,9 +215,8 @@ impl App {
         for cols in [&mut self.dirs, &mut self.artists] {
             scroll(&mut cols.offset, cols.selected, cols.items.len(), page);
         }
-        let rows = page.saturating_sub(1).max(1);
         let s = &mut self.search;
-        scroll(&mut s.offset, s.selected, s.results.len(), rows);
+        scroll(&mut s.offset, s.selected, self.library.tracks.len(), page);
     }
 
     fn columns(&mut self, view: View) -> &mut Columns<Entry> {
@@ -236,7 +231,7 @@ impl App {
             View::Queue => (&mut self.queue_selected, self.queue.len()),
             View::Directories => (&mut self.dirs.selected, self.dirs.items.len()),
             View::Artists => (&mut self.artists.selected, self.artists.items.len()),
-            View::Search => (&mut self.search.selected, self.search.results.len()),
+            View::Search => (&mut self.search.selected, self.library.tracks.len()),
         }
     }
 
@@ -339,15 +334,7 @@ impl App {
             }
             Submit => {
                 self.search.editing = false;
-                if self.search.query.trim().is_empty() {
-                    return vec![];
-                }
-                vec![Out::Send(
-                    Command::Search {
-                        query: self.search.query.clone(),
-                    },
-                    Pending::Search,
-                )]
+                vec![]
             }
             Cancel => {
                 self.search.editing = false;
@@ -369,7 +356,11 @@ impl App {
         }
         *sel = new;
         match self.view {
-            View::Directories | View::Artists => self.preview(self.view),
+            View::Directories => self.preview(View::Directories),
+            View::Artists => {
+                self.rebuild_preview();
+                vec![]
+            }
             _ => vec![],
         }
     }
@@ -406,7 +397,7 @@ impl App {
     fn take(&mut self, op: Op) -> Vec<Out> {
         let path = match self.view {
             View::Queue => return vec![],
-            View::Search => match self.search.results.get(self.search.selected) {
+            View::Search => match self.library.tracks.get(self.search.selected) {
                 Some(t) => t.path.clone(),
                 None => return vec![],
             },
@@ -416,16 +407,33 @@ impl App {
                     (Some(Entry::Track(t)), ..) => t.path.clone(),
                     (Some(Entry::Dir { path, .. }), View::Directories, _) => path.clone(),
                     (Some(Entry::Dir { name, .. }), _, []) => {
-                        return find(Some(name.clone()), None, op);
+                        let name = name.clone();
+                        return self.take_found(Some(&name), None, op);
                     }
                     (Some(Entry::Dir { name, .. }), _, [artist, ..]) => {
-                        return find(Some(artist.clone()), Some(name.clone()), op);
+                        let (artist, name) = (artist.clone(), name.clone());
+                        return self.take_found(Some(&artist), Some(&name), op);
                     }
                     (None, ..) => return vec![],
                 }
             }
         };
         vec![done(op.command(vec![path]))]
+    }
+
+    fn take_found(&self, artist: Option<&str>, album: Option<&str>, op: Op) -> Vec<Out> {
+        let lib = &self.library;
+        let paths: Vec<String> = lib
+            .catalog
+            .find(&lib.tracks, artist, album)
+            .into_iter()
+            .map(|i| lib.tracks[i].path.clone())
+            .collect();
+        if paths.is_empty() {
+            vec![]
+        } else {
+            send(op.command(paths))
+        }
     }
 
     fn right(&mut self) -> Vec<Out> {
@@ -436,6 +444,10 @@ impl App {
                 cols.path.push(name.clone());
                 cols.parent = std::mem::replace(&mut cols.items, std::mem::take(&mut cols.preview));
                 cols.selected = 0;
+                if view == View::Artists {
+                    self.rebuild_artists(None);
+                    return vec![];
+                }
                 vec![list(view, cols.path.clone(), Col::Current, None)]
             }
             Some(Entry::Track(t)) => send(Command::Add {
@@ -460,6 +472,10 @@ impl App {
             .iter()
             .position(|e| matches!(e, Entry::Dir { name: n, .. } if *n == name))
             .unwrap_or(0);
+        if view == View::Artists {
+            self.rebuild_artists(Some(name));
+            return vec![];
+        }
         let mut outs = Vec::new();
         if !loaded {
             outs.push(list(view, cols.path.clone(), Col::Current, Some(name)));
@@ -482,19 +498,79 @@ impl App {
         }
     }
 
+    /// The Artists column at `path`, from the library copy.
+    pub fn artist_column(&self, path: &[String]) -> Vec<Entry> {
+        let lib = &self.library;
+        let dirs = |names: Vec<String>| {
+            names
+                .into_iter()
+                .map(|n| Entry::Dir {
+                    path: n.clone(),
+                    name: n,
+                })
+                .collect()
+        };
+        match path {
+            [] => dirs(lib.catalog.artists()),
+            [artist] => dirs(lib.catalog.albums(Some(artist))),
+            [artist, album, ..] => lib
+                .catalog
+                .find(&lib.tracks, Some(artist), Some(album))
+                .into_iter()
+                .map(|i| Entry::Track(lib.tracks[i].clone()))
+                .collect(),
+        }
+    }
+
+    /// Refills the parent, current and preview columns of Artists at
+    /// `artists.path`; `select` names the entry to land on.
+    fn rebuild_artists(&mut self, select: Option<String>) {
+        let path = self.artists.path.clone();
+        let items = self.artist_column(&path);
+        let parent = match path.split_last() {
+            Some((_, up)) => self.artist_column(up),
+            None => Vec::new(),
+        };
+        let cols = &mut self.artists;
+        let found = select.and_then(|s| {
+            items
+                .iter()
+                .position(|e| matches!(e, Entry::Dir { name, .. } if *name == s))
+        });
+        cols.selected = clamp(found.unwrap_or(cols.selected), items.len());
+        cols.items = items;
+        cols.parent = parent;
+        self.rebuild_preview();
+    }
+
+    fn rebuild_preview(&mut self) {
+        let cols = &self.artists;
+        let preview = match cols.items.get(cols.selected) {
+            Some(Entry::Dir { name, .. }) => {
+                let mut path = cols.path.clone();
+                path.push(name.clone());
+                self.artist_column(&path)
+            }
+            _ => Vec::new(),
+        };
+        self.artists.preview = preview;
+    }
+
     fn refetch(&mut self) -> Vec<Out> {
         let mut outs = Vec::new();
-        for v in [View::Directories, View::Artists] {
-            let path = self.columns(v).path.clone();
-            outs.extend(parent_of(v, &path));
-            outs.push(list(v, path, Col::Current, None));
-        }
+        let path = self.dirs.path.clone();
+        outs.extend(parent_of(View::Directories, &path));
+        outs.push(list(View::Directories, path, Col::Current, None));
         outs
     }
 
     fn library_delta(&mut self, delta: Delta) -> Vec<Out> {
         match delta {
-            Delta::Applied => self.refetch(),
+            Delta::Applied => {
+                self.rebuild_artists(None);
+                self.search.selected = clamp(self.search.selected, self.library.tracks.len());
+                self.refetch()
+            }
             Delta::Refetch => vec![Out::Send(Command::Tracks, Pending::Tracks)],
             Delta::Stale => vec![],
         }
@@ -540,17 +616,9 @@ impl App {
                 },
                 body,
             ) => self.listed(view, path, column, select, body),
-            (Pending::Then(op), Body::Tracks(tracks)) if !tracks.is_empty() => {
-                send(op.command(tracks.into_iter().map(|t| t.path).collect()))
-            }
             (Pending::Tracks, Body::Library { generation, tracks }) => {
                 let delta = self.library.replace(generation, tracks);
                 self.library_delta(delta)
-            }
-            (Pending::Search, Body::Tracks(tracks)) => {
-                self.search.results = tracks;
-                self.search.selected = clamp(self.search.selected, self.search.results.len());
-                vec![]
             }
             _ => vec![],
         }
@@ -700,33 +768,17 @@ fn send(cmd: Command) -> Vec<Out> {
     vec![done(cmd)]
 }
 
-fn find(artist: Option<String>, album: Option<String>, op: Op) -> Vec<Out> {
-    vec![Out::Send(
-        Command::Find { artist, album },
-        Pending::Then(op),
-    )]
-}
-
 fn parent_of(view: View, path: &[String]) -> Option<Out> {
     let (_, up) = path.split_last()?;
     Some(list(view, up.to_vec(), Col::Parent, None))
 }
 
-/// The request that lists a Directories or Artists column at `path`.
+/// The request that lists a Directories column at `path`.
 fn list(view: View, path: Vec<String>, column: Col, select: Option<String>) -> Out {
-    let cmd = match (view, path.as_slice()) {
-        (View::Directories, p) => Command::Browse { path: p.join("/") },
-        (_, []) => Command::Artists,
-        (_, [artist]) => Command::Albums {
-            artist: Some(artist.clone()),
-        },
-        (_, [artist, album, ..]) => Command::Find {
-            artist: Some(artist.clone()),
-            album: Some(album.clone()),
-        },
-    };
     Out::Send(
-        cmd,
+        Command::Browse {
+            path: path.join("/"),
+        },
         Pending::List {
             view,
             path,
@@ -814,9 +866,27 @@ mod tests {
         app.queue = vec![track("q0"), track("q1"), track("q2")];
         app.queue_selected = 1;
         app.dirs.items = vec![dir("a", "a"), dir("b", "b"), Entry::Track(track("x.flac"))];
-        app.artists.items = vec![named("Ann"), named("Bob")];
-        app.search.results = vec![track("hit.flac")];
+        app.library.replace(
+            1,
+            vec![
+                track("hit.flac"),
+                tagged("m/a1.flac", "Ann", "Red", 1),
+                tagged("m/a2.flac", "Ann", "Red", 2),
+                tagged("m/a3.flac", "Ann", "Blue", 1),
+                tagged("m/b1.flac", "Bob", "Gold", 1),
+            ],
+        );
+        app.rebuild_artists(None);
         app
+    }
+
+    fn tagged(path: &str, artist: &str, album: &str, no: u32) -> Track {
+        Track {
+            artist: Some(artist.into()),
+            album: Some(album.into()),
+            track_number: Some(no),
+            ..track(path)
+        }
     }
 
     fn press(code: KeyCode) -> Msg {
@@ -905,15 +975,6 @@ mod tests {
             paths: paths(&[p]),
             at,
         };
-        let find = |artist: &str, op| {
-            Out::Send(
-                Find {
-                    artist: Some(artist.into()),
-                    album: None,
-                },
-                Pending::Then(op),
-            )
-        };
         let rows: Vec<(View, Msg, Vec<Out>)> = vec![
             (
                 View::Queue,
@@ -964,30 +1025,28 @@ mod tests {
             (
                 View::Artists,
                 press(KeyCode::Enter),
-                vec![find("Ann", Op::Replace)],
-            ),
-            (View::Artists, ch('a'), vec![find("Ann", Op::Add(None))]),
-            (View::Artists, ch('A'), vec![find("Ann", Op::Add(Some(2)))]),
-            (
-                View::Artists,
-                ch('l'),
-                vec![Out::Send(
-                    Albums {
-                        artist: Some("Ann".into()),
-                    },
-                    list(View::Artists, &["Ann"], Col::Current, None),
-                )],
+                vec![done(Replace {
+                    paths: paths(&["m/a3.flac", "m/a1.flac", "m/a2.flac"]),
+                })],
             ),
             (
                 View::Artists,
-                ch('j'),
-                vec![Out::Send(
-                    Albums {
-                        artist: Some("Bob".into()),
-                    },
-                    list(View::Artists, &["Bob"], Col::Preview, None),
-                )],
+                ch('a'),
+                vec![done(Add {
+                    paths: paths(&["m/a3.flac", "m/a1.flac", "m/a2.flac"]),
+                    at: None,
+                })],
             ),
+            (
+                View::Artists,
+                ch('A'),
+                vec![done(Add {
+                    paths: paths(&["m/a3.flac", "m/a1.flac", "m/a2.flac"]),
+                    at: Some(2),
+                })],
+            ),
+            (View::Artists, ch('l'), vec![]),
+            (View::Artists, ch('j'), vec![]),
             (View::Artists, ch('D'), vec![]),
             (
                 View::Search,
@@ -1015,74 +1074,171 @@ mod tests {
         }
     }
 
+    fn entries(names: &[&str]) -> Vec<Entry> {
+        names.iter().map(|n| named(n)).collect()
+    }
+
+    fn tracks_of(paths: &[&str]) -> Vec<Entry> {
+        paths.iter().map(|p| Entry::Track(tagged_of(p))).collect()
+    }
+
+    fn tagged_of(path: &str) -> Track {
+        let app = app();
+        app.library
+            .tracks
+            .iter()
+            .find(|t| t.path == path)
+            .unwrap()
+            .clone()
+    }
+
     #[test]
-    fn deeper_columns_send_their_commands() {
-        use Command::*;
+    fn artists_come_from_the_copy() {
         let mut app = app();
         app.view = View::Artists;
-        app.artists.path = paths(&["Ann"]);
-        app.artists.items = vec![named("Red")];
-        let find = Find {
-            artist: Some("Ann".into()),
-            album: Some("Red".into()),
-        };
+        assert_eq!(app.artists.items, entries(&["Ann", "Bob", "Unknown"]));
+        assert_eq!(app.artists.preview, entries(&["Blue", "Red"]));
+        assert_eq!(run(&mut app, ch('j')), []);
+        assert_eq!(app.artists.preview, entries(&["Gold"]));
+        assert_eq!(run(&mut app, ch('k')), []);
+        assert_eq!(run(&mut app, ch('l')), []);
+        assert_eq!(app.artists.path, paths(&["Ann"]));
+        assert_eq!(app.artists.parent, entries(&["Ann", "Bob", "Unknown"]));
+        assert_eq!(app.artists.items, entries(&["Blue", "Red"]));
+        assert_eq!(app.artists.preview, tracks_of(&["m/a3.flac"]),);
+        assert_eq!(run(&mut app, ch('j')), []);
+        assert_eq!(app.artists.preview, tracks_of(&["m/a1.flac", "m/a2.flac"]),);
+        assert_eq!(run(&mut app, ch('l')), []);
+        assert_eq!(app.artists.path, paths(&["Ann", "Red"]));
+        assert_eq!(app.artists.parent, entries(&["Blue", "Red"]));
+        assert_eq!(app.artists.items, tracks_of(&["m/a1.flac", "m/a2.flac"]));
+        assert!(app.artists.preview.is_empty());
+        assert_eq!(run(&mut app, ch('h')), []);
+        assert_eq!(app.artists.path, paths(&["Ann"]));
+        assert_eq!(app.artists.selected, 1);
+        assert_eq!(app.artists.items, entries(&["Blue", "Red"]));
+        assert_eq!(run(&mut app, ch('h')), []);
+        assert_eq!(app.artists.selected, 0);
+        assert!(app.artists.parent.is_empty());
+        assert_eq!(app.artists.items, entries(&["Ann", "Bob", "Unknown"]));
+    }
+
+    #[test]
+    fn artist_columns_match_the_catalog() {
+        let app = app();
+        let c = &app.library.catalog;
+        assert_eq!(app.artist_column(&[]), entries_of(&c.artists()));
+        assert_eq!(
+            app.artist_column(&paths(&["Ann"])),
+            entries_of(&c.albums(Some("Ann")))
+        );
+        let want: Vec<Entry> = c
+            .find(&app.library.tracks, Some("Ann"), Some("Red"))
+            .into_iter()
+            .map(|i| Entry::Track(app.library.tracks[i].clone()))
+            .collect();
+        assert_eq!(app.artist_column(&paths(&["Ann", "Red"])), want);
+    }
+
+    fn entries_of(names: &[String]) -> Vec<Entry> {
+        names.iter().map(|n| named(n)).collect()
+    }
+
+    #[test]
+    fn artist_add_sends_paths() {
+        let mut app = app();
+        app.view = View::Artists;
+        run(&mut app, ch('l'));
+        run(&mut app, ch('j'));
         assert_eq!(
             run(&mut app, ch('a')),
-            [Out::Send(find.clone(), Pending::Then(Op::Add(None)))]
+            [done(Command::Add {
+                paths: paths(&["m/a1.flac", "m/a2.flac"]),
+                at: None
+            })]
         );
-        assert_eq!(
-            run(&mut app, ch('l')),
-            [Out::Send(
-                find,
-                list(View::Artists, &["Ann", "Red"], Col::Current, None)
-            )]
-        );
-        app.artists.items = vec![Entry::Track(track("t.flac"))];
-        let add = done(Add {
-            paths: paths(&["t.flac"]),
+        run(&mut app, ch('l'));
+        let add = done(Command::Add {
+            paths: paths(&["m/a1.flac"]),
             at: None,
         });
         assert_eq!(run(&mut app, ch('l')), std::slice::from_ref(&add));
         assert_eq!(run(&mut app, ch('a')), [add]);
-        assert_eq!(
-            run(&mut app, ch('h')),
-            [Out::Send(
-                Artists,
-                list(View::Artists, &[], Col::Parent, None)
-            )]
-        );
-        let mut app = super::tests::app();
-        app.view = View::Directories;
-        app.dirs.selected = 2;
-        assert_eq!(
-            run(&mut app, ch('l')),
-            [done(Add {
-                paths: paths(&["x.flac"]),
-                at: None
-            })]
-        );
     }
 
     #[test]
-    fn find_replies_become_replace_or_add() {
+    fn artist_columns_follow_the_copy() {
         let mut app = app();
-        app.expect(7, Pending::Then(Op::Add(Some(2))));
-        app.expect(8, Pending::Then(Op::Replace));
-        let tracks = Outcome::Ok(Body::Tracks(vec![track("1"), track("2")]));
+        app.view = View::Artists;
+        run(&mut app, ch('l'));
+        run(&mut app, ch('j'));
+        assert_eq!(app.artists.path, paths(&["Ann"]));
+        let gone = Event::LibraryChanged {
+            generation: 2,
+            tracks: 0,
+            added: vec![tagged("m/a4.flac", "Ann", "Zed", 1)],
+            removed: paths(&["m/a1.flac", "m/a2.flac"]),
+        };
+        let outs = run(&mut app, event(1, gone));
+        assert!(outs.iter().all(|o| matches!(
+            o,
+            Out::Send(
+                Command::Browse { .. },
+                Pending::List {
+                    view: View::Directories,
+                    ..
+                }
+            )
+        )));
+        assert_eq!(app.artists.items, entries(&["Blue", "Zed"]));
+        assert_eq!(app.artists.selected, 1);
+        assert_eq!(app.artists.preview, tracks_new(&["m/a4.flac"], &app));
+        let gone = Event::LibraryChanged {
+            generation: 3,
+            tracks: 0,
+            added: vec![],
+            removed: paths(&["m/a3.flac", "m/a4.flac"]),
+        };
+        run(&mut app, event(1, gone));
+        assert!(app.artists.items.is_empty());
+        assert_eq!(app.artists.path, paths(&["Ann"]));
+        assert_eq!(app.artists.selected, 0);
+    }
+
+    fn tracks_new(p: &[&str], app: &App) -> Vec<Entry> {
+        p.iter()
+            .map(|p| {
+                Entry::Track(
+                    app.library
+                        .tracks
+                        .iter()
+                        .find(|t| t.path == *p)
+                        .unwrap()
+                        .clone(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn search_tab_lists_the_library() {
+        let mut app = app();
+        app.view = View::Search;
+        app.page = 3;
+        assert_eq!(run(&mut app, ch('G')), []);
+        assert_eq!(app.search.selected, 4);
+        app.follow();
+        assert_eq!(app.search.offset, 2);
         assert_eq!(
-            run(&mut app, reply(1, 7, tracks.clone())),
-            [done(Command::Add {
-                paths: paths(&["1", "2"]),
-                at: Some(2)
-            })]
-        );
-        assert_eq!(
-            run(&mut app, reply(1, 8, tracks)),
+            run(&mut app, press(KeyCode::Enter)),
             [done(Command::Replace {
-                paths: paths(&["1", "2"])
+                paths: paths(&["m/b1.flac"])
             })]
         );
-        assert_eq!(run(&mut app, reply(1, 8, Outcome::Ok(Body::Done))), []);
+        run(&mut app, ch('/'));
+        assert_eq!(run(&mut app, ch('x')), []);
+        assert_eq!(run(&mut app, press(KeyCode::Enter)), []);
+        assert!(!app.search.editing);
     }
 
     #[test]
@@ -1122,7 +1278,7 @@ mod tests {
     }
 
     #[test]
-    fn the_query_is_edited_locally_and_sent_on_enter() {
+    fn the_query_is_edited_locally() {
         let mut app = app();
         assert_eq!(run(&mut app, ch('/')), []);
         assert_eq!(app.view, View::Search);
@@ -1132,27 +1288,13 @@ mod tests {
         }
         assert_eq!(run(&mut app, press(KeyCode::Backspace)), []);
         assert_eq!(run(&mut app, ch('s')), []);
-        assert_eq!(
-            run(&mut app, press(KeyCode::Enter)),
-            [Out::Send(
-                Command::Search {
-                    query: "iris".into()
-                },
-                Pending::Search
-            )]
-        );
+        assert_eq!(run(&mut app, press(KeyCode::Enter)), []);
         assert!(!app.search.editing);
         run(&mut app, ch('/'));
         assert_eq!(run(&mut app, ch('o')), []);
         assert_eq!(run(&mut app, press(KeyCode::Esc)), []);
         assert!(!app.search.editing);
         assert_eq!(app.search.query, "iriso");
-        app.expect(3, Pending::Search);
-        app.search.selected = 4;
-        let hits = Outcome::Ok(Body::Tracks(vec![track("1"), track("2")]));
-        assert_eq!(run(&mut app, reply(1, 3, hits)), []);
-        assert_eq!(app.search.results.len(), 2);
-        assert_eq!(app.search.selected, 1);
     }
 
     #[test]
@@ -1341,17 +1483,12 @@ mod tests {
     fn artists_parent_follows_depth() {
         let mut app = app();
         app.view = View::Artists;
-        app.artists.path = paths(&["Ann", "Alb"]);
-        app.artists.parent = vec![named("Alb")];
-        app.artists.items = vec![Entry::Track(track("t"))];
-        assert_eq!(
-            run(&mut app, ch('h')),
-            [Out::Send(
-                Command::Artists,
-                list(View::Artists, &[], Col::Parent, None)
-            )]
-        );
-        assert!(run(&mut app, ch('h')).len() <= 1);
+        app.artists.path = paths(&["Ann", "Red"]);
+        app.rebuild_artists(None);
+        assert_eq!(app.artists.parent, entries(&["Blue", "Red"]));
+        assert_eq!(run(&mut app, ch('h')), []);
+        assert_eq!(app.artists.parent, entries(&["Ann", "Bob", "Unknown"]));
+        assert_eq!(run(&mut app, ch('h')), []);
         assert!(app.artists.parent.is_empty());
     }
 
@@ -1383,14 +1520,13 @@ mod tests {
     #[test]
     fn refetch_also_fetches_the_parent() {
         let mut app = app();
-        app.library.replace(0, vec![]);
         app.dirs.path = paths(&["a", "b"]);
         let outs = run(
             &mut app,
             event(
                 1,
                 Event::LibraryChanged {
-                    generation: 1,
+                    generation: 2,
                     tracks: 0,
                     added: vec![],
                     removed: vec![],
@@ -1660,16 +1796,6 @@ mod tests {
                     Command::Browse { path: "a".into() },
                     list(View::Directories, &["a"], Col::Current, None)
                 ),
-                Out::Send(
-                    Command::Artists,
-                    list(View::Artists, &[], Col::Parent, None)
-                ),
-                Out::Send(
-                    Command::Albums {
-                        artist: Some("Ann".into())
-                    },
-                    list(View::Artists, &["Ann"], Col::Current, None)
-                ),
                 Out::Send(Command::Tracks, Pending::Tracks),
             ]
         );
@@ -1715,6 +1841,7 @@ mod tests {
             "{outs:?}"
         );
         assert_eq!(app.library.tracks, [track("/m/a.flac")]);
+        assert_eq!(app.artists.items, entries(&["Unknown"]));
     }
 
     #[test]
