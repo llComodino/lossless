@@ -5,6 +5,7 @@ mod clock;
 mod conn;
 mod input;
 mod keys;
+mod local;
 mod term;
 mod theme;
 mod ui;

@@ -11,6 +11,7 @@ use crate::clock::Clock;
 use crate::conn::{Msg, Resync};
 pub use crate::keys::View;
 use crate::keys::{self, Action};
+use crate::local::{Delta, Local};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Col {
@@ -42,6 +43,7 @@ pub enum Pending {
     /// `find` whose result paths become a `replace` or `add`.
     Then(Op),
     Search,
+    Tracks,
     Done,
 }
 
@@ -102,6 +104,7 @@ pub struct App {
     pub dirs: Columns<Entry>,
     pub artists: Columns<Entry>,
     pub search: Search,
+    pub library: Local,
     pub footer: Option<String>,
     pub connected: bool,
     pub help: bool,
@@ -133,6 +136,7 @@ impl App {
             dirs: Columns::default(),
             artists: Columns::default(),
             search: Search::default(),
+            library: Local::default(),
             footer: None,
             connected: false,
             help: false,
@@ -199,6 +203,7 @@ impl App {
         self.search.results.clear();
         self.search.selected = 0;
         self.search.offset = 0;
+        self.library.clear();
     }
 
     /// Keeps each list's window on its selection, moving it only when the
@@ -487,6 +492,14 @@ impl App {
         outs
     }
 
+    fn library_delta(&mut self, delta: Delta) -> Vec<Out> {
+        match delta {
+            Delta::Applied => self.refetch(),
+            Delta::Refetch => vec![Out::Send(Command::Tracks, Pending::Tracks)],
+            Delta::Stale => vec![],
+        }
+    }
+
     fn reply(&mut self, id: u64, result: Outcome, now: Instant) -> Vec<Out> {
         let Some(pending) = self.pending.remove(&id) else {
             return vec![];
@@ -499,7 +512,11 @@ impl App {
             }
         };
         match (pending, body) {
-            (Pending::Subscribe, _) => self.refetch(),
+            (Pending::Subscribe, _) => {
+                let mut outs = self.refetch();
+                outs.push(Out::Send(Command::Tracks, Pending::Tracks));
+                outs
+            }
             (Pending::Status, Body::Status(s)) => {
                 self.clock = Clock::from_event(s.state, s.position_ms, s.duration_ms, now);
                 self.status = Some(*s);
@@ -525,6 +542,10 @@ impl App {
             ) => self.listed(view, path, column, select, body),
             (Pending::Then(op), Body::Tracks(tracks)) if !tracks.is_empty() => {
                 send(op.command(tracks.into_iter().map(|t| t.path).collect()))
+            }
+            (Pending::Tracks, Body::Library { generation, tracks }) => {
+                let delta = self.library.replace(generation, tracks);
+                self.library_delta(delta)
             }
             (Pending::Search, Body::Tracks(tracks)) => {
                 self.search.results = tracks;
@@ -620,7 +641,15 @@ impl App {
                 }
                 vec![]
             }
-            Event::LibraryChanged { .. } => self.refetch(),
+            Event::LibraryChanged {
+                generation,
+                added,
+                removed,
+                ..
+            } => {
+                let delta = self.library.apply(generation, added, removed);
+                self.library_delta(delta)
+            }
             Event::Error(e) => {
                 self.footer = Some(format!("error: {e}"));
                 vec![]
@@ -1354,6 +1383,7 @@ mod tests {
     #[test]
     fn refetch_also_fetches_the_parent() {
         let mut app = app();
+        app.library.replace(0, vec![]);
         app.dirs.path = paths(&["a", "b"]);
         let outs = run(
             &mut app,
@@ -1640,6 +1670,7 @@ mod tests {
                     },
                     list(View::Artists, &["Ann"], Col::Current, None)
                 ),
+                Out::Send(Command::Tracks, Pending::Tracks),
             ]
         );
         let new = Outcome::Ok(Body::Queue(vec![track("new")]));
@@ -1654,6 +1685,78 @@ mod tests {
             ),
         );
         assert_eq!(app.status, Some(status(None, None)));
+    }
+
+    #[test]
+    fn connect_fetches_the_library() {
+        let mut app = app();
+        let resync = Resync {
+            subscribe: 10,
+            status: 11,
+            queue: 12,
+        };
+        app.connected(2, &resync);
+        let outs = run(&mut app, reply(2, 10, Outcome::Ok(Body::Done)));
+        assert!(
+            outs.contains(&Out::Send(Command::Tracks, Pending::Tracks)),
+            "{outs:?}"
+        );
+        app.expect(13, Pending::Tracks);
+        let library = Body::Library {
+            generation: 4,
+            tracks: vec![track("/m/a.flac")],
+        };
+        let outs = run(&mut app, reply(2, 13, Outcome::Ok(library)));
+        assert!(
+            outs.contains(&Out::Send(
+                Command::Browse { path: "".into() },
+                list(View::Directories, &[], Col::Current, None)
+            )),
+            "{outs:?}"
+        );
+        assert_eq!(app.library.tracks, [track("/m/a.flac")]);
+    }
+
+    #[test]
+    fn library_events_follow_the_generation() {
+        let mut app = app();
+        app.library.replace(4, vec![track("/m/a.flac")]);
+        let changed = |generation, added: Vec<Track>| Event::LibraryChanged {
+            generation,
+            tracks: 0,
+            added,
+            removed: vec![],
+        };
+        assert_eq!(run(&mut app, event(1, changed(4, vec![]))), []);
+        let outs = run(&mut app, event(1, changed(5, vec![track("/m/b.flac")])));
+        assert!(!outs.is_empty());
+        assert_eq!(app.library.tracks, [track("/m/a.flac"), track("/m/b.flac")]);
+        assert_eq!(
+            run(&mut app, event(1, changed(7, vec![]))),
+            [Out::Send(Command::Tracks, Pending::Tracks)]
+        );
+        app.expect(3, Pending::Tracks);
+        let old = Body::Library {
+            generation: 3,
+            tracks: vec![],
+        };
+        assert_eq!(run(&mut app, reply(1, 3, Outcome::Ok(old))), []);
+        assert_eq!(app.library.tracks.len(), 2);
+    }
+
+    #[test]
+    fn switch_clears_the_library() {
+        let mut app = app();
+        app.library.replace(4, vec![track("/m/a.flac")]);
+        assert_eq!(run(&mut app, ch('o')), [Out::Switch]);
+        let resync = Resync {
+            subscribe: 10,
+            status: 11,
+            queue: 12,
+        };
+        app.connected(2, &resync);
+        assert!(app.library.tracks.is_empty());
+        assert_eq!(app.library.replace(1, vec![]), crate::local::Delta::Applied);
     }
 
     #[test]
