@@ -627,6 +627,7 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::sync_channel;
     use std::sync::{Arc, Mutex, RwLock};
 
     use lossless_engine::fixtures::{Dir, PacedSink, flac};
@@ -664,6 +665,20 @@ mod tests {
         assert!(handle.is_none());
         // The running scan still owns the flag.
         assert!(flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_failed_scan_keeps_the_library_and_sends_nothing() {
+        let dir = Dir::new();
+        let library = Arc::new(RwLock::new(Library::default()));
+        swap(&library, Library::default());
+        let (tx, rx) = sync_channel::<Arc<str>>(super::BACKLOG);
+        let subs = Arc::new(Mutex::new(vec![tx]));
+        let flag = Arc::new(AtomicBool::new(false));
+        let handle = spawn_scan(dir.path("missing"), Arc::clone(&library), flag, subs);
+        handle.unwrap().join().unwrap();
+        assert_eq!(library.read().unwrap().generation(), 1);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
