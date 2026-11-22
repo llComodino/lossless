@@ -262,7 +262,11 @@ losslessd-tui -p pw              # another profile (--socket PATH wins)
 ```
 
 `?` lists the keys. Views are `1` Queue, `2` Directories, `3` Artists and
-`4` Search; `o` switches to the next profile. The UI is event-driven: it
+`4` Search; `o` switches to the next profile. `/` opens a live fuzzy filter
+in every view (fzf-style, smart case): rows re-rank as you type, `Enter`
+keeps the filter, `Esc` clears it. The UI keeps its own copy of the library
+and patches it from `library_changed`, so filtering never asks the daemon.
+Colors are Gruber Darker, painted as 24-bit RGB with a `#181818` background. The UI is event-driven: it
 redraws only on input, daemon events and whole-second progress while playing.
 
 ### Running under a supervisor
@@ -327,11 +331,17 @@ After `{"id":4,"cmd":"subscribe"}` the connection also receives events:
 {"type":"event","event":"state","state":"paused","position_ms":61250}
 {"type":"event","event":"track_changed","index":1}
 {"type":"event","event":"queue_changed"}
-{"type":"event","event":"library_changed","tracks":914}
+{"type":"event","event":"library_changed","generation":4,"tracks":914,"added":[{...}],"removed":["/music/a/old.flac"]}
 {"type":"event","event":"mode","repeat":"queue","random":true}
 {"type":"event","event":"volume","percent":40}
 {"type":"event","event":"error","code":"decode","message":"x.flac: bad frame"}
 ```
+
+`tracks` returns the whole library, `{"kind":"library","data":{"generation":N,"tracks":[...]}}`.
+`library_changed` follows each rescan: `added` (new or changed tracks) and
+`removed` (paths) patch a copy taken at `generation - 1`; a client that
+sees a gap in `generation` fetches `tracks` again. `lossless watch` prints
+it as `library changed: 914 tracks (+2 -1)`.
 
 `volume` follows every `set_volume` and changes made on the card outside the
 daemon; `error` reports a failure the daemon recovered from (a skipped file,

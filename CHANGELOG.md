@@ -64,6 +64,13 @@ First development version, not yet tagged.
   real binary, property tests, and fuzz targets for requests, config files,
   device names, decoding, tags and state files.
 
+- `tracks` command: the whole library with its `generation`.
+- `library_changed` carries `generation`, `added` and `removed`;
+  `lossless watch` prints `library changed: T tracks (+A -R)`.
+- `losslessd-tui`: `/` opens a live fuzzy filter in every view (`Esc`
+  clears); the UI keeps a local library copy patched from the deltas.
+- `losslessd-tui`: Gruber Darker colors on a `#181818` background.
+
 ### Fixed
 
 - Seek by timestamp is sample-exact (it was off by one frame through
