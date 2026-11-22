@@ -68,7 +68,8 @@ First development version, not yet tagged.
 - `library_changed` carries `generation`, `added` and `removed`;
   `lossless watch` prints `library changed: T tracks (+A -R)`.
 - `losslessd-tui`: `/` opens a live fuzzy filter in every view (`Esc`
-  clears); the UI keeps a local library copy patched from the deltas.
+  clears; moving queue entries is off while filtered); the UI keeps a local
+  library copy patched from the deltas.
 - `losslessd-tui`: Gruber Darker colors on a `#181818` background.
 
 ### Fixed

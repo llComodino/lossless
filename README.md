@@ -264,10 +264,16 @@ losslessd-tui -p pw              # another profile (--socket PATH wins)
 `?` lists the keys. Views are `1` Queue, `2` Directories, `3` Artists and
 `4` Search; `o` switches to the next profile. `/` opens a live fuzzy filter
 in every view (fzf-style, smart case): rows re-rank as you type, `Enter`
-keeps the filter, `Esc` clears it. The UI keeps its own copy of the library
-and patches it from `library_changed`, so filtering never asks the daemon.
-Colors are Gruber Darker, painted as 24-bit RGB with a `#181818` background. The UI is event-driven: it
-redraws only on input, daemon events and whole-second progress while playing.
+keeps the filter, `Esc` clears it. While the queue is filtered `J` and `K`
+(move entry) are off; clear the filter first. The filter is fuzzy, unlike
+the daemon's `search` and `lossless search`, which match whole words. The UI
+keeps its own copy of the library and patches it from `library_changed`, so
+filtering never asks the daemon.
+
+Colors are Gruber Darker, painted as 24-bit RGB on a `#181818` background.
+
+The UI is event-driven: it redraws only on input, daemon events and
+whole-second progress while playing.
 
 ### Running under a supervisor
 
