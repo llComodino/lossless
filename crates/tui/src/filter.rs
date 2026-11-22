@@ -49,7 +49,7 @@ impl Filter {
 
     pub fn real(&self, pos: usize, total: usize) -> Option<usize> {
         match &self.hits {
-            Some(h) => h.get(pos).copied(),
+            Some(h) => h.get(pos).copied().filter(|&i| i < total),
             None => (pos < total).then_some(pos),
         }
     }
@@ -131,6 +131,7 @@ mod tests {
         assert_eq!(f.len(5), 3);
         assert_eq!(f.real(0, 5), Some(4));
         assert_eq!(f.real(3, 5), None);
+        assert_eq!(f.real(0, 4), None, "a hit past a shrunk list");
         assert_eq!(f.position(3), Some(2));
         assert_eq!(f.position(0), None);
         for p in 0..3 {

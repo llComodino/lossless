@@ -685,19 +685,29 @@ impl App {
         outs
     }
 
-    /// `Applied` and `Refetch` may both follow a change to the copy, so
-    /// both rebuild Artists and re-apply the Search filter.
-    fn library_delta(&mut self, delta: Delta) -> Vec<Out> {
+    /// Applies `change` to the copy. `Applied` and `Refetch` may both follow
+    /// a change, so both rebuild Artists and re-apply the Search filter,
+    /// keeping each selection on the entry it was on.
+    fn library_changed(&mut self, change: impl FnOnce(&mut Local) -> Delta) -> Vec<Out> {
+        let track = self
+            .real(View::Search)
+            .and_then(|i| self.library.tracks.get(i))
+            .map(|t| t.path.clone());
+        let artist = match self.chosen(View::Artists) {
+            Some(Entry::Dir { name, .. }) => Some(name.clone()),
+            _ => None,
+        };
+        let delta = change(&mut self.library);
         if delta == Delta::Stale {
             return vec![];
         }
-        self.rebuild_artists(None);
-        let mut outs = self.refilter(View::Search, false);
-        outs.extend(match delta {
+        self.rebuild_artists(artist);
+        let found = track.and_then(|p| self.library.tracks.iter().position(|t| t.path == p));
+        self.place(View::Search, found);
+        match delta {
             Delta::Refetch => self.fetch_library(),
             _ => self.refetch(),
-        });
-        outs
+        }
     }
 
     /// One `Tracks` in flight at a time: a newer one would only repeat it,
@@ -752,8 +762,7 @@ impl App {
                 body,
             ) => self.listed(view, path, column, select, body),
             (Pending::Tracks, Body::Library { generation, tracks }) => {
-                let delta = self.library.replace(generation, tracks);
-                self.library_delta(delta)
+                self.library_changed(|lib| lib.replace(generation, tracks))
             }
             _ => vec![],
         }
@@ -849,10 +858,7 @@ impl App {
                 added,
                 removed,
                 ..
-            } => {
-                let delta = self.library.apply(generation, added, removed);
-                self.library_delta(delta)
-            }
+            } => self.library_changed(|lib| lib.apply(generation, added, removed)),
             Event::Error(e) => {
                 self.footer = Some(format!("error: {e}"));
                 vec![]
@@ -2051,6 +2057,22 @@ mod tests {
         };
         assert_eq!(run(&mut app, reply(1, 3, Outcome::Ok(old))), []);
         assert_eq!(app.library.tracks.len(), 2);
+    }
+
+    #[test]
+    fn a_delta_keeps_the_selected_entries() {
+        let mut app = app();
+        app.search.selected = 4;
+        app.artists.selected = 1;
+        let delta = Event::LibraryChanged {
+            generation: 2,
+            tracks: 6,
+            added: vec![tagged("m/a0.flac", "Aaron", "Grey", 1)],
+            removed: vec![],
+        };
+        run(&mut app, event(1, delta));
+        assert_eq!(app.library.tracks[app.search.selected].path, "m/b1.flac");
+        assert_eq!(app.chosen(View::Artists), Some(&named("Bob")));
     }
 
     #[test]
