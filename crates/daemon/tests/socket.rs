@@ -639,7 +639,29 @@ fn a_stalled_subscriber_does_not_stop_the_others() {
             }
         )
     });
-    drop(stalled);
+    // Dropped subscribers are disconnected, so they notice and resync.
+    stalled.set_read_timeout(Some(WAIT)).unwrap();
+    let mut rest = Vec::new();
+    stalled
+        .read_to_end(&mut rest)
+        .expect("a dropped subscriber reads EOF");
+}
+
+#[test]
+fn subscribing_twice_sends_each_event_once() {
+    let s = Server::start(false);
+    let mut c = s.connect();
+    c.ok(Command::Subscribe);
+    c.ok(Command::Subscribe);
+    for random in [true, false] {
+        c.ok(Command::SetMode {
+            repeat: None,
+            random: Some(random),
+        });
+    }
+    c.wait_for(|e| matches!(e, Event::Mode { random: false, .. }));
+    let rest = c.events.iter().filter(|e| matches!(e, Event::Mode { .. }));
+    assert_eq!(rest.count(), 1, "one Mode event for random: true");
 }
 
 #[test]

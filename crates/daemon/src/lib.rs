@@ -63,41 +63,82 @@ fn send(writer: &Writer, msg: &ServerMessage) -> std::io::Result<()> {
     w.write_all(line.as_bytes())
 }
 
-/// Events a subscriber may fall behind by before it counts as stalled.
+/// Events a subscriber may fall behind by (past the socket buffer) before
+/// it counts as stalled.
 const BACKLOG: usize = 256;
 
-type Subscribers = Arc<Mutex<Vec<SyncSender<Arc<str>>>>>;
+struct Subscriber {
+    tx: SyncSender<Arc<str>>,
+    /// The connection, to close it when the subscriber is dropped.
+    stream: UnixStream,
+    writer: Writer,
+}
+
+type Subscribers = Arc<Mutex<Vec<Subscriber>>>;
 
 /// A writer thread per subscriber, so one that stops reading blocks only
-/// itself; it ends when its channel is dropped or a write fails.
+/// itself; it ends when its channel is dropped or a write fails. Once per
+/// connection. If no thread can be had the connection is closed.
 fn subscribe(subscribers: &Subscribers, writer: &Writer) {
+    let mut subs = subscribers.lock().unwrap_or_else(PoisonError::into_inner);
+    if subs.iter().any(|s| Arc::ptr_eq(&s.writer, writer)) {
+        return;
+    }
+    let lock = writer.lock().unwrap_or_else(PoisonError::into_inner);
+    let Ok(stream) = lock.try_clone() else {
+        let _ = lock.shutdown(Shutdown::Both);
+        return;
+    };
+    drop(lock);
     let (tx, rx) = sync_channel::<Arc<str>>(BACKLOG);
-    let writer = Arc::clone(writer);
-    thread::spawn(move || {
+    let thread_writer = Arc::clone(writer);
+    let spawned = thread::Builder::new().stack_size(64 * 1024).spawn(move || {
         for line in rx {
-            let mut w = writer.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut w = thread_writer.lock().unwrap_or_else(PoisonError::into_inner);
             if w.write_all(line.as_bytes()).is_err() {
                 break;
             }
         }
     });
+    if let Err(e) = spawned {
+        warn!("no writer thread for a subscriber: {e}");
+        let _ = stream.shutdown(Shutdown::Both);
+        return;
+    }
+    subs.push(Subscriber {
+        tx,
+        stream,
+        writer: Arc::clone(writer),
+    });
+}
+
+/// Forgets the subscription of a connection that ended.
+fn unsubscribe(subscribers: &Subscribers, writer: &Writer) {
     subscribers
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .push(tx);
+        .retain(|s| !Arc::ptr_eq(&s.writer, writer));
 }
 
-/// Never blocks: a subscriber whose backlog is full is dropped.
+/// Never blocks. A subscriber whose backlog is full has stopped reading: its
+/// connection is closed, so the client sees EOF and resyncs on reconnect.
 fn broadcast(subscribers: &Subscribers, event: Event) {
-    let Ok(line) = encode(&ServerMessage::Event { event }) else {
-        return;
-    };
-    let line: Arc<str> = line.into();
     let mut subs = subscribers.lock().unwrap_or_else(PoisonError::into_inner);
-    subs.retain(|tx| match tx.try_send(Arc::clone(&line)) {
+    if subs.is_empty() {
+        return;
+    }
+    let line: Arc<str> = match encode(&ServerMessage::Event { event }) {
+        Ok(line) => line.into(),
+        Err(e) => {
+            warn!("event not sent: {e}");
+            return;
+        }
+    };
+    subs.retain(|s| match s.tx.try_send(Arc::clone(&line)) {
         Ok(()) => true,
         Err(TrySendError::Full(_)) => {
-            warn!("dropping a subscriber that stopped reading");
+            warn!("closing a subscriber that stopped reading");
+            let _ = s.stream.shutdown(Shutdown::Both);
             false
         }
         Err(TrySendError::Disconnected(_)) => false,
@@ -364,6 +405,12 @@ fn bad(msg: String) -> ServerMessage {
 
 fn serve(state: &State, stream: UnixStream) -> Result<()> {
     let writer: Writer = Arc::new(Mutex::new(stream.try_clone()?));
+    let result = session(state, &writer, stream);
+    unsubscribe(&state.subscribers, &writer);
+    result
+}
+
+fn session(state: &State, writer: &Writer, stream: UnixStream) -> Result<()> {
     let mut reader = BufReader::new(stream);
     let mut buf = Vec::new();
     loop {
@@ -377,13 +424,13 @@ fn serve(state: &State, stream: UnixStream) -> Result<()> {
         }
         if n > MAX_REQUEST {
             send(
-                &writer,
+                writer,
                 &bad(format!("request longer than {MAX_REQUEST} bytes")),
             )?;
             return Ok(());
         }
         let Ok(line) = std::str::from_utf8(&buf) else {
-            send(&writer, &bad("request is not UTF-8".into()))?;
+            send(writer, &bad("request is not UTF-8".into()))?;
             continue;
         };
         if line.trim().is_empty() {
@@ -392,7 +439,7 @@ fn serve(state: &State, stream: UnixStream) -> Result<()> {
         let reply = match decode::<Request>(line) {
             Ok(req) => {
                 debug!("request {}: {:?}", req.id, req.command);
-                let result = match state.handle(req.command, &writer) {
+                let result = match state.handle(req.command, writer) {
                     Ok(body) => Outcome::Ok(body),
                     Err(e) => Outcome::Err(e.to_wire()),
                 };
@@ -406,7 +453,7 @@ fn serve(state: &State, stream: UnixStream) -> Result<()> {
             }
             Err(e) => bad(format!("bad request: {e}")),
         };
-        send(&writer, &reply)?;
+        send(writer, &reply)?;
     }
 }
 
@@ -627,7 +674,6 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::mpsc::sync_channel;
     use std::sync::{Arc, Mutex, RwLock};
 
     use lossless_engine::fixtures::{Dir, PacedSink, flac};
@@ -635,7 +681,10 @@ mod tests {
     use lossless_library::{Library, collect};
     use lossless_proto::{PlayState, Repeat};
 
-    use super::{ClearOnDrop, Daemon, MAX_REQUEST, saved, serve, spawn_scan, swap};
+    use super::{
+        ClearOnDrop, Daemon, MAX_REQUEST, Subscribers, saved, serve, spawn_scan, subscribe, swap,
+        unsubscribe,
+    };
 
     fn scan(root: PathBuf, busy: bool) -> (Option<std::thread::JoinHandle<()>>, Arc<AtomicBool>) {
         let flag = Arc::new(AtomicBool::new(busy));
@@ -672,13 +721,34 @@ mod tests {
         let dir = Dir::new();
         let library = Arc::new(RwLock::new(Library::default()));
         swap(&library, Library::default());
-        let (tx, rx) = sync_channel::<Arc<str>>(super::BACKLOG);
-        let subs = Arc::new(Mutex::new(vec![tx]));
+        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        let subs: Subscribers = Arc::new(Mutex::new(Vec::new()));
+        subscribe(&subs, &Arc::new(Mutex::new(ours)));
         let flag = Arc::new(AtomicBool::new(false));
-        let handle = spawn_scan(dir.path("missing"), Arc::clone(&library), flag, subs);
+        let handle = spawn_scan(
+            dir.path("missing"),
+            Arc::clone(&library),
+            flag,
+            Arc::clone(&subs),
+        );
         handle.unwrap().join().unwrap();
         assert_eq!(library.read().unwrap().generation(), 1);
-        assert!(rx.try_recv().is_err());
+        theirs.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 1];
+        let read = std::io::Read::read(&mut theirs, &mut buf);
+        assert_eq!(read.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn a_connection_that_ends_is_unsubscribed() {
+        let (ours, _theirs) = UnixStream::pair().unwrap();
+        let writer = Arc::new(Mutex::new(ours));
+        let subs: Subscribers = Arc::new(Mutex::new(Vec::new()));
+        subscribe(&subs, &writer);
+        subscribe(&subs, &writer);
+        assert_eq!(subs.lock().unwrap().len(), 1);
+        unsubscribe(&subs, &writer);
+        assert!(subs.lock().unwrap().is_empty());
     }
 
     #[test]

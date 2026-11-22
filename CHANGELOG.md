@@ -83,7 +83,8 @@ First development version, not yet tagged.
   widths without underflow.
 - The scan flag is cleared even if a scan panics.
 - A subscriber that stops reading no longer stalls events for the others:
-  each has its own writer and is dropped once 256 events behind.
+  each has its own writer, and one about 256 events behind is disconnected
+  (it resyncs on reconnect).
 
 ### Security
 
