@@ -3,9 +3,12 @@
 mod app;
 mod clock;
 mod conn;
+mod filter;
 mod input;
 mod keys;
+mod local;
 mod term;
+mod theme;
 mod ui;
 
 use std::io::{self, Stdout};

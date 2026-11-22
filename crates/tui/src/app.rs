@@ -1,16 +1,19 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::time::Instant;
 
 use crossterm::event::{KeyEvent, KeyEventKind};
 use lossless_proto::profile::Profile;
 use lossless_proto::{
-    Body, Command, Entry, Event, Outcome, PlayState, Repeat, ServerMessage, Status, Track,
+    Body, Command, Entry, Event, Outcome, PlayState, Repeat, ServerMessage, Status, Track, describe,
 };
 
 use crate::clock::Clock;
 use crate::conn::{Msg, Resync};
+use crate::filter::{Filter, Ranker};
 pub use crate::keys::View;
 use crate::keys::{self, Action};
+use crate::local::{Delta, Local};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Col {
@@ -31,7 +34,7 @@ pub enum Pending {
     Subscribe,
     Status,
     Queue,
-    /// A column of Directories or Artists at `path`; `select` names the
+    /// A column of Directories at `path`; `select` names the
     /// entry to land on (the one `h` came out of).
     List {
         view: View,
@@ -39,9 +42,7 @@ pub enum Pending {
         column: Col,
         select: Option<String>,
     },
-    /// `find` whose result paths become a `replace` or `add`.
-    Then(Op),
-    Search,
+    Tracks,
     Done,
 }
 
@@ -54,7 +55,8 @@ pub enum Out {
 
 /// Miller columns: `items` lists `path`, `parent` the path without its
 /// last name (empty at the top), `preview` the selected item.
-/// Artists and albums are `Entry::Dir` named after them.
+/// Artists and albums are `Entry::Dir` named after them, built from the
+/// library copy.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Columns<T> {
     pub path: Vec<String>,
@@ -81,9 +83,6 @@ impl<T> Default for Columns<T> {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Search {
-    pub query: String,
-    pub editing: bool,
-    pub results: Vec<Track>,
     pub selected: usize,
     pub offset: usize,
 }
@@ -102,6 +101,11 @@ pub struct App {
     pub dirs: Columns<Entry>,
     pub artists: Columns<Entry>,
     pub search: Search,
+    pub library: Local,
+    /// One per view, by `View::index()`; each view's `selected` and
+    /// `offset` are positions in its filtered list.
+    pub filters: [Filter; 4],
+    ranker: Ranker,
     pub footer: Option<String>,
     pub connected: bool,
     pub help: bool,
@@ -133,6 +137,9 @@ impl App {
             dirs: Columns::default(),
             artists: Columns::default(),
             search: Search::default(),
+            library: Local::default(),
+            filters: Default::default(),
+            ranker: Ranker::new(),
             footer: None,
             connected: false,
             help: false,
@@ -181,9 +188,16 @@ impl App {
         }
     }
 
+    fn stop_editing(&mut self) {
+        for f in &mut self.filters {
+            f.editing = false;
+        }
+    }
+
     fn reset(&mut self, generation: u32) {
         self.generation = generation;
         self.pending.clear();
+        self.stop_editing();
         self.status = None;
         self.clock = stopped();
         self.queue.clear();
@@ -196,27 +210,23 @@ impl App {
             cols.selected = 0;
             cols.offset = 0;
         }
-        self.search.results.clear();
         self.search.selected = 0;
         self.search.offset = 0;
+        self.library.clear();
+        for view in View::ALL {
+            self.rank(view);
+        }
     }
 
     /// Keeps each list's window on its selection, moving it only when the
     /// selection would leave it, and clamps it after a shrink or resize.
     pub fn follow(&mut self) {
         let page = self.page.max(1);
-        scroll(
-            &mut self.queue_offset,
-            self.queue_selected,
-            self.queue.len(),
-            page,
-        );
-        for cols in [&mut self.dirs, &mut self.artists] {
-            scroll(&mut cols.offset, cols.selected, cols.items.len(), page);
-        }
-        let rows = page.saturating_sub(1).max(1);
-        let s = &mut self.search;
-        scroll(&mut s.offset, s.selected, s.results.len(), rows);
+        let [q, d, a, s] = View::ALL.map(|v| self.visible(v));
+        scroll(&mut self.queue_offset, self.queue_selected, q, page);
+        scroll(&mut self.dirs.offset, self.dirs.selected, d, page);
+        scroll(&mut self.artists.offset, self.artists.selected, a, page);
+        scroll(&mut self.search.offset, self.search.selected, s, page);
     }
 
     fn columns(&mut self, view: View) -> &mut Columns<Entry> {
@@ -226,12 +236,133 @@ impl App {
         }
     }
 
+    fn cols(&self, view: View) -> &Columns<Entry> {
+        match view {
+            View::Artists => &self.artists,
+            _ => &self.dirs,
+        }
+    }
+
+    /// Length of `view`'s unfiltered list.
+    pub fn total(&self, view: View) -> usize {
+        match view {
+            View::Queue => self.queue.len(),
+            View::Directories => self.dirs.items.len(),
+            View::Artists => self.artists.items.len(),
+            View::Search => self.library.tracks.len(),
+        }
+    }
+
+    fn visible(&self, view: View) -> usize {
+        self.filters[view.index()].len(self.total(view))
+    }
+
+    fn selected(&self, view: View) -> usize {
+        match view {
+            View::Queue => self.queue_selected,
+            View::Directories => self.dirs.selected,
+            View::Artists => self.artists.selected,
+            View::Search => self.search.selected,
+        }
+    }
+
+    /// The real index of `view`'s selection.
+    fn real(&self, view: View) -> Option<usize> {
+        self.filters[view.index()].real(self.selected(view), self.total(view))
+    }
+
+    fn chosen(&self, view: View) -> Option<&Entry> {
+        self.real(view).and_then(|i| self.cols(view).items.get(i))
+    }
+
+    fn cursor_of(&mut self, view: View) -> (&mut usize, usize) {
+        let len = self.visible(view);
+        let sel = match view {
+            View::Queue => &mut self.queue_selected,
+            View::Directories => &mut self.dirs.selected,
+            View::Artists => &mut self.artists.selected,
+            View::Search => &mut self.search.selected,
+        };
+        (sel, len)
+    }
+
     fn cursor(&mut self) -> (&mut usize, usize) {
-        match self.view {
-            View::Queue => (&mut self.queue_selected, self.queue.len()),
-            View::Directories => (&mut self.dirs.selected, self.dirs.items.len()),
-            View::Artists => (&mut self.artists.selected, self.artists.items.len()),
-            View::Search => (&mut self.search.selected, self.search.results.len()),
+        self.cursor_of(self.view)
+    }
+
+    /// Re-ranks `view` against its current list.
+    fn rank(&mut self, view: View) {
+        let f = &mut self.filters[view.index()];
+        if f.query.is_empty() {
+            f.hits = None;
+            return;
+        }
+        let (q, r) = (f.query.as_str(), &mut self.ranker);
+        f.hits = Some(match view {
+            View::Queue => r.rank(q, self.queue.iter().map(describe)),
+            View::Directories => r.rank(q, self.dirs.items.iter().map(name)),
+            View::Artists => r.rank(q, self.artists.items.iter().map(name)),
+            View::Search => r.rank(q, self.library.tracks.iter().map(describe)),
+        });
+    }
+
+    /// Re-ranks `view` and puts its selection on the real entry `found`,
+    /// else clamps it.
+    fn place(&mut self, view: View, found: Option<usize>) {
+        self.rank(view);
+        let to = found.and_then(|r| self.filters[view.index()].position(r));
+        let (sel, len) = self.cursor_of(view);
+        *sel = clamp(to.unwrap_or(*sel), len);
+    }
+
+    /// Re-applies `view`'s filter; `reset` (a keystroke) selects the best
+    /// match. A preview follows a selection that changed entry.
+    fn refilter(&mut self, view: View, reset: bool) -> Vec<Out> {
+        let before = self.real(view);
+        if reset {
+            self.rank(view);
+            *self.cursor_of(view).0 = 0;
+        } else {
+            self.place(view, None);
+        }
+        if self.real(view) == before {
+            vec![]
+        } else {
+            self.refresh(view)
+        }
+    }
+
+    /// Clears the current view's filter, keeping the selected entry.
+    fn clear_filter(&mut self) -> Vec<Out> {
+        let view = self.view;
+        let real = self.real(view);
+        self.filters[view.index()] = Filter::default();
+        let (sel, len) = self.cursor();
+        match real {
+            Some(r) => {
+                *sel = r;
+                vec![]
+            }
+            None => {
+                *sel = clamp(*sel, len);
+                self.refresh(view)
+            }
+        }
+    }
+
+    fn query(&mut self, edit: impl FnOnce(&mut String)) -> Vec<Out> {
+        edit(&mut self.filters[self.view.index()].query);
+        self.refilter(self.view, true)
+    }
+
+    fn refresh(&mut self, view: View) -> Vec<Out> {
+        match view {
+            View::Directories => self.preview(View::Directories),
+            View::Artists => {
+                self.rebuild_preview();
+                vec![]
+            }
+            _ => vec![],
         }
     }
 
@@ -244,7 +375,8 @@ impl App {
             self.help = false;
             return vec![];
         }
-        let action = keys::action(self.view, key, self.search.editing);
+        let editing = self.connected && self.filters[self.view.index()].editing;
+        let action = keys::action(self.view, key, editing);
         if !self.connected {
             return match action {
                 Some(Action::Quit) => self.act(Action::Quit, now),
@@ -303,8 +435,7 @@ impl App {
             VolumeUp => self.volume(|v| v.saturating_add(VOLUME_STEP).min(100)),
             VolumeDown => self.volume(|v| v.saturating_sub(VOLUME_STEP)),
             EditQuery => {
-                self.view = View::Search;
-                self.search.editing = true;
+                self.filters[self.view.index()].editing = true;
                 vec![]
             }
             Update => send(Command::Update),
@@ -324,30 +455,15 @@ impl App {
                 self.quit = true;
                 vec![]
             }
-            Type(c) => {
-                self.search.query.push(c);
-                vec![]
-            }
-            Backspace => {
-                self.search.query.pop();
-                vec![]
-            }
+            Type(c) => self.query(|q| q.push(c)),
+            Backspace => self.query(|q| {
+                q.pop();
+            }),
             Submit => {
-                self.search.editing = false;
-                if self.search.query.trim().is_empty() {
-                    return vec![];
-                }
-                vec![Out::Send(
-                    Command::Search {
-                        query: self.search.query.clone(),
-                    },
-                    Pending::Search,
-                )]
-            }
-            Cancel => {
-                self.search.editing = false;
+                self.filters[self.view.index()].editing = false;
                 vec![]
             }
+            Cancel | ClearFilter => self.clear_filter(),
         }
     }
 
@@ -363,21 +479,19 @@ impl App {
             return vec![];
         }
         *sel = new;
-        match self.view {
-            View::Directories | View::Artists => self.preview(self.view),
-            _ => vec![],
-        }
+        self.refresh(self.view)
     }
 
     fn on_queue(&self, cmd: impl FnOnce(usize) -> Command) -> Vec<Out> {
-        if self.queue_selected < self.queue.len() {
-            send(cmd(self.queue_selected))
-        } else {
-            vec![]
-        }
+        self.real(View::Queue)
+            .map_or_else(Vec::new, |i| send(cmd(i)))
     }
 
     fn shift(&mut self, down: bool) -> Vec<Out> {
+        if self.filters[View::Queue.index()].hits.is_some() {
+            self.footer = Some("clear the filter (Esc) to move entries".into());
+            return vec![];
+        }
         let from = self.queue_selected;
         let to = if down { from + 1 } else { from.wrapping_sub(1) };
         if from >= self.queue.len() || to >= self.queue.len() {
@@ -401,36 +515,62 @@ impl App {
     fn take(&mut self, op: Op) -> Vec<Out> {
         let path = match self.view {
             View::Queue => return vec![],
-            View::Search => match self.search.results.get(self.search.selected) {
-                Some(t) => t.path.clone(),
-                None => return vec![],
-            },
-            view => {
-                let cols = self.columns(view);
-                match (cols.items.get(cols.selected), view, cols.path.as_slice()) {
-                    (Some(Entry::Track(t)), ..) => t.path.clone(),
-                    (Some(Entry::Dir { path, .. }), View::Directories, _) => path.clone(),
-                    (Some(Entry::Dir { name, .. }), _, []) => {
-                        return find(Some(name.clone()), None, op);
-                    }
-                    (Some(Entry::Dir { name, .. }), _, [artist, ..]) => {
-                        return find(Some(artist.clone()), Some(name.clone()), op);
-                    }
-                    (None, ..) => return vec![],
+            View::Search => {
+                match self
+                    .real(View::Search)
+                    .and_then(|i| self.library.tracks.get(i))
+                {
+                    Some(t) => t.path.clone(),
+                    None => return vec![],
                 }
             }
+            view => match (self.chosen(view), view, self.cols(view).path.as_slice()) {
+                (Some(Entry::Track(t)), ..) => t.path.clone(),
+                (Some(Entry::Dir { path, .. }), View::Directories, _) => path.clone(),
+                (Some(Entry::Dir { name, .. }), _, []) => {
+                    let name = name.clone();
+                    return self.take_found(Some(&name), None, op);
+                }
+                (Some(Entry::Dir { name, .. }), _, [artist, ..]) => {
+                    let (artist, name) = (artist.clone(), name.clone());
+                    return self.take_found(Some(&artist), Some(&name), op);
+                }
+                (None, ..) => return vec![],
+            },
         };
         vec![done(op.command(vec![path]))]
     }
 
+    fn take_found(&self, artist: Option<&str>, album: Option<&str>, op: Op) -> Vec<Out> {
+        let lib = &self.library;
+        let paths: Vec<String> = lib
+            .catalog
+            .find(&lib.tracks, artist, album)
+            .into_iter()
+            .map(|i| lib.tracks[i].path.clone())
+            .collect();
+        if paths.is_empty() {
+            vec![]
+        } else {
+            send(op.command(paths))
+        }
+    }
+
+    /// Entering a folder clears the view's filter, as a new list starts.
     fn right(&mut self) -> Vec<Out> {
         let view = self.view;
-        let cols = self.columns(view);
-        match cols.items.get(cols.selected) {
+        match self.chosen(view) {
             Some(Entry::Dir { name, .. }) => {
-                cols.path.push(name.clone());
+                let name = name.clone();
+                self.filters[view.index()] = Filter::default();
+                let cols = self.columns(view);
+                cols.path.push(name);
                 cols.parent = std::mem::replace(&mut cols.items, std::mem::take(&mut cols.preview));
                 cols.selected = 0;
+                if view == View::Artists {
+                    self.rebuild_artists(None);
+                    return vec![];
+                }
                 vec![list(view, cols.path.clone(), Col::Current, None)]
             }
             Some(Entry::Track(t)) => send(Command::Add {
@@ -443,10 +583,11 @@ impl App {
 
     fn left(&mut self) -> Vec<Out> {
         let view = self.view;
-        let cols = self.columns(view);
-        let Some(name) = cols.path.pop() else {
+        let Some(name) = self.columns(view).path.pop() else {
             return vec![];
         };
+        self.filters[view.index()] = Filter::default();
+        let cols = self.columns(view);
         cols.preview = std::mem::take(&mut cols.items);
         let loaded = !cols.parent.is_empty();
         cols.items = std::mem::take(&mut cols.parent);
@@ -455,6 +596,10 @@ impl App {
             .iter()
             .position(|e| matches!(e, Entry::Dir { name: n, .. } if *n == name))
             .unwrap_or(0);
+        if view == View::Artists {
+            self.rebuild_artists(Some(name));
+            return vec![];
+        }
         let mut outs = Vec::new();
         if !loaded {
             outs.push(list(view, cols.path.clone(), Col::Current, Some(name)));
@@ -465,11 +610,10 @@ impl App {
 
     /// Fetches the preview of the selected folder, artist or album.
     fn preview(&mut self, view: View) -> Vec<Out> {
-        let cols = self.columns(view);
-        cols.preview.clear();
-        match cols.items.get(cols.selected) {
+        self.columns(view).preview.clear();
+        match self.chosen(view) {
             Some(Entry::Dir { name, .. }) => {
-                let mut path = cols.path.clone();
+                let mut path = self.cols(view).path.clone();
                 path.push(name.clone());
                 vec![list(view, path, Col::Preview, None)]
             }
@@ -477,13 +621,82 @@ impl App {
         }
     }
 
+    /// The Artists column at `path`, from the library copy.
+    pub fn artist_column(&self, path: &[String]) -> Vec<Entry> {
+        let lib = &self.library;
+        let dirs = |names: Vec<String>| {
+            names
+                .into_iter()
+                .map(|n| Entry::Dir {
+                    path: n.clone(),
+                    name: n,
+                })
+                .collect()
+        };
+        match path {
+            [] => dirs(lib.catalog.artists()),
+            [artist] => dirs(lib.catalog.albums(Some(artist))),
+            [artist, album, ..] => lib
+                .catalog
+                .find(&lib.tracks, Some(artist), Some(album))
+                .into_iter()
+                .map(|i| Entry::Track(lib.tracks[i].clone()))
+                .collect(),
+        }
+    }
+
+    /// Refills the parent, current and preview columns of Artists at
+    /// `artists.path`; `select` names the entry to land on.
+    fn rebuild_artists(&mut self, select: Option<String>) {
+        let path = self.artists.path.clone();
+        let items = self.artist_column(&path);
+        let parent = match path.split_last() {
+            Some((_, up)) => self.artist_column(up),
+            None => Vec::new(),
+        };
+        let found = select.and_then(|s| {
+            items
+                .iter()
+                .position(|e| matches!(e, Entry::Dir { name, .. } if *name == s))
+        });
+        self.artists.items = items;
+        self.artists.parent = parent;
+        self.place(View::Artists, found);
+        self.rebuild_preview();
+    }
+
+    fn rebuild_preview(&mut self) {
+        let preview = match self.chosen(View::Artists) {
+            Some(Entry::Dir { name, .. }) => {
+                let mut path = self.artists.path.clone();
+                path.push(name.clone());
+                self.artist_column(&path)
+            }
+            _ => Vec::new(),
+        };
+        self.artists.preview = preview;
+    }
+
     fn refetch(&mut self) -> Vec<Out> {
         let mut outs = Vec::new();
-        for v in [View::Directories, View::Artists] {
-            let path = self.columns(v).path.clone();
-            outs.extend(parent_of(v, &path));
-            outs.push(list(v, path, Col::Current, None));
+        let path = self.dirs.path.clone();
+        outs.extend(parent_of(View::Directories, &path));
+        outs.push(list(View::Directories, path, Col::Current, None));
+        outs
+    }
+
+    /// `Applied` and `Refetch` may both follow a change to the copy, so
+    /// both rebuild Artists and re-apply the Search filter.
+    fn library_delta(&mut self, delta: Delta) -> Vec<Out> {
+        if delta == Delta::Stale {
+            return vec![];
         }
+        self.rebuild_artists(None);
+        let mut outs = self.refilter(View::Search, false);
+        outs.extend(match delta {
+            Delta::Refetch => vec![Out::Send(Command::Tracks, Pending::Tracks)],
+            _ => self.refetch(),
+        });
         outs
     }
 
@@ -499,7 +712,11 @@ impl App {
             }
         };
         match (pending, body) {
-            (Pending::Subscribe, _) => self.refetch(),
+            (Pending::Subscribe, _) => {
+                let mut outs = self.refetch();
+                outs.push(Out::Send(Command::Tracks, Pending::Tracks));
+                outs
+            }
             (Pending::Status, Body::Status(s)) => {
                 self.clock = Clock::from_event(s.state, s.position_ms, s.duration_ms, now);
                 self.status = Some(*s);
@@ -507,11 +724,12 @@ impl App {
             }
             (Pending::Queue, Body::Queue(q)) => {
                 self.queue = q;
-                if std::mem::take(&mut self.first_queue) {
-                    let playing = self.status.as_ref().and_then(|s| s.index);
-                    self.queue_selected = playing.unwrap_or(self.queue_selected);
-                }
-                self.queue_selected = clamp(self.queue_selected, self.queue.len());
+                let playing = if std::mem::take(&mut self.first_queue) {
+                    self.status.as_ref().and_then(|s| s.index)
+                } else {
+                    None
+                };
+                self.place(View::Queue, playing);
                 vec![]
             }
             (
@@ -523,13 +741,9 @@ impl App {
                 },
                 body,
             ) => self.listed(view, path, column, select, body),
-            (Pending::Then(op), Body::Tracks(tracks)) if !tracks.is_empty() => {
-                send(op.command(tracks.into_iter().map(|t| t.path).collect()))
-            }
-            (Pending::Search, Body::Tracks(tracks)) => {
-                self.search.results = tracks;
-                self.search.selected = clamp(self.search.selected, self.search.results.len());
-                vec![]
+            (Pending::Tracks, Body::Library { generation, tracks }) => {
+                let delta = self.library.replace(generation, tracks);
+                self.library_delta(delta)
             }
             _ => vec![],
         }
@@ -555,25 +769,25 @@ impl App {
             Body::Tracks(t) => t.into_iter().map(Entry::Track).collect(),
             _ => return vec![],
         };
+        let current = match self.chosen(view) {
+            Some(Entry::Dir { name, .. }) => {
+                path.split_last() == Some((name, self.cols(view).path.as_slice()))
+            }
+            _ => false,
+        };
         let cols = self.columns(view);
         match column {
             Col::Current if cols.path == path => {
-                cols.items = entries;
                 let found = select.and_then(|s| {
-                    cols.items
+                    entries
                         .iter()
                         .position(|e| matches!(e, Entry::Dir { name, .. } if *name == s))
                 });
-                cols.selected = clamp(found.unwrap_or(cols.selected), cols.items.len());
+                cols.items = entries;
+                self.place(view, found);
                 self.preview(view)
             }
             Col::Preview => {
-                let current = match cols.items.get(cols.selected) {
-                    Some(Entry::Dir { name, .. }) => {
-                        path.split_last() == Some((name, cols.path.as_slice()))
-                    }
-                    _ => false,
-                };
                 if current {
                     cols.preview = entries;
                 }
@@ -620,7 +834,15 @@ impl App {
                 }
                 vec![]
             }
-            Event::LibraryChanged { .. } => self.refetch(),
+            Event::LibraryChanged {
+                generation,
+                added,
+                removed,
+                ..
+            } => {
+                let delta = self.library.apply(generation, added, removed);
+                self.library_delta(delta)
+            }
             Event::Error(e) => {
                 self.footer = Some(format!("error: {e}"));
                 vec![]
@@ -659,6 +881,14 @@ fn scroll(offset: &mut usize, selected: usize, len: usize, rows: usize) {
     *offset = (*offset).min(len.saturating_sub(rows));
 }
 
+/// A column entry as matched: the name without the trailing `/`.
+fn name(e: &Entry) -> Cow<'_, str> {
+    match e {
+        Entry::Dir { name, .. } => Cow::Borrowed(name),
+        Entry::Track(t) => Cow::Owned(describe(t)),
+    }
+}
+
 fn clamp(i: usize, len: usize) -> usize {
     i.min(len.saturating_sub(1))
 }
@@ -671,33 +901,17 @@ fn send(cmd: Command) -> Vec<Out> {
     vec![done(cmd)]
 }
 
-fn find(artist: Option<String>, album: Option<String>, op: Op) -> Vec<Out> {
-    vec![Out::Send(
-        Command::Find { artist, album },
-        Pending::Then(op),
-    )]
-}
-
 fn parent_of(view: View, path: &[String]) -> Option<Out> {
     let (_, up) = path.split_last()?;
     Some(list(view, up.to_vec(), Col::Parent, None))
 }
 
-/// The request that lists a Directories or Artists column at `path`.
+/// The request that lists a Directories column at `path`.
 fn list(view: View, path: Vec<String>, column: Col, select: Option<String>) -> Out {
-    let cmd = match (view, path.as_slice()) {
-        (View::Directories, p) => Command::Browse { path: p.join("/") },
-        (_, []) => Command::Artists,
-        (_, [artist]) => Command::Albums {
-            artist: Some(artist.clone()),
-        },
-        (_, [artist, album, ..]) => Command::Find {
-            artist: Some(artist.clone()),
-            album: Some(album.clone()),
-        },
-    };
     Out::Send(
-        cmd,
+        Command::Browse {
+            path: path.join("/"),
+        },
         Pending::List {
             view,
             path,
@@ -715,6 +929,7 @@ pub fn update(app: &mut App, msg: Msg, now: Instant) -> Vec<Out> {
         Msg::Disconnected(_) => {
             app.connected = false;
             app.pending.clear();
+            app.stop_editing();
             app.stop_clock(now);
             app.footer = Some(DISCONNECTED.into());
             vec![]
@@ -785,9 +1000,27 @@ mod tests {
         app.queue = vec![track("q0"), track("q1"), track("q2")];
         app.queue_selected = 1;
         app.dirs.items = vec![dir("a", "a"), dir("b", "b"), Entry::Track(track("x.flac"))];
-        app.artists.items = vec![named("Ann"), named("Bob")];
-        app.search.results = vec![track("hit.flac")];
+        app.library.replace(
+            1,
+            vec![
+                track("hit.flac"),
+                tagged("m/a1.flac", "Ann", "Red", 1),
+                tagged("m/a2.flac", "Ann", "Red", 2),
+                tagged("m/a3.flac", "Ann", "Blue", 1),
+                tagged("m/b1.flac", "Bob", "Gold", 1),
+            ],
+        );
+        app.rebuild_artists(None);
         app
+    }
+
+    fn tagged(path: &str, artist: &str, album: &str, no: u32) -> Track {
+        Track {
+            artist: Some(artist.into()),
+            album: Some(album.into()),
+            track_number: Some(no),
+            ..track(path)
+        }
     }
 
     fn press(code: KeyCode) -> Msg {
@@ -876,15 +1109,6 @@ mod tests {
             paths: paths(&[p]),
             at,
         };
-        let find = |artist: &str, op| {
-            Out::Send(
-                Find {
-                    artist: Some(artist.into()),
-                    album: None,
-                },
-                Pending::Then(op),
-            )
-        };
         let rows: Vec<(View, Msg, Vec<Out>)> = vec![
             (
                 View::Queue,
@@ -935,30 +1159,28 @@ mod tests {
             (
                 View::Artists,
                 press(KeyCode::Enter),
-                vec![find("Ann", Op::Replace)],
-            ),
-            (View::Artists, ch('a'), vec![find("Ann", Op::Add(None))]),
-            (View::Artists, ch('A'), vec![find("Ann", Op::Add(Some(2)))]),
-            (
-                View::Artists,
-                ch('l'),
-                vec![Out::Send(
-                    Albums {
-                        artist: Some("Ann".into()),
-                    },
-                    list(View::Artists, &["Ann"], Col::Current, None),
-                )],
+                vec![done(Replace {
+                    paths: paths(&["m/a3.flac", "m/a1.flac", "m/a2.flac"]),
+                })],
             ),
             (
                 View::Artists,
-                ch('j'),
-                vec![Out::Send(
-                    Albums {
-                        artist: Some("Bob".into()),
-                    },
-                    list(View::Artists, &["Bob"], Col::Preview, None),
-                )],
+                ch('a'),
+                vec![done(Add {
+                    paths: paths(&["m/a3.flac", "m/a1.flac", "m/a2.flac"]),
+                    at: None,
+                })],
             ),
+            (
+                View::Artists,
+                ch('A'),
+                vec![done(Add {
+                    paths: paths(&["m/a3.flac", "m/a1.flac", "m/a2.flac"]),
+                    at: Some(2),
+                })],
+            ),
+            (View::Artists, ch('l'), vec![]),
+            (View::Artists, ch('j'), vec![]),
             (View::Artists, ch('D'), vec![]),
             (
                 View::Search,
@@ -986,74 +1208,171 @@ mod tests {
         }
     }
 
+    fn entries(names: &[&str]) -> Vec<Entry> {
+        names.iter().map(|n| named(n)).collect()
+    }
+
+    fn tracks_of(paths: &[&str]) -> Vec<Entry> {
+        paths.iter().map(|p| Entry::Track(tagged_of(p))).collect()
+    }
+
+    fn tagged_of(path: &str) -> Track {
+        let app = app();
+        app.library
+            .tracks
+            .iter()
+            .find(|t| t.path == path)
+            .unwrap()
+            .clone()
+    }
+
     #[test]
-    fn deeper_columns_send_their_commands() {
-        use Command::*;
+    fn artists_come_from_the_copy() {
         let mut app = app();
         app.view = View::Artists;
-        app.artists.path = paths(&["Ann"]);
-        app.artists.items = vec![named("Red")];
-        let find = Find {
-            artist: Some("Ann".into()),
-            album: Some("Red".into()),
-        };
+        assert_eq!(app.artists.items, entries(&["Ann", "Bob", "Unknown"]));
+        assert_eq!(app.artists.preview, entries(&["Blue", "Red"]));
+        assert_eq!(run(&mut app, ch('j')), []);
+        assert_eq!(app.artists.preview, entries(&["Gold"]));
+        assert_eq!(run(&mut app, ch('k')), []);
+        assert_eq!(run(&mut app, ch('l')), []);
+        assert_eq!(app.artists.path, paths(&["Ann"]));
+        assert_eq!(app.artists.parent, entries(&["Ann", "Bob", "Unknown"]));
+        assert_eq!(app.artists.items, entries(&["Blue", "Red"]));
+        assert_eq!(app.artists.preview, tracks_of(&["m/a3.flac"]),);
+        assert_eq!(run(&mut app, ch('j')), []);
+        assert_eq!(app.artists.preview, tracks_of(&["m/a1.flac", "m/a2.flac"]),);
+        assert_eq!(run(&mut app, ch('l')), []);
+        assert_eq!(app.artists.path, paths(&["Ann", "Red"]));
+        assert_eq!(app.artists.parent, entries(&["Blue", "Red"]));
+        assert_eq!(app.artists.items, tracks_of(&["m/a1.flac", "m/a2.flac"]));
+        assert!(app.artists.preview.is_empty());
+        assert_eq!(run(&mut app, ch('h')), []);
+        assert_eq!(app.artists.path, paths(&["Ann"]));
+        assert_eq!(app.artists.selected, 1);
+        assert_eq!(app.artists.items, entries(&["Blue", "Red"]));
+        assert_eq!(run(&mut app, ch('h')), []);
+        assert_eq!(app.artists.selected, 0);
+        assert!(app.artists.parent.is_empty());
+        assert_eq!(app.artists.items, entries(&["Ann", "Bob", "Unknown"]));
+    }
+
+    #[test]
+    fn artist_columns_match_the_catalog() {
+        let app = app();
+        let c = &app.library.catalog;
+        assert_eq!(app.artist_column(&[]), entries_of(&c.artists()));
+        assert_eq!(
+            app.artist_column(&paths(&["Ann"])),
+            entries_of(&c.albums(Some("Ann")))
+        );
+        let want: Vec<Entry> = c
+            .find(&app.library.tracks, Some("Ann"), Some("Red"))
+            .into_iter()
+            .map(|i| Entry::Track(app.library.tracks[i].clone()))
+            .collect();
+        assert_eq!(app.artist_column(&paths(&["Ann", "Red"])), want);
+    }
+
+    fn entries_of(names: &[String]) -> Vec<Entry> {
+        names.iter().map(|n| named(n)).collect()
+    }
+
+    #[test]
+    fn artist_add_sends_paths() {
+        let mut app = app();
+        app.view = View::Artists;
+        run(&mut app, ch('l'));
+        run(&mut app, ch('j'));
         assert_eq!(
             run(&mut app, ch('a')),
-            [Out::Send(find.clone(), Pending::Then(Op::Add(None)))]
+            [done(Command::Add {
+                paths: paths(&["m/a1.flac", "m/a2.flac"]),
+                at: None
+            })]
         );
-        assert_eq!(
-            run(&mut app, ch('l')),
-            [Out::Send(
-                find,
-                list(View::Artists, &["Ann", "Red"], Col::Current, None)
-            )]
-        );
-        app.artists.items = vec![Entry::Track(track("t.flac"))];
-        let add = done(Add {
-            paths: paths(&["t.flac"]),
+        run(&mut app, ch('l'));
+        let add = done(Command::Add {
+            paths: paths(&["m/a1.flac"]),
             at: None,
         });
         assert_eq!(run(&mut app, ch('l')), std::slice::from_ref(&add));
         assert_eq!(run(&mut app, ch('a')), [add]);
-        assert_eq!(
-            run(&mut app, ch('h')),
-            [Out::Send(
-                Artists,
-                list(View::Artists, &[], Col::Parent, None)
-            )]
-        );
-        let mut app = super::tests::app();
-        app.view = View::Directories;
-        app.dirs.selected = 2;
-        assert_eq!(
-            run(&mut app, ch('l')),
-            [done(Add {
-                paths: paths(&["x.flac"]),
-                at: None
-            })]
-        );
     }
 
     #[test]
-    fn find_replies_become_replace_or_add() {
+    fn artist_columns_follow_the_copy() {
         let mut app = app();
-        app.expect(7, Pending::Then(Op::Add(Some(2))));
-        app.expect(8, Pending::Then(Op::Replace));
-        let tracks = Outcome::Ok(Body::Tracks(vec![track("1"), track("2")]));
+        app.view = View::Artists;
+        run(&mut app, ch('l'));
+        run(&mut app, ch('j'));
+        assert_eq!(app.artists.path, paths(&["Ann"]));
+        let gone = Event::LibraryChanged {
+            generation: 2,
+            tracks: 0,
+            added: vec![tagged("m/a4.flac", "Ann", "Zed", 1)],
+            removed: paths(&["m/a1.flac", "m/a2.flac"]),
+        };
+        let outs = run(&mut app, event(1, gone));
+        assert!(outs.iter().all(|o| matches!(
+            o,
+            Out::Send(
+                Command::Browse { .. },
+                Pending::List {
+                    view: View::Directories,
+                    ..
+                }
+            )
+        )));
+        assert_eq!(app.artists.items, entries(&["Blue", "Zed"]));
+        assert_eq!(app.artists.selected, 1);
+        assert_eq!(app.artists.preview, tracks_new(&["m/a4.flac"], &app));
+        let gone = Event::LibraryChanged {
+            generation: 3,
+            tracks: 0,
+            added: vec![],
+            removed: paths(&["m/a3.flac", "m/a4.flac"]),
+        };
+        run(&mut app, event(1, gone));
+        assert!(app.artists.items.is_empty());
+        assert_eq!(app.artists.path, paths(&["Ann"]));
+        assert_eq!(app.artists.selected, 0);
+    }
+
+    fn tracks_new(p: &[&str], app: &App) -> Vec<Entry> {
+        p.iter()
+            .map(|p| {
+                Entry::Track(
+                    app.library
+                        .tracks
+                        .iter()
+                        .find(|t| t.path == *p)
+                        .unwrap()
+                        .clone(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn search_tab_lists_the_library() {
+        let mut app = app();
+        app.view = View::Search;
+        app.page = 3;
+        assert_eq!(run(&mut app, ch('G')), []);
+        assert_eq!(app.search.selected, 4);
+        app.follow();
+        assert_eq!(app.search.offset, 2);
         assert_eq!(
-            run(&mut app, reply(1, 7, tracks.clone())),
-            [done(Command::Add {
-                paths: paths(&["1", "2"]),
-                at: Some(2)
-            })]
-        );
-        assert_eq!(
-            run(&mut app, reply(1, 8, tracks)),
+            run(&mut app, press(KeyCode::Enter)),
             [done(Command::Replace {
-                paths: paths(&["1", "2"])
+                paths: paths(&["m/b1.flac"])
             })]
         );
-        assert_eq!(run(&mut app, reply(1, 8, Outcome::Ok(Body::Done))), []);
+        run(&mut app, ch('/'));
+        assert_eq!(run(&mut app, ch('x')), []);
+        assert_eq!(run(&mut app, press(KeyCode::Enter)), []);
+        assert!(!app.filters[View::Search.index()].editing);
     }
 
     #[test]
@@ -1089,41 +1408,65 @@ mod tests {
         assert_eq!(app.view, View::Queue);
         run(&mut app, press(KeyCode::BackTab));
         assert_eq!(app.view, View::Search);
-        assert!(!app.search.editing);
+        assert!(app.filters.iter().all(|f| !f.editing));
     }
 
     #[test]
-    fn the_query_is_edited_locally_and_sent_on_enter() {
+    fn quit_works_while_disconnected_with_a_filter_open() {
         let mut app = app();
+        run(&mut app, ch('/'));
+        run(&mut app, ch('a'));
+        run(&mut app, ch('b'));
+        let g = app.generation;
+        run(&mut app, Msg::Disconnected(g));
+        assert!(!app.filters[app.view.index()].editing);
+        assert_eq!(app.filters[app.view.index()].query, "ab");
+        run(&mut app, ch('q'));
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn quit_works_after_a_failed_connect_with_a_filter_open() {
+        let mut app = app();
+        run(&mut app, ch('/'));
+        run(&mut app, ch('a'));
+        app.connect_failed(app.generation + 1);
+        assert!(app.filters.iter().all(|f| !f.editing));
+        run(&mut app, ch('q'));
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn escape_while_disconnected_only_reconnects() {
+        let mut app = app();
+        run(&mut app, ch('/'));
+        let g = app.generation;
+        run(&mut app, Msg::Disconnected(g));
+        assert_eq!(run(&mut app, press(KeyCode::Esc)), [Out::Reconnect]);
+        assert!(!app.quit);
+    }
+
+    #[test]
+    fn the_query_is_edited_locally() {
+        let mut app = app();
+        app.view = View::Search;
         assert_eq!(run(&mut app, ch('/')), []);
         assert_eq!(app.view, View::Search);
-        assert!(app.search.editing);
+        let f = |app: &App| app.filters[View::Search.index()].clone();
+        assert!(f(&app).editing);
         for c in "iriq".chars() {
             assert_eq!(run(&mut app, ch(c)), []);
         }
         assert_eq!(run(&mut app, press(KeyCode::Backspace)), []);
         assert_eq!(run(&mut app, ch('s')), []);
-        assert_eq!(
-            run(&mut app, press(KeyCode::Enter)),
-            [Out::Send(
-                Command::Search {
-                    query: "iris".into()
-                },
-                Pending::Search
-            )]
-        );
-        assert!(!app.search.editing);
+        assert_eq!(f(&app).query, "iris");
+        assert_eq!(run(&mut app, press(KeyCode::Enter)), []);
+        assert!(!f(&app).editing);
+        assert_eq!(f(&app).query, "iris");
         run(&mut app, ch('/'));
         assert_eq!(run(&mut app, ch('o')), []);
         assert_eq!(run(&mut app, press(KeyCode::Esc)), []);
-        assert!(!app.search.editing);
-        assert_eq!(app.search.query, "iriso");
-        app.expect(3, Pending::Search);
-        app.search.selected = 4;
-        let hits = Outcome::Ok(Body::Tracks(vec![track("1"), track("2")]));
-        assert_eq!(run(&mut app, reply(1, 3, hits)), []);
-        assert_eq!(app.search.results.len(), 2);
-        assert_eq!(app.search.selected, 1);
+        assert_eq!(f(&app), Filter::default());
     }
 
     #[test]
@@ -1312,17 +1655,12 @@ mod tests {
     fn artists_parent_follows_depth() {
         let mut app = app();
         app.view = View::Artists;
-        app.artists.path = paths(&["Ann", "Alb"]);
-        app.artists.parent = vec![named("Alb")];
-        app.artists.items = vec![Entry::Track(track("t"))];
-        assert_eq!(
-            run(&mut app, ch('h')),
-            [Out::Send(
-                Command::Artists,
-                list(View::Artists, &[], Col::Parent, None)
-            )]
-        );
-        assert!(run(&mut app, ch('h')).len() <= 1);
+        app.artists.path = paths(&["Ann", "Red"]);
+        app.rebuild_artists(None);
+        assert_eq!(app.artists.parent, entries(&["Blue", "Red"]));
+        assert_eq!(run(&mut app, ch('h')), []);
+        assert_eq!(app.artists.parent, entries(&["Ann", "Bob", "Unknown"]));
+        assert_eq!(run(&mut app, ch('h')), []);
         assert!(app.artists.parent.is_empty());
     }
 
@@ -1355,7 +1693,18 @@ mod tests {
     fn refetch_also_fetches_the_parent() {
         let mut app = app();
         app.dirs.path = paths(&["a", "b"]);
-        let outs = run(&mut app, event(1, Event::LibraryChanged { tracks: 0 }));
+        let outs = run(
+            &mut app,
+            event(
+                1,
+                Event::LibraryChanged {
+                    generation: 2,
+                    tracks: 0,
+                    added: vec![],
+                    removed: vec![],
+                },
+            ),
+        );
         assert!(
             outs.contains(&Out::Send(
                 Command::Browse { path: "a".into() },
@@ -1619,16 +1968,7 @@ mod tests {
                     Command::Browse { path: "a".into() },
                     list(View::Directories, &["a"], Col::Current, None)
                 ),
-                Out::Send(
-                    Command::Artists,
-                    list(View::Artists, &[], Col::Parent, None)
-                ),
-                Out::Send(
-                    Command::Albums {
-                        artist: Some("Ann".into())
-                    },
-                    list(View::Artists, &["Ann"], Col::Current, None)
-                ),
+                Out::Send(Command::Tracks, Pending::Tracks),
             ]
         );
         let new = Outcome::Ok(Body::Queue(vec![track("new")]));
@@ -1643,6 +1983,79 @@ mod tests {
             ),
         );
         assert_eq!(app.status, Some(status(None, None)));
+    }
+
+    #[test]
+    fn connect_fetches_the_library() {
+        let mut app = app();
+        let resync = Resync {
+            subscribe: 10,
+            status: 11,
+            queue: 12,
+        };
+        app.connected(2, &resync);
+        let outs = run(&mut app, reply(2, 10, Outcome::Ok(Body::Done)));
+        assert!(
+            outs.contains(&Out::Send(Command::Tracks, Pending::Tracks)),
+            "{outs:?}"
+        );
+        app.expect(13, Pending::Tracks);
+        let library = Body::Library {
+            generation: 4,
+            tracks: vec![track("/m/a.flac")],
+        };
+        let outs = run(&mut app, reply(2, 13, Outcome::Ok(library)));
+        assert!(
+            outs.contains(&Out::Send(
+                Command::Browse { path: "".into() },
+                list(View::Directories, &[], Col::Current, None)
+            )),
+            "{outs:?}"
+        );
+        assert_eq!(app.library.tracks, [track("/m/a.flac")]);
+        assert_eq!(app.artists.items, entries(&["Unknown"]));
+    }
+
+    #[test]
+    fn library_events_follow_the_generation() {
+        let mut app = app();
+        app.library.replace(4, vec![track("/m/a.flac")]);
+        let changed = |generation, added: Vec<Track>| Event::LibraryChanged {
+            generation,
+            tracks: 0,
+            added,
+            removed: vec![],
+        };
+        assert_eq!(run(&mut app, event(1, changed(4, vec![]))), []);
+        let outs = run(&mut app, event(1, changed(5, vec![track("/m/b.flac")])));
+        assert!(!outs.is_empty());
+        assert_eq!(app.library.tracks, [track("/m/a.flac"), track("/m/b.flac")]);
+        assert_eq!(
+            run(&mut app, event(1, changed(7, vec![]))),
+            [Out::Send(Command::Tracks, Pending::Tracks)]
+        );
+        app.expect(3, Pending::Tracks);
+        let old = Body::Library {
+            generation: 3,
+            tracks: vec![],
+        };
+        assert_eq!(run(&mut app, reply(1, 3, Outcome::Ok(old))), []);
+        assert_eq!(app.library.tracks.len(), 2);
+    }
+
+    #[test]
+    fn switch_clears_the_library() {
+        let mut app = app();
+        app.library.replace(4, vec![track("/m/a.flac")]);
+        assert_eq!(run(&mut app, ch('o')), [Out::Switch]);
+        let resync = Resync {
+            subscribe: 10,
+            status: 11,
+            queue: 12,
+        };
+        app.connected(2, &resync);
+        assert!(app.library.tracks.is_empty());
+        assert_eq!(app.library.replace(1, vec![]), crate::local::Delta::Applied);
     }
 
     #[test]
@@ -1665,5 +2078,388 @@ mod tests {
             app.footer.as_deref(),
             Some("disconnected: press any key to reconnect")
         );
+    }
+
+    fn titled(path: &str, artist: &str, title: &str) -> Track {
+        Track {
+            artist: Some(artist.into()),
+            title: Some(title.into()),
+            ..track(path)
+        }
+    }
+
+    fn filtered_queue() -> App {
+        let mut app = app();
+        app.queue = vec![
+            titled("q0", "ABBA", "Fernando"),
+            titled("q1", "ABBA", "The Winner Takes It All"),
+            titled("q2", "Other", "Waltz Time"),
+        ];
+        app.queue_selected = 0;
+        app
+    }
+
+    fn typed(app: &mut App, text: &str) -> Vec<Out> {
+        let mut outs = run(app, ch('/'));
+        for c in text.chars() {
+            outs.extend(run(app, ch(c)));
+        }
+        outs
+    }
+
+    fn queue_lines(app: &App) -> Vec<String> {
+        app.queue.iter().map(lossless_proto::describe).collect()
+    }
+
+    #[test]
+    fn typing_filters_without_enter() {
+        let mut app = filtered_queue();
+        app.queue_selected = 2;
+        assert_eq!(typed(&mut app, "wt"), []);
+        let want = Ranker::new().rank("wt", queue_lines(&app));
+        assert_eq!(want.len(), 2);
+        let f = &app.filters[View::Queue.index()];
+        assert!(f.editing);
+        assert_eq!(f.hits.as_ref(), Some(&want));
+        assert_eq!(app.queue_selected, 0);
+        assert_eq!(app.view, View::Queue);
+        assert_eq!(run(&mut app, press(KeyCode::Down)), []);
+        assert_eq!(app.queue_selected, 1);
+        assert_eq!(run(&mut app, ctrl('p')), []);
+        assert_eq!(app.queue_selected, 0);
+        assert_eq!(run(&mut app, press(KeyCode::Backspace)), []);
+        assert_eq!(
+            app.filters[0].hits,
+            Some(Ranker::new().rank("w", queue_lines(&app)))
+        );
+        run(&mut app, press(KeyCode::Backspace));
+        assert_eq!(app.filters[0].hits, None);
+    }
+
+    #[test]
+    fn enter_plays_the_real_index() {
+        let mut app = filtered_queue();
+        typed(&mut app, "waltz");
+        assert_eq!(app.filters[0].hits, Some(vec![2]));
+        assert_eq!(run(&mut app, press(KeyCode::Enter)), []);
+        assert!(!app.filters[0].editing);
+        assert_eq!(
+            run(&mut app, press(KeyCode::Enter)),
+            [done(Command::Play { index: Some(2) })]
+        );
+    }
+
+    #[test]
+    fn remove_uses_the_real_index() {
+        let mut app = filtered_queue();
+        typed(&mut app, "waltz");
+        run(&mut app, press(KeyCode::Enter));
+        assert_eq!(
+            run(&mut app, ch('d')),
+            [done(Command::Remove { indices: vec![2] })]
+        );
+        typed(&mut app, "zzz");
+        run(&mut app, press(KeyCode::Enter));
+        assert_eq!(run(&mut app, ch('d')), []);
+        assert_eq!(run(&mut app, press(KeyCode::Enter)), []);
+    }
+
+    #[test]
+    fn move_is_refused_while_filtered() {
+        let mut app = filtered_queue();
+        typed(&mut app, "abba");
+        run(&mut app, press(KeyCode::Enter));
+        for k in ['J', 'K'] {
+            assert_eq!(run(&mut app, ch(k)), []);
+            assert_eq!(
+                app.footer.as_deref(),
+                Some("clear the filter (Esc) to move entries")
+            );
+        }
+    }
+
+    #[test]
+    fn escape_clears_and_keeps_the_entry() {
+        let mut app = filtered_queue();
+        typed(&mut app, "waltz");
+        run(&mut app, press(KeyCode::Enter));
+        assert_eq!(run(&mut app, press(KeyCode::Esc)), []);
+        assert_eq!(app.filters[0], Filter::default());
+        assert_eq!(app.queue_selected, 2);
+        typed(&mut app, "winner");
+        assert_eq!(run(&mut app, press(KeyCode::Esc)), []);
+        assert_eq!(app.filters[0], Filter::default());
+        assert_eq!(app.queue_selected, 1);
+        typed(&mut app, "zzz");
+        run(&mut app, press(KeyCode::Esc));
+        assert_eq!(app.queue_selected, 0);
+    }
+
+    #[test]
+    fn queue_filter_survives_a_shrinking_queue() {
+        let mut app = filtered_queue();
+        typed(&mut app, "a");
+        run(&mut app, press(KeyCode::Enter));
+        assert_eq!(app.filters[0].hits.as_ref().map(Vec::len), Some(3));
+        run(&mut app, ch('G'));
+        assert_eq!(app.queue_selected, 2);
+        app.expect(5, Pending::Queue);
+        let q = vec![titled("n0", "Ann", "Away"), titled("n1", "Ann", "Bye")];
+        run(&mut app, reply(1, 5, Outcome::Ok(Body::Queue(q))));
+        let want = Ranker::new().rank("a", queue_lines(&app));
+        assert_eq!(app.filters[0].hits.as_ref(), Some(&want));
+        assert_eq!(app.queue_selected, want.len() - 1);
+        let [Out::Send(Command::Play { index: Some(i) }, _)] =
+            run(&mut app, press(KeyCode::Enter))[..]
+        else {
+            panic!("one play")
+        };
+        assert!(i < app.queue.len());
+    }
+
+    #[test]
+    fn directories_preview_follows_the_top_match() {
+        let mut app = app();
+        app.view = View::Directories;
+        assert_eq!(run(&mut app, ch('/')), []);
+        assert_eq!(
+            run(&mut app, ch('b')),
+            [Out::Send(
+                Command::Browse { path: "b".into() },
+                list(View::Directories, &["b"], Col::Preview, None)
+            )]
+        );
+        assert_eq!(app.dirs.selected, 0);
+        assert_eq!(
+            run(&mut app, press(KeyCode::Backspace)),
+            [Out::Send(
+                Command::Browse { path: "a".into() },
+                list(View::Directories, &["a"], Col::Preview, None)
+            )]
+        );
+        app.expect(3, list(View::Directories, &["a"], Col::Preview, None));
+        app.expect(4, list(View::Directories, &["b"], Col::Preview, None));
+        run(&mut app, ch('b'));
+        let stale = vec![Entry::Track(track("a/t.flac"))];
+        run(&mut app, reply(1, 3, Outcome::Ok(Body::Entries(stale))));
+        assert!(app.dirs.preview.is_empty());
+        let fresh = vec![Entry::Track(track("b/t.flac"))];
+        run(
+            &mut app,
+            reply(1, 4, Outcome::Ok(Body::Entries(fresh.clone()))),
+        );
+        assert_eq!(app.dirs.preview, fresh);
+    }
+
+    #[test]
+    fn a_listing_reapplies_the_directories_filter() {
+        let mut app = app();
+        app.view = View::Directories;
+        typed(&mut app, "b");
+        run(&mut app, press(KeyCode::Enter));
+        app.expect(6, list(View::Directories, &[], Col::Current, None));
+        let top = vec![named("a"), named("bb"), named("c"), named("b")];
+        let outs = run(&mut app, reply(1, 6, Outcome::Ok(Body::Entries(top))));
+        let want = Ranker::new().rank("b", ["a", "bb", "c", "b"]);
+        assert_eq!(app.filters[1].hits.as_ref(), Some(&want));
+        let top = match &app.dirs.items[want[0]] {
+            Entry::Dir { name, .. } => name.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            outs,
+            [Out::Send(
+                Command::Browse { path: top.clone() },
+                list(View::Directories, &[top.as_str()], Col::Preview, None)
+            )]
+        );
+    }
+
+    #[test]
+    fn entering_a_column_clears_its_filter() {
+        let mut app = app();
+        app.view = View::Directories;
+        typed(&mut app, "b");
+        run(&mut app, press(KeyCode::Enter));
+        assert_eq!(
+            run(&mut app, ch('l')),
+            [Out::Send(
+                Command::Browse { path: "b".into() },
+                list(View::Directories, &["b"], Col::Current, None)
+            )]
+        );
+        assert_eq!(app.dirs.path, paths(&["b"]));
+        assert_eq!(app.filters[1], Filter::default());
+        typed(&mut app, "zz");
+        run(&mut app, press(KeyCode::Enter));
+        run(&mut app, ch('h'));
+        assert_eq!(app.filters[1], Filter::default());
+        assert!(app.dirs.path.is_empty());
+        app.view = View::Artists;
+        typed(&mut app, "bob");
+        run(&mut app, press(KeyCode::Enter));
+        assert_eq!(app.artists.preview, entries(&["Gold"]));
+        assert_eq!(run(&mut app, ch('l')), []);
+        assert_eq!(app.artists.path, paths(&["Bob"]));
+        assert_eq!(app.artists.items, entries(&["Gold"]));
+        assert_eq!(app.filters[2], Filter::default());
+        typed(&mut app, "zz");
+        run(&mut app, press(KeyCode::Enter));
+        run(&mut app, ch('h'));
+        assert_eq!(app.filters[2], Filter::default());
+        assert_eq!(app.artists.selected, 1);
+    }
+
+    #[test]
+    fn artists_filter_follows_the_copy() {
+        let mut app = app();
+        app.view = View::Artists;
+        typed(&mut app, "bo");
+        assert_eq!(app.artists.preview, entries(&["Gold"]));
+        let added = Event::LibraryChanged {
+            generation: 2,
+            tracks: 0,
+            added: vec![tagged("m/c1.flac", "Bono", "Solo", 1)],
+            removed: vec![],
+        };
+        run(&mut app, event(1, added));
+        let names = ["Ann", "Bob", "Bono", "Unknown"];
+        assert_eq!(app.artists.items, entries(&names));
+        let want = Ranker::new().rank("bo", names);
+        assert_eq!(app.filters[2].hits.as_ref(), Some(&want));
+        run(&mut app, press(KeyCode::Enter));
+        let top = names[want[0]];
+        let lib = &app.library;
+        let want_paths: Vec<String> = lib
+            .catalog
+            .find(&lib.tracks, Some(top), None)
+            .into_iter()
+            .map(|i| lib.tracks[i].path.clone())
+            .collect();
+        assert_eq!(
+            run(&mut app, ch('a')),
+            [done(Command::Add {
+                paths: want_paths,
+                at: None
+            })]
+        );
+    }
+
+    #[test]
+    fn delta_reapplies_the_search_filter() {
+        let mut app = app();
+        app.view = View::Search;
+        typed(&mut app, "zed");
+        run(&mut app, press(KeyCode::Enter));
+        assert_eq!(app.filters[3].hits, Some(vec![]));
+        assert_eq!(run(&mut app, press(KeyCode::Enter)), []);
+        let added = Event::LibraryChanged {
+            generation: 2,
+            tracks: 0,
+            added: vec![titled("m/z.flac", "Zed", "Zz")],
+            removed: vec![],
+        };
+        run(&mut app, event(1, added));
+        let at = app
+            .library
+            .tracks
+            .iter()
+            .position(|t| t.path == "m/z.flac")
+            .unwrap();
+        assert_eq!(app.filters[3].hits, Some(vec![at]));
+        assert_eq!(
+            run(&mut app, press(KeyCode::Enter)),
+            [done(Command::Replace {
+                paths: paths(&["m/z.flac"])
+            })]
+        );
+    }
+
+    #[test]
+    fn refetch_reapplies_the_search_filter() {
+        let mut app = app();
+        app.library
+            .replace(1, vec![titled("old/z.flac", "Zed", "Old")]);
+        app.view = View::Search;
+        typed(&mut app, "zed");
+        run(&mut app, press(KeyCode::Enter));
+        assert_eq!(app.filters[3].hits, Some(vec![0]));
+        app.library.clear();
+        let early = Event::LibraryChanged {
+            generation: 5,
+            tracks: 0,
+            added: vec![],
+            removed: vec![],
+        };
+        assert_eq!(run(&mut app, event(1, early)), []);
+        app.expect(7, Pending::Tracks);
+        let library = Body::Library {
+            generation: 4,
+            tracks: vec![titled("a.flac", "Ann", "A"), titled("z.flac", "Zed", "Zz")],
+        };
+        let outs = run(&mut app, reply(1, 7, Outcome::Ok(library)));
+        assert!(
+            outs.contains(&Out::Send(Command::Tracks, Pending::Tracks)),
+            "{outs:?}"
+        );
+        assert_eq!(app.filters[3].hits, Some(vec![1]));
+        assert_eq!(app.artists.items, entries(&["Ann", "Zed"]));
+        assert_eq!(
+            run(&mut app, press(KeyCode::Enter)),
+            [done(Command::Replace {
+                paths: paths(&["z.flac"])
+            })]
+        );
+    }
+
+    fn footer_of(app: &App) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut t = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        t.draw(|f| crate::ui::draw(app, f)).unwrap();
+        (0..80)
+            .map(|x| t.backend().buffer()[(x, 23)].symbol().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn footer_shows_query_and_count() {
+        let mut app = filtered_queue();
+        typed(&mut app, "wt");
+        assert!(
+            footer_of(&app).starts_with("/ wt_ "),
+            "{:?}",
+            footer_of(&app)
+        );
+        run(&mut app, press(KeyCode::Enter));
+        assert!(
+            footer_of(&app).starts_with("/ wt  2 of 3 "),
+            "{:?}",
+            footer_of(&app)
+        );
+        run(&mut app, ch('J'));
+        assert!(footer_of(&app).starts_with("clear the filter (Esc) to move entries"));
+        app.view = View::Search;
+        assert!(!footer_of(&app).contains("/ wt"));
+        app.view = View::Queue;
+        run(&mut app, press(KeyCode::Esc));
+        assert!(!footer_of(&app).contains("/ "));
+    }
+
+    #[test]
+    fn filters_survive_a_reconnect() {
+        let mut app = filtered_queue();
+        typed(&mut app, "wt");
+        run(&mut app, press(KeyCode::Enter));
+        let resync = Resync {
+            subscribe: 10,
+            status: 11,
+            queue: 12,
+        };
+        app.connected(2, &resync);
+        assert_eq!(app.filters[0].hits, Some(vec![]));
+        let q = vec![titled("n0", "Ann", "Wet")];
+        run(&mut app, reply(2, 12, Outcome::Ok(Body::Queue(q))));
+        assert_eq!(app.filters[0].hits, Some(vec![0]));
     }
 }

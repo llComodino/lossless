@@ -14,8 +14,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Block;
 
 use crate::app::{App, View};
+use crate::theme;
 
 pub fn draw(app: &App, f: &mut Frame) {
+    f.render_widget(Block::new().style(theme::base()), f.area());
     let [head, body, foot] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(3),
@@ -23,13 +25,15 @@ pub fn draw(app: &App, f: &mut Frame) {
     ])
     .areas(f.area());
     header::draw(app, Instant::now(), f, head);
-    let block = Block::bordered().title(tabs(app.view));
+    let block = Block::bordered()
+        .border_style(theme::border())
+        .title(tabs(app.view));
     let inner = block.inner(body);
     f.render_widget(block, body);
     match app.view {
         View::Queue => queue::draw(app, f, inner),
-        View::Directories => columns::draw(&app.dirs, f, inner),
-        View::Artists => columns::draw(&app.artists, f, inner),
+        View::Directories => columns::draw(&app.dirs, &app.filters[1], f, inner),
+        View::Artists => columns::draw(&app.artists, &app.filters[2], f, inner),
         View::Search => search::draw(app, f, inner),
     }
     footer::draw(app, f, foot);
@@ -51,12 +55,12 @@ fn tabs(current: View) -> Line<'static> {
     let mut spans = Vec::new();
     for (i, view) in View::ALL.into_iter().enumerate() {
         let style = if view == current {
-            Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            Style::new().fg(theme::YELLOW).add_modifier(Modifier::BOLD)
         } else {
-            Style::new()
+            Style::new().fg(theme::GREY)
         };
         spans.push(Span::styled(format!(" {} {} ", i + 1, label(view)), style));
-        spans.push(Span::raw("\u{2500}"));
+        spans.push(Span::styled("\u{2500}", theme::border()));
     }
     spans.pop();
     Line::from(spans)
@@ -70,12 +74,13 @@ mod tests {
     use lossless_proto::{Entry, PlayState, Repeat, Status, StreamFormat, Track};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use ratatui::style::Modifier;
     use unicode_width::UnicodeWidthStr;
 
     use super::draw;
     use crate::app::{App, View};
     use crate::clock::Clock;
+    use crate::filter::Filter;
+    use crate::theme;
 
     fn track(artist: &str, title: &str) -> Track {
         Track {
@@ -193,7 +198,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_selection_is_reversed() {
+    fn selection_is_yellow_on_dark() {
         let mut a = app("default", None);
         a.queue_selected = 0;
         let (l, t) = render(&a);
@@ -201,16 +206,56 @@ mod tests {
             .iter()
             .position(|r| r.contains("1  Kenshi") || r.contains("1 Kenshi"))
             .unwrap();
-        assert!(
-            t.backend().buffer()[(10, y as u16)]
-                .modifier
-                .contains(Modifier::REVERSED)
-        );
-        assert!(
-            !t.backend().buffer()[(10, y as u16 + 1)]
-                .modifier
-                .contains(Modifier::REVERSED)
-        );
+        let b = t.backend().buffer();
+        assert_eq!(b[(10, y as u16)].fg, theme::YELLOW);
+        assert_eq!(b[(10, y as u16)].bg, theme::SELECTED_BG);
+        assert_ne!(b[(10, y as u16 + 1)].bg, theme::SELECTED_BG);
+    }
+
+    #[test]
+    fn playing_row_is_green() {
+        let mut a = app("default", None);
+        a.queue_selected = 0;
+        let (l, t) = render(&a);
+        let y = l
+            .iter()
+            .position(|r| r.contains('\u{25b6}') && r.contains("KICK BACK"))
+            .unwrap() as u16;
+        assert_eq!(t.backend().buffer()[(10, y)].fg, theme::GREEN);
+        a.queue_selected = 1;
+        let (_, t) = render(&a);
+        let c = &t.backend().buffer()[(10, y)];
+        assert_eq!((c.fg, c.bg), (theme::YELLOW, theme::SELECTED_BG));
+        assert_eq!(t.backend().buffer()[(1, y)].symbol(), "\u{25b6}");
+    }
+
+    #[test]
+    fn background_is_painted() {
+        let (_, t) = render(&app("default", None));
+        let b = t.backend().buffer();
+        assert_eq!(b[(40, 20)].bg, theme::BG);
+        assert_eq!(b[(40, 20)].fg, theme::FG);
+        assert_eq!(b[(0, 4)].fg, theme::GREY);
+    }
+
+    #[test]
+    fn header_accents_and_progress_bar() {
+        let (_, t) = render(&app("default", Some(72)));
+        let b = t.backend().buffer();
+        assert_eq!(b[(1, 0)].fg, theme::NIAGARA);
+        assert_eq!(b[(0, 2)].fg, theme::GREEN);
+        assert_eq!(b[(60, 2)].fg, theme::GREY);
+    }
+
+    #[test]
+    fn errors_are_red() {
+        let mut a = app("default", None);
+        a.footer = Some("error: x".into());
+        let (_, t) = render(&a);
+        assert_eq!(t.backend().buffer()[(0, 23)].fg, theme::RED);
+        a.footer = Some("note".into());
+        let (_, t) = render(&a);
+        assert_ne!(t.backend().buffer()[(0, 23)].fg, theme::RED);
     }
 
     #[test]
@@ -283,6 +328,7 @@ mod tests {
             "r / z",
             "+/-",
             "/",
+            "Esc",
             "u",
             "o",
             "?",
@@ -360,16 +406,8 @@ mod tests {
         assert!(row.contains("Jazz") || l.iter().any(|r| r.contains("Jazz/")));
         assert!(l.iter().any(|r| r.contains("Album One/")));
         let y = l.iter().position(|r| r.contains("Two/")).unwrap() as u16;
-        assert!(
-            t.backend().buffer()[(c as u16, y)]
-                .modifier
-                .contains(Modifier::REVERSED)
-        );
-        assert!(
-            !t.backend().buffer()[(v as u16, y)]
-                .modifier
-                .contains(Modifier::REVERSED)
-        );
+        assert_eq!(t.backend().buffer()[(c as u16, y)].fg, theme::YELLOW);
+        assert_ne!(t.backend().buffer()[(v as u16, y)].fg, theme::YELLOW);
     }
 
     #[test]
@@ -408,33 +446,81 @@ mod tests {
     }
 
     #[test]
-    fn search_shows_query_and_results() {
+    fn search_lists_the_library() {
         let mut a = app("default", None);
         a.view = View::Search;
-        a.search.query = "iris".into();
-        a.search.editing = true;
-        a.search.results = vec![track("Kenshi Yonezu", "IRIS OUT"), track("X", "Other")];
+        a.library.replace(
+            0,
+            vec![track("Kenshi Yonezu", "IRIS OUT"), track("X", "Other")],
+        );
         a.search.selected = 1;
         let (l, t) = sized(&a, 80, 24);
-        let q = l
-            .iter()
-            .find(|r| r.contains("/ iris_"))
-            .expect("query line");
-        assert!(q.starts_with('\u{2502}'), "{q:?}");
         let r = l
             .iter()
             .find(|r| r.contains("Kenshi Yonezu - IRIS OUT"))
             .unwrap();
         assert!(r.contains("2:31") && r.contains("24-bit/48 kHz"), "{r:?}");
         let y = l.iter().position(|r| r.contains("X - Other")).unwrap() as u16;
-        assert!(
-            t.backend().buffer()[(10, y)]
-                .modifier
-                .contains(Modifier::REVERSED)
-        );
-        a.search.editing = false;
-        let (l, _) = sized(&a, 80, 24);
-        assert!(l.iter().any(|r| r.contains("/ iris")) && !l.iter().any(|r| r.contains("/ iris_")));
+        assert_eq!(t.backend().buffer()[(10, y)].bg, theme::SELECTED_BG);
+    }
+
+    fn filtered(hits: Vec<usize>) -> Filter {
+        Filter {
+            query: "k".into(),
+            editing: false,
+            hits: Some(hits),
+        }
+    }
+
+    #[test]
+    fn filtered_rows_keep_their_real_numbers() {
+        let mut a = app("default", None);
+        a.filters[View::Queue.index()] = filtered(vec![1]);
+        a.queue_selected = 0;
+        let (l, t) = render(&a);
+        let y = l
+            .iter()
+            .position(|r| r.contains("   2  Kenshi Yonezu - KICK BACK"))
+            .unwrap();
+        assert_eq!(t.backend().buffer()[(10, y as u16)].bg, theme::SELECTED_BG);
+        assert!(!l.iter().any(|r| r.contains("Kenshi Yonezu - IRIS OUT (")));
+        assert!(l[23].starts_with("/ k  1 of 2 "), "{:?}", l[23]);
+        assert_eq!(t.backend().buffer()[(0, 23)].fg, theme::YELLOW);
+    }
+
+    #[test]
+    fn disconnected_wins_over_the_filter_line() {
+        let mut a = app("default", None);
+        a.filters[View::Queue.index()] = filtered(vec![1]);
+        a.connected = false;
+        let (l, _) = render(&a);
+        assert!(l[23].contains("disconnected"), "{:?}", l[23]);
+        assert!(!l[23].contains("1 of 2"), "{:?}", l[23]);
+    }
+
+    #[test]
+    fn filtered_search_rows_number_by_position() {
+        let mut a = app("default", None);
+        a.view = View::Search;
+        a.library.tracks = vec![track("A", "zero"), track("B", "one"), track("C", "two")];
+        a.filters[View::Search.index()] = filtered(vec![2, 1]);
+        let (l, _) = render(&a);
+        assert!(l.iter().any(|r| r.contains("  1  C - two")), "{l:?}");
+        assert!(l.iter().any(|r| r.contains("  2  B - one")), "{l:?}");
+        assert!(!l.iter().any(|r| r.contains("  3  C - two")), "{l:?}");
+    }
+
+    #[test]
+    fn columns_show_the_current_column_filtered() {
+        let mut a = browsing(View::Directories);
+        a.filters[View::Directories.index()] = filtered(vec![1]);
+        a.dirs.selected = 0;
+        let (l, t) = sized(&a, 100, 24);
+        assert!(!l.iter().any(|r| r.contains("Album One/")));
+        let y = l.iter().position(|r| r.contains("Two/")).unwrap() as u16;
+        let x = col_of(&l[y as usize], "Two/").unwrap() as u16;
+        assert_eq!(t.backend().buffer()[(x, y)].bg, theme::SELECTED_BG);
+        assert!(l.iter().any(|r| r.contains("Jazz/")));
     }
 
     #[test]
@@ -446,8 +532,7 @@ mod tests {
                     a.view = view;
                     a.help = help;
                     a.footer = Some("a long footer message that overflows".into());
-                    a.search.query = "q".into();
-                    a.search.results = vec![track("A", "B")];
+                    a.library.replace(0, vec![track("A", "B")]);
                     a.queue_selected = 1;
                     sized(&a, w, h);
                 }
@@ -477,7 +562,7 @@ mod tests {
         ];
         let mut a = app("default", None);
         a.queue = titles.iter().map(|t| track("Art", t)).collect();
-        a.search.results = a.queue.clone();
+        a.library.replace(0, a.queue.clone());
         a.view = View::Queue;
         let (q, _) = sized(&a, 80, 24);
         a.view = View::Search;

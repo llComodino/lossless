@@ -6,16 +6,24 @@ use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 
 use crate::app::Columns;
+use crate::filter::Filter;
+use crate::theme;
 
 const MIN_THREE: u16 = 60;
 
-pub fn draw(cols: &Columns<Entry>, f: &mut Frame, area: Rect) {
+/// The current column is shown through `filter`.
+pub fn draw(cols: &Columns<Entry>, filter: &Filter, f: &mut Frame, area: Rect) {
+    let current_items: Vec<&Entry> = filter
+        .visible(&cols.items)
+        .into_iter()
+        .map(|(_, e)| e)
+        .collect();
     if area.width < MIN_THREE {
         list(
-            &cols.items,
+            &current_items,
             Some(cols.selected),
             cols.offset,
-            Style::new(),
+            theme::selected(),
             f,
             area,
         );
@@ -34,23 +42,25 @@ pub fn draw(cols: &Columns<Entry>, f: &mut Frame, area: Rect) {
             .position(|e| matches!(e, Entry::Dir { name: n, .. } if n == name))
     });
     let rows = usize::from(parent.height);
+    let parent_items: Vec<&Entry> = cols.parent.iter().collect();
     list(
-        &cols.parent,
+        &parent_items,
         came_from,
         came_from.map_or(0, |s| (s + 1).saturating_sub(rows)),
-        Style::new().add_modifier(Modifier::BOLD),
+        Style::new().fg(theme::FG).add_modifier(Modifier::BOLD),
         f,
         parent,
     );
     list(
-        &cols.items,
+        &current_items,
         Some(cols.selected),
         cols.offset,
-        Style::new(),
+        theme::selected(),
         f,
         current,
     );
-    list(&cols.preview, None, 0, Style::new(), f, preview);
+    let preview_items: Vec<&Entry> = cols.preview.iter().collect();
+    list(&preview_items, None, 0, theme::selected(), f, preview);
 }
 
 fn label(e: &Entry) -> String {
@@ -61,20 +71,15 @@ fn label(e: &Entry) -> String {
 }
 
 fn list(
-    items: &[Entry],
+    items: &[&Entry],
     selected: Option<usize>,
     offset: usize,
-    mark: Style,
+    style: Style,
     f: &mut Frame,
     area: Rect,
 ) {
     let height = usize::from(area.height);
     let width = usize::from(area.width);
-    let style = if mark == Style::new() {
-        Style::new().add_modifier(Modifier::REVERSED)
-    } else {
-        mark
-    };
     let lines: Vec<Line> = items
         .iter()
         .enumerate()

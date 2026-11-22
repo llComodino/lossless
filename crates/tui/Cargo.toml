@@ -14,9 +14,11 @@ path = "src/main.rs"
 crossterm = "0.29.0"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29"] }
 lossless-proto.workspace = true
+nucleo-matcher = { version = "0.3.1", default-features = false, features = ["unicode-casefold", "unicode-normalization"] }
 
 [dev-dependencies]
 lossless-daemon = { path = "../daemon" }
 lossless-engine = { workspace = true, features = ["fixtures"] }
 portable-pty = "0.9.0"
+proptest = "1.12.0"
 unicode-width = "0.2"

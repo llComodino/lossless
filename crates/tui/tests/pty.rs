@@ -59,12 +59,21 @@ fn wait_for(rx: &Receiver<Vec<u8>>, seen: &mut Vec<u8>, want: &str) {
     }
 }
 
-#[test]
-fn keys_drive_the_daemon() {
+struct Session {
+    _dir: Dir,
+    sock: std::path::PathBuf,
+    child: Kill,
+    rx: Receiver<Vec<u8>>,
+    keys: Box<dyn Write + Send>,
+    seen: Vec<u8>,
+    _master: Box<dyn portable_pty::MasterPty + Send>,
+}
+
+fn session(names: &[&str]) -> Session {
     let dir = Dir::new();
     let album = dir.path("music/album");
     std::fs::create_dir_all(&album).unwrap();
-    for n in ["01 one.flac", "02 two.flac"] {
+    for n in names {
         flac_at(&album.join(n), 44_100, 16, 2, 50 * BLOCK);
     }
     let sock = dir.path("sock");
@@ -95,7 +104,7 @@ fn keys_drive_the_daemon() {
     cmd.arg(&sock);
     cmd.env("XDG_RUNTIME_DIR", dir.path(""));
     cmd.env("TERM", "xterm-256color");
-    let mut child = Kill(pair.slave.spawn_command(cmd).unwrap());
+    let child = Kill(pair.slave.spawn_command(cmd).unwrap());
     drop(pair.slave);
 
     let mut reader = pair.master.try_clone_reader().unwrap();
@@ -108,9 +117,31 @@ fn keys_drive_the_daemon() {
             }
         }
     });
-    let mut keys = pair.master.take_writer().unwrap();
-    let mut seen = Vec::new();
+    let keys = pair.master.take_writer().unwrap();
+    let seen = Vec::new();
 
+    Session {
+        _dir: dir,
+        sock,
+        child,
+        rx,
+        keys,
+        seen,
+        _master: pair.master,
+    }
+}
+
+#[test]
+fn keys_drive_the_daemon() {
+    let Session {
+        sock,
+        mut child,
+        rx,
+        mut keys,
+        mut seen,
+        _dir,
+        _master,
+    } = session(&["01 one.flac", "02 two.flac"]);
     keys.write_all(b"2").unwrap();
     wait_for(&rx, &mut seen, "album/");
     keys.write_all(b"l").unwrap();
@@ -136,4 +167,44 @@ fn keys_drive_the_daemon() {
         thread::sleep(Duration::from_millis(20));
     };
     assert!(code.success(), "{code:?}");
+}
+
+#[test]
+fn typing_reranks_rows_live() {
+    let mut s = session(&["01 one.flac", "02 two.flac", "03 three.flac"]);
+    s.keys.write_all(b"4").unwrap();
+    wait_for(&s.rx, &mut s.seen, "three.flac");
+    s.keys.write_all(b"/thr").unwrap();
+    let mut after = Vec::new();
+    let end = Instant::now() + WAIT;
+    let first_row = loop {
+        let text = String::from_utf8_lossy(&after).into_owned();
+        if text.contains("\x1b[5;13Hhree.flac") {
+            break true;
+        }
+        let left = end.saturating_duration_since(Instant::now());
+        match s.rx.recv_timeout(left) {
+            Ok(chunk) => after.extend(chunk),
+            Err(_) => break false,
+        }
+    };
+    assert!(
+        first_row,
+        "three.flac never took row 1: {}",
+        String::from_utf8_lossy(&after)
+    );
+    s.seen.extend(&after);
+    assert!(
+        String::from_utf8_lossy(&s.seen).contains("48;2;24;24;24"),
+        "no #181818 background"
+    );
+    s.keys.write_all(b"\x1b").unwrap();
+    wait_for(&s.rx, &mut Vec::new(), "01 one.flac");
+    s.keys.write_all(b"q").unwrap();
+    let end = Instant::now() + WAIT;
+    while s.child.0.try_wait().unwrap().is_none() {
+        while s.rx.try_recv().is_ok() {}
+        assert!(Instant::now() < end, "tui did not exit");
+        thread::sleep(Duration::from_millis(20));
+    }
 }

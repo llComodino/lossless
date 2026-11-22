@@ -1,9 +1,10 @@
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use lofty::prelude::*;
+use lossless_proto::catalog::Catalog;
 use lossless_proto::{StreamFormat, Track};
 
 mod error;
@@ -158,15 +159,24 @@ fn describe(path: String, file: Option<lofty::file::TaggedFile>) -> Track {
     track
 }
 
+/// What a rescan changed, by path.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Changes {
+    /// Tracks that are new or differ from the old library, in new order.
+    pub added: Vec<Track>,
+    /// Old paths no longer present, in old order.
+    pub removed: Vec<String>,
+}
+
 #[derive(Default)]
 pub struct Library {
     root: PathBuf,
+    generation: u64,
     tracks: Vec<Track>,
     by_path: HashMap<String, usize>,
     /// Lowercased artist/album/title/path per track, for search.
     haystack: Vec<String>,
-    artists: BTreeMap<String, (String, BTreeSet<usize>)>,
-    albums: BTreeMap<(String, String), (String, BTreeSet<usize>)>,
+    catalog: Catalog,
 }
 
 impl Library {
@@ -207,21 +217,36 @@ impl Library {
         .join("\n")
         .to_lowercase();
         let i = self.tracks.len();
-        let artist = track.artist.as_deref().unwrap_or(UNKNOWN);
-        let album = track.album.as_deref().unwrap_or(UNKNOWN);
-        self.artists
-            .entry(artist.to_lowercase())
-            .or_insert_with(|| (artist.to_string(), BTreeSet::new()))
-            .1
-            .insert(i);
-        self.albums
-            .entry((artist.to_lowercase(), album.to_lowercase()))
-            .or_insert_with(|| (album.to_string(), BTreeSet::new()))
-            .1
-            .insert(i);
+        self.catalog.insert(i, &track);
         self.by_path.insert(track.path.clone(), i);
         self.tracks.push(track);
         self.haystack.push(hay);
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn tracks(&self) -> &[Track] {
+        &self.tracks
+    }
+
+    /// Take the place of `old`: bump its generation and diff against it.
+    pub fn replaces(&mut self, old: &Library) -> Changes {
+        self.generation = old.generation.saturating_add(1);
+        let added = self
+            .tracks
+            .iter()
+            .filter(|t| old.get(&t.path) != Some(t))
+            .cloned()
+            .collect();
+        let removed = old
+            .tracks
+            .iter()
+            .filter(|t| !self.by_path.contains_key(&t.path))
+            .map(|t| t.path.clone())
+            .collect();
+        Changes { added, removed }
     }
 
     pub fn len(&self) -> usize {
@@ -267,6 +292,63 @@ mod tests {
             duration_ms: None,
             format: None,
         }
+    }
+
+    fn plain(path: &str, title: &str) -> Track {
+        track(path, "A", "B", title)
+    }
+
+    fn lib_of(tracks: &[Track]) -> Library {
+        Library::from_tracks(Path::new("/m"), tracks.iter().cloned())
+    }
+
+    #[test]
+    fn empty_to_full_adds_everything() {
+        let all = [plain("/m/a", "a"), plain("/m/b", "b")];
+        let mut new = lib_of(&all);
+        let changes = new.replaces(&Library::default());
+        assert_eq!(changes.added, all);
+        assert!(changes.removed.is_empty());
+        assert_eq!(new.generation(), 1);
+        assert_eq!(new.tracks(), all);
+    }
+
+    #[test]
+    fn removed_paths_are_listed() {
+        let old = lib_of(&[plain("/m/a", "a"), plain("/m/b", "b"), plain("/m/c", "c")]);
+        let mut new = lib_of(&[plain("/m/b", "b")]);
+        let changes = new.replaces(&old);
+        assert!(changes.added.is_empty());
+        assert_eq!(changes.removed, ["/m/a", "/m/c"]);
+    }
+
+    #[test]
+    fn retagged_track_is_added_not_removed() {
+        let old = lib_of(&[plain("/m/a", "old")]);
+        let mut new = lib_of(&[plain("/m/a", "new")]);
+        let changes = new.replaces(&old);
+        assert_eq!(changes.added, [plain("/m/a", "new")]);
+        assert!(changes.removed.is_empty());
+    }
+
+    #[test]
+    fn unchanged_library_has_no_changes() {
+        let all = [plain("/m/a", "a")];
+        let old = lib_of(&all);
+        let mut new = lib_of(&all);
+        assert_eq!(new.replaces(&old), Changes::default());
+        assert_eq!(new.generation(), 1);
+    }
+
+    #[test]
+    fn generation_counts_successive_replaces() {
+        let a = Library::default();
+        assert_eq!(a.generation(), 0);
+        let mut b = Library::default();
+        b.replaces(&a);
+        let mut c = Library::default();
+        c.replaces(&b);
+        assert_eq!((b.generation(), c.generation()), (1, 2));
     }
 
     #[test]
