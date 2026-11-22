@@ -82,6 +82,8 @@ First development version, not yet tagged.
 - The client rejects non-finite and negative seek times and fits narrow
   widths without underflow.
 - The scan flag is cleared even if a scan panics.
+- A subscriber that stops reading no longer stalls events for the others:
+  each has its own writer and is dropped once 256 events behind.
 
 ### Security
 

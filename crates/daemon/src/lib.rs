@@ -7,7 +7,7 @@ use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock, Weak};
 use std::thread;
 
@@ -63,12 +63,45 @@ fn send(writer: &Writer, msg: &ServerMessage) -> std::io::Result<()> {
     w.write_all(line.as_bytes())
 }
 
-type Subscribers = Arc<Mutex<Vec<Writer>>>;
+/// Events a subscriber may fall behind by before it counts as stalled.
+const BACKLOG: usize = 256;
 
+type Subscribers = Arc<Mutex<Vec<SyncSender<Arc<str>>>>>;
+
+/// A writer thread per subscriber, so one that stops reading blocks only
+/// itself; it ends when its channel is dropped or a write fails.
+fn subscribe(subscribers: &Subscribers, writer: &Writer) {
+    let (tx, rx) = sync_channel::<Arc<str>>(BACKLOG);
+    let writer = Arc::clone(writer);
+    thread::spawn(move || {
+        for line in rx {
+            let mut w = writer.lock().unwrap_or_else(PoisonError::into_inner);
+            if w.write_all(line.as_bytes()).is_err() {
+                break;
+            }
+        }
+    });
+    subscribers
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(tx);
+}
+
+/// Never blocks: a subscriber whose backlog is full is dropped.
 fn broadcast(subscribers: &Subscribers, event: Event) {
-    let msg = ServerMessage::Event { event };
+    let Ok(line) = encode(&ServerMessage::Event { event }) else {
+        return;
+    };
+    let line: Arc<str> = line.into();
     let mut subs = subscribers.lock().unwrap_or_else(PoisonError::into_inner);
-    subs.retain(|w| send(w, &msg).is_ok());
+    subs.retain(|tx| match tx.try_send(Arc::clone(&line)) {
+        Ok(()) => true,
+        Err(TrySendError::Full(_)) => {
+            warn!("dropping a subscriber that stopped reading");
+            false
+        }
+        Err(TrySendError::Disconnected(_)) => false,
+    });
 }
 
 /// What to persist from `snap`. Paths go through UTF-8 (JSON can't carry
@@ -300,10 +333,7 @@ impl State {
             Command::Remove { indices } => play(PlayerCmd::Remove(indices)),
             Command::Move { from, to } => play(PlayerCmd::Move { from, to }),
             Command::Subscribe => {
-                self.subscribers
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .push(Arc::clone(writer));
+                subscribe(&self.subscribers, writer);
                 Ok(Body::Done)
             }
             Command::Play { index } => play(PlayerCmd::Play(index)),

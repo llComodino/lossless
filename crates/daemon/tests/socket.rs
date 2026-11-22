@@ -607,6 +607,42 @@ fn a_dead_subscriber_does_not_stop_the_others() {
 }
 
 #[test]
+fn a_stalled_subscriber_does_not_stop_the_others() {
+    let s = Server::start(false);
+    let mut stalled = UnixStream::connect(s.socket()).unwrap();
+    let subscribe = Request {
+        id: 1,
+        command: Command::Subscribe,
+    };
+    stalled
+        .write_all(encode(&subscribe).unwrap().as_bytes())
+        .unwrap();
+    let mut c = s.connect();
+    c.ok(Command::Subscribe);
+    for i in 0..10_000 {
+        c.ok(Command::SetMode {
+            repeat: None,
+            random: Some(i % 2 == 0),
+        });
+        c.events.clear();
+    }
+    c.ok(Command::SetMode {
+        repeat: Some(Repeat::One),
+        random: None,
+    });
+    c.wait_for(|e| {
+        matches!(
+            e,
+            Event::Mode {
+                repeat: Repeat::One,
+                ..
+            }
+        )
+    });
+    drop(stalled);
+}
+
+#[test]
 fn blank_lines_are_skipped() {
     let s = Server::start(false);
     let mut c = s.connect();

@@ -331,7 +331,8 @@ status carries `repeat` (`off`, `queue`, `one`), `random`, `volume` (percent,
 recovered from by itself, as `{code, message}`, cleared once a track loads
 cleanly).
 
-After `{"id":4,"cmd":"subscribe"}` the connection also receives events:
+After `{"id":4,"cmd":"subscribe"}` the connection also receives events.
+A subscriber that falls 256 events behind (stopped reading) is dropped:
 
 ```json
 {"type":"event","event":"state","state":"paused","position_ms":61250}
