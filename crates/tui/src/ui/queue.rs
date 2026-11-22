@@ -45,7 +45,7 @@ pub fn track_rows(
             let mark = if playing == Some(i) { '\u{25b6}' } else { ' ' };
             let dur = t.duration_ms.map_or_else(|| "?".into(), clock);
             let fmt = t.format.as_ref().map_or_else(String::new, rate_str);
-            let tail = format!("  {dur:>6}  {fmt:<14}");
+            let tail = format!("  {dur:>6}  {fmt:<14} ");
             let title = width.saturating_sub(7 + tail.chars().count());
             let head = format!("{mark} {:>3}  {}", number, fit(&describe(t), title));
             let row = fit(&format!("{head}{tail}"), width);

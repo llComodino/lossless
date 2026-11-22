@@ -12,7 +12,8 @@ pub enum Delta {
 }
 
 /// The library as of `generation`, kept in daemon order; `seen` is the
-/// newest event generation that arrived while unloaded.
+/// newest event generation not applied (unloaded, or past a gap), which a
+/// later reply must reach.
 #[derive(Default)]
 pub struct Local {
     pub tracks: Vec<Track>,
@@ -26,8 +27,7 @@ impl Local {
         *self = Self::default();
     }
 
-    /// A `Tracks` reply. `Refetch` when it predates an event that arrived
-    /// while unloaded.
+    /// A `Tracks` reply. `Refetch` when it predates an event not applied.
     pub fn replace(&mut self, generation: u64, tracks: Vec<Track>) -> Delta {
         if self.generation.is_some_and(|g| generation < g) {
             return Delta::Stale;
@@ -52,6 +52,7 @@ impl Local {
             return Delta::Stale;
         }
         if generation != current + 1 {
+            self.seen = self.seen.max(generation);
             return Delta::Refetch;
         }
         let gone: HashSet<&str> = removed
@@ -146,6 +147,15 @@ mod tests {
             Delta::Applied
         );
         assert_eq!(paths(&local), ["/m/b.flac"]);
+    }
+
+    #[test]
+    fn a_reply_older_than_a_gap_refetches() {
+        let mut local = loaded(3, &["/m/a.flac"]);
+        assert_eq!(local.apply(5, vec![], vec![]), Delta::Refetch);
+        assert_eq!(local.apply(6, vec![], vec![]), Delta::Refetch);
+        assert_eq!(local.replace(5, vec![]), Delta::Refetch);
+        assert_eq!(local.replace(6, vec![]), Delta::Applied);
     }
 
     #[test]

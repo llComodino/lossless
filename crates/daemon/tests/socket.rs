@@ -607,6 +607,64 @@ fn a_dead_subscriber_does_not_stop_the_others() {
 }
 
 #[test]
+fn a_stalled_subscriber_does_not_stop_the_others() {
+    let s = Server::start(false);
+    let mut stalled = UnixStream::connect(s.socket()).unwrap();
+    let subscribe = Request {
+        id: 1,
+        command: Command::Subscribe,
+    };
+    stalled
+        .write_all(encode(&subscribe).unwrap().as_bytes())
+        .unwrap();
+    let mut c = s.connect();
+    c.ok(Command::Subscribe);
+    for i in 0..10_000 {
+        c.ok(Command::SetMode {
+            repeat: None,
+            random: Some(i % 2 == 0),
+        });
+        c.events.clear();
+    }
+    c.ok(Command::SetMode {
+        repeat: Some(Repeat::One),
+        random: None,
+    });
+    c.wait_for(|e| {
+        matches!(
+            e,
+            Event::Mode {
+                repeat: Repeat::One,
+                ..
+            }
+        )
+    });
+    // Dropped subscribers are disconnected, so they notice and resync.
+    stalled.set_read_timeout(Some(WAIT)).unwrap();
+    let mut rest = Vec::new();
+    stalled
+        .read_to_end(&mut rest)
+        .expect("a dropped subscriber reads EOF");
+}
+
+#[test]
+fn subscribing_twice_sends_each_event_once() {
+    let s = Server::start(false);
+    let mut c = s.connect();
+    c.ok(Command::Subscribe);
+    c.ok(Command::Subscribe);
+    for random in [true, false] {
+        c.ok(Command::SetMode {
+            repeat: None,
+            random: Some(random),
+        });
+    }
+    c.wait_for(|e| matches!(e, Event::Mode { random: false, .. }));
+    let rest = c.events.iter().filter(|e| matches!(e, Event::Mode { .. }));
+    assert_eq!(rest.count(), 1, "one Mode event for random: true");
+}
+
+#[test]
 fn blank_lines_are_skipped() {
     let s = Server::start(false);
     let mut c = s.connect();

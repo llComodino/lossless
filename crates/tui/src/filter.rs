@@ -3,6 +3,7 @@ use std::cmp::Reverse;
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Matcher, Utf32Str};
 
+/// fzf-style ranking, reusing its matcher and buffer across keystrokes.
 pub struct Ranker {
     matcher: Matcher,
     buf: Vec<char>,
@@ -16,6 +17,8 @@ impl Ranker {
         }
     }
 
+    /// Indices of the `lines` that match `query`, best first, ties in input
+    /// order. `query` must not be empty: an empty pattern matches everything.
     pub fn rank<S: AsRef<str>>(
         &mut self,
         query: &str,
@@ -35,6 +38,8 @@ impl Ranker {
     }
 }
 
+/// One view's filter. `hits` holds real indices in rank order, `None`
+/// while the query is empty (the whole list shows).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Filter {
     pub query: String,
@@ -43,13 +48,15 @@ pub struct Filter {
 }
 
 impl Filter {
+    /// Visible rows of a list of `total`.
     pub fn len(&self, total: usize) -> usize {
         self.hits.as_ref().map_or(total, Vec::len)
     }
 
+    /// The real index shown at visible `pos`, `None` past the end.
     pub fn real(&self, pos: usize, total: usize) -> Option<usize> {
         match &self.hits {
-            Some(h) => h.get(pos).copied(),
+            Some(h) => h.get(pos).copied().filter(|&i| i < total),
             None => (pos < total).then_some(pos),
         }
     }
@@ -62,6 +69,8 @@ impl Filter {
         }
     }
 
+    /// Where real index `real` shows; unbounded without a filter, so callers
+    /// clamp to the list.
     pub fn position(&self, real: usize) -> Option<usize> {
         match &self.hits {
             Some(h) => h.iter().position(|&r| r == real),
@@ -117,6 +126,16 @@ mod tests {
     }
 
     #[test]
+    fn fzf_syntax() {
+        let lines = ["ABBA - Mamma Mia", "Queen - Mamma Mia cover", "abbaq - x"];
+        let mut r = Ranker::new();
+        assert_eq!(r.rank("^queen", lines), [1]);
+        assert_eq!(r.rank("mamma !queen", lines), [0]);
+        assert_eq!(r.rank("'abbaq", lines), [2]);
+        assert_eq!(r.rank("cover$", lines), [1]);
+    }
+
+    #[test]
     fn real_and_position_round_trip() {
         let none = Filter::default();
         assert_eq!(none.len(5), 5);
@@ -131,6 +150,7 @@ mod tests {
         assert_eq!(f.len(5), 3);
         assert_eq!(f.real(0, 5), Some(4));
         assert_eq!(f.real(3, 5), None);
+        assert_eq!(f.real(0, 4), None, "a hit past a shrunk list");
         assert_eq!(f.position(3), Some(2));
         assert_eq!(f.position(0), None);
         for p in 0..3 {

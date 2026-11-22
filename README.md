@@ -265,10 +265,12 @@ losslessd-tui -p pw              # another profile (--socket PATH wins)
 `4` Search; `o` switches to the next profile. `/` opens a live fuzzy filter
 in every view (fzf-style, smart case): rows re-rank as you type, `Enter`
 keeps the filter, `Esc` clears it. While the queue is filtered `J` and `K`
-(move entry) are off; clear the filter first. The filter is fuzzy, unlike
-the daemon's `search` and `lossless search`, which match whole words. The UI
-keeps its own copy of the library and patches it from `library_changed`, so
-filtering never asks the daemon.
+(move entry) are off; clear the filter first. Queries take fzf syntax:
+words separated by spaces must all match, `'x` matches `x` exactly, `^x`
+and `x$` anchor to the start or end, `!x` excludes. The filter is fuzzy,
+unlike the daemon's `search` and `lossless search`, which need every word
+as a plain substring. The UI keeps its own copy of the library and patches
+it from `library_changed`, so filtering never asks the daemon.
 
 Colors are Gruber Darker, painted as 24-bit RGB on a `#181818` background.
 
@@ -331,7 +333,9 @@ status carries `repeat` (`off`, `queue`, `one`), `random`, `volume` (percent,
 recovered from by itself, as `{code, message}`, cleared once a track loads
 cleanly).
 
-After `{"id":4,"cmd":"subscribe"}` the connection also receives events:
+After `{"id":4,"cmd":"subscribe"}` the connection also receives events.
+A subscriber that falls about 256 events behind (stopped reading) is
+disconnected; it resyncs on reconnect:
 
 ```json
 {"type":"event","event":"state","state":"paused","position_ms":61250}
