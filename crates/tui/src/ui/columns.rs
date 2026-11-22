@@ -6,6 +6,7 @@ use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 
 use crate::app::Columns;
+use crate::theme;
 
 const MIN_THREE: u16 = 60;
 
@@ -15,7 +16,7 @@ pub fn draw(cols: &Columns<Entry>, f: &mut Frame, area: Rect) {
             &cols.items,
             Some(cols.selected),
             cols.offset,
-            Style::new(),
+            theme::selected(),
             f,
             area,
         );
@@ -38,7 +39,7 @@ pub fn draw(cols: &Columns<Entry>, f: &mut Frame, area: Rect) {
         &cols.parent,
         came_from,
         came_from.map_or(0, |s| (s + 1).saturating_sub(rows)),
-        Style::new().add_modifier(Modifier::BOLD),
+        Style::new().fg(theme::FG).add_modifier(Modifier::BOLD),
         f,
         parent,
     );
@@ -46,11 +47,11 @@ pub fn draw(cols: &Columns<Entry>, f: &mut Frame, area: Rect) {
         &cols.items,
         Some(cols.selected),
         cols.offset,
-        Style::new(),
+        theme::selected(),
         f,
         current,
     );
-    list(&cols.preview, None, 0, Style::new(), f, preview);
+    list(&cols.preview, None, 0, theme::selected(), f, preview);
 }
 
 fn label(e: &Entry) -> String {
@@ -64,17 +65,12 @@ fn list(
     items: &[Entry],
     selected: Option<usize>,
     offset: usize,
-    mark: Style,
+    style: Style,
     f: &mut Frame,
     area: Rect,
 ) {
     let height = usize::from(area.height);
     let width = usize::from(area.width);
-    let style = if mark == Style::new() {
-        Style::new().add_modifier(Modifier::REVERSED)
-    } else {
-        mark
-    };
     let lines: Vec<Line> = items
         .iter()
         .enumerate()

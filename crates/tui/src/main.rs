@@ -6,6 +6,7 @@ mod conn;
 mod input;
 mod keys;
 mod term;
+mod theme;
 mod ui;
 
 use std::io::{self, Stdout};

@@ -2,6 +2,8 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::widgets::{Block, Clear, Paragraph};
 
+use crate::theme;
+
 pub(super) const KEYS: [(&str, &str); 17] = [
     ("j/k, g/G, Ctrl-d/Ctrl-u", "move, first/last, half page"),
     ("h/l", "column left/right; l on a track adds it"),
@@ -39,7 +41,11 @@ pub fn draw(f: &mut Frame) {
     let lines: Vec<String> = KEYS.iter().map(|(k, a)| row(k, a)).collect();
     f.render_widget(Clear, rect);
     f.render_widget(
-        Paragraph::new(lines.join("\n")).block(Block::bordered().title(" keys ")),
+        Paragraph::new(lines.join("\n")).style(theme::base()).block(
+            Block::bordered()
+                .border_style(theme::border())
+                .title(" keys "),
+        ),
         rect,
     );
 }

@@ -1,11 +1,11 @@
 use lossless_proto::{Track, clock, describe, fit, rate_str};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::app::App;
+use crate::theme;
 
 pub fn draw(app: &App, f: &mut Frame, area: Rect) {
     let playing = app.status.as_ref().and_then(|s| s.index);
@@ -19,7 +19,7 @@ pub fn draw(app: &App, f: &mut Frame, area: Rect) {
     );
 }
 
-/// Numbered track rows (title, duration, format), `selected` reversed and
+/// Numbered track rows (title, duration, format), `selected` highlighted and
 /// `playing` marked.
 pub fn track_rows(
     tracks: &[Track],
@@ -42,13 +42,22 @@ pub fn track_rows(
             let fmt = t.format.as_ref().map_or_else(String::new, rate_str);
             let tail = format!("  {dur:>6}  {fmt:<14}");
             let title = width.saturating_sub(7 + tail.chars().count());
-            let row = format!("{mark} {:>3}  {}{tail}", i + 1, fit(&describe(t), title));
-            let style = if i == selected {
-                Style::new().add_modifier(Modifier::REVERSED)
+            let head = format!("{mark} {:>3}  {}", i + 1, fit(&describe(t), title));
+            let row = fit(&format!("{head}{tail}"), width);
+            let (style, tail_style) = if i == selected {
+                (theme::selected(), theme::selected())
+            } else if playing == Some(i) {
+                (theme::playing(), theme::dim())
             } else {
-                Style::new()
+                (theme::base(), theme::dim())
             };
-            Line::styled(fit(&row, width), style)
+            match row.strip_suffix(&tail) {
+                Some(head) => Line::from(vec![
+                    Span::styled(head.to_owned(), style),
+                    Span::styled(tail.clone(), tail_style),
+                ]),
+                None => Line::styled(row, style),
+            }
         })
         .collect();
     f.render_widget(Paragraph::new(lines), area);
