@@ -63,7 +63,6 @@ First development version, not yet tagged.
   state machine against a fake sink, daemon over a real socket, CLI as a
   real binary, property tests, and fuzz targets for requests, config files,
   device names, decoding, tags and state files.
-
 - `tracks` command: the whole library with its `generation`.
 - `library_changed` carries `generation`, `added` and `removed`;
   `lossless watch` prints `library changed: T tracks (+A -R)`.
