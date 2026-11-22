@@ -5,7 +5,7 @@ use lossless_proto::{Entry, Track};
 
 use crate::{Error, Library, Result};
 
-pub const UNKNOWN: &str = "Unknown";
+pub use lossless_proto::catalog::UNKNOWN;
 
 impl Library {
     /// Folders and tracks directly under `rel`, a path relative to the music
@@ -56,44 +56,20 @@ impl Library {
     }
 
     pub fn artists(&self) -> Vec<String> {
-        self.artists
-            .values()
-            .map(|(name, _)| name.clone())
-            .collect()
+        self.catalog.artists()
     }
 
     /// Album names of one artist, or of everyone when `artist` is `None`.
     pub fn albums(&self, artist: Option<&str>) -> Vec<String> {
-        let artist = artist.map(str::to_lowercase);
-        let mut out: Vec<(&str, &String)> = self
-            .albums
-            .iter()
-            .filter(|((a, _), _)| artist.as_ref().is_none_or(|x| x == a))
-            .map(|((_, album), (name, _))| (album.as_str(), name))
-            .collect();
-        out.sort();
-        out.dedup_by(|a, b| a.0 == b.0);
-        out.into_iter().map(|(_, name)| name.clone()).collect()
+        self.catalog.albums(artist)
     }
 
     pub fn find(&self, artist: Option<&str>, album: Option<&str>) -> Vec<&Track> {
-        let artist = artist.map(str::to_lowercase);
-        let album = album.map(str::to_lowercase);
-        let mut hits: Vec<(&str, &Track)> = self
-            .albums
-            .iter()
-            .filter(|((a, b), _)| {
-                artist.as_ref().is_none_or(|x| x == a) && album.as_ref().is_none_or(|x| x == b)
-            })
-            .flat_map(|((_, b), (_, ids))| ids.iter().map(move |&i| (b.as_str(), &self.tracks[i])))
-            .collect();
-        hits.sort_by(|(ab, a), (bb, b)| {
-            ab.cmp(bb)
-                .then(a.disc_number.cmp(&b.disc_number))
-                .then(a.track_number.cmp(&b.track_number))
-                .then_with(|| a.path.cmp(&b.path))
-        });
-        hits.into_iter().map(|(_, t)| t).collect()
+        self.catalog
+            .find(&self.tracks, artist, album)
+            .into_iter()
+            .map(|i| &self.tracks[i])
+            .collect()
     }
 }
 

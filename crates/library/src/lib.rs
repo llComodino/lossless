@@ -1,9 +1,10 @@
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use lofty::prelude::*;
+use lossless_proto::catalog::Catalog;
 use lossless_proto::{StreamFormat, Track};
 
 mod error;
@@ -165,8 +166,7 @@ pub struct Library {
     by_path: HashMap<String, usize>,
     /// Lowercased artist/album/title/path per track, for search.
     haystack: Vec<String>,
-    artists: BTreeMap<String, (String, BTreeSet<usize>)>,
-    albums: BTreeMap<(String, String), (String, BTreeSet<usize>)>,
+    catalog: Catalog,
 }
 
 impl Library {
@@ -207,18 +207,7 @@ impl Library {
         .join("\n")
         .to_lowercase();
         let i = self.tracks.len();
-        let artist = track.artist.as_deref().unwrap_or(UNKNOWN);
-        let album = track.album.as_deref().unwrap_or(UNKNOWN);
-        self.artists
-            .entry(artist.to_lowercase())
-            .or_insert_with(|| (artist.to_string(), BTreeSet::new()))
-            .1
-            .insert(i);
-        self.albums
-            .entry((artist.to_lowercase(), album.to_lowercase()))
-            .or_insert_with(|| (album.to_string(), BTreeSet::new()))
-            .1
-            .insert(i);
+        self.catalog.insert(i, &track);
         self.by_path.insert(track.path.clone(), i);
         self.tracks.push(track);
         self.haystack.push(hay);

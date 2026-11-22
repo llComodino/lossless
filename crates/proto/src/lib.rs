@@ -4,6 +4,7 @@
 //! Clients send `Request`s; the server sends `ServerMessage`s (replies, and
 //! events once the client has sent `Subscribe`).
 
+pub mod catalog;
 mod display;
 pub mod profile;
 
