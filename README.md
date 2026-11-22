@@ -265,8 +265,11 @@ losslessd-tui -p pw              # another profile (--socket PATH wins)
 `4` Search; `o` switches to the next profile. `/` opens a live fuzzy filter
 in every view (fzf-style, smart case): rows re-rank as you type, `Enter`
 keeps the filter, `Esc` clears it. While the queue is filtered `J` and `K`
-(move entry) are off; clear the filter first. The filter is fuzzy, unlike
-the daemon's `search` and `lossless search`, which match whole words. The UI
+(move entry) are off; clear the filter first. Queries take fzf syntax:
+words separated by spaces must all match, `'x` matches `x` exactly, `^x`
+and `x$` anchor to the start or end, `!x` excludes. The filter is fuzzy,
+unlike the daemon's `search` and `lossless search`, which need every word
+as a plain substring. The UI
 keeps its own copy of the library and patches it from `library_changed`, so
 filtering never asks the daemon.
 
