@@ -499,6 +499,18 @@ mod tests {
     }
 
     #[test]
+    fn filtered_search_rows_number_by_position() {
+        let mut a = app("default", None);
+        a.view = View::Search;
+        a.library.tracks = vec![track("A", "zero"), track("B", "one"), track("C", "two")];
+        a.filters[View::Search.index()] = filtered(vec![2, 1]);
+        let (l, _) = render(&a);
+        assert!(l.iter().any(|r| r.contains("  1  C - two")), "{l:?}");
+        assert!(l.iter().any(|r| r.contains("  2  B - one")), "{l:?}");
+        assert!(!l.iter().any(|r| r.contains("  3  C - two")), "{l:?}");
+    }
+
+    #[test]
     fn columns_show_the_current_column_filtered() {
         let mut a = browsing(View::Directories);
         a.filters[View::Directories.index()] = filtered(vec![1]);

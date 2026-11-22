@@ -7,5 +7,5 @@ use crate::app::{App, View};
 pub fn draw(app: &App, f: &mut Frame, area: Rect) {
     let s = &app.search;
     let rows = app.filters[View::Search.index()].visible(&app.library.tracks);
-    track_rows(&rows, s.selected, s.offset, None, f, area);
+    track_rows(&rows, s.selected, s.offset, None, false, f, area);
 }
