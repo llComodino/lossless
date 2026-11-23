@@ -436,12 +436,18 @@ reads 1.0 and can't be set), and metadata (title, artist, album, track
 number, length, `file://` URL), all with change signals. Not supported: the
 track list, playlists, cover art, OpenUri, Raise/Quit.
 
-Media keys per daemon, or follow the last active one with `playerctld`:
+playerctl treats `lossless.<profile>` as an instance of `lossless`, so
+`-p lossless` alone drives whichever lossless daemon it finds first. To
+bind keys per daemon, name the profile, and for the default one ignore the
+others:
 
 ```sh
-playerctl -p lossless play-pause        # the DAC
-playerctl -p lossless.pw play-pause     # the pw profile
+playerctl -p lossless.pw play-pause                 # only the pw profile
+playerctl -p lossless -i lossless.pw play-pause     # only the default one
+playerctl -p lossless play-pause                    # any lossless daemon
 ```
+
+`playerctld` instead follows the player you used last.
 
 Under a supervisor the run script must export the session bus, e.g.
 `export DBUS_SESSION_BUS_ADDRESS unix:path=/run/user/${UID}/bus`.
