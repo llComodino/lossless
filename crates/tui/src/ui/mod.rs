@@ -2,6 +2,8 @@ mod columns;
 mod footer;
 mod header;
 mod help;
+#[cfg(feature = "scripts")]
+mod modal;
 mod queue;
 #[cfg(feature = "scripts")]
 mod scripts;
@@ -45,6 +47,10 @@ pub fn draw(app: &App, f: &mut Frame) {
     footer::draw(app, f, foot);
     if app.help {
         help::draw(f, &app.keymap);
+    }
+    #[cfg(feature = "scripts")]
+    if let Some(m) = &app.modal {
+        modal::draw(m, f);
     }
 }
 
@@ -334,6 +340,28 @@ mod tests {
             l.iter().any(|r| r.contains("-  pick    terminal  fzf")),
             "{text}"
         );
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn modal_shows_output_and_input() {
+        let mut a = app("default", None);
+        a.modal = Some(crate::app::Modal {
+            id: 1,
+            name: "ask".into(),
+            lines: ["how many?".to_string(), "really?".to_string()].into(),
+            input: "12".into(),
+            ..Default::default()
+        });
+        let (l, _) = render(&a);
+        let text = l.join("\n");
+        assert!(text.contains(" ask "), "{text}");
+        let out = l.iter().position(|r| r.contains("really?")).expect(&text);
+        let input = l.iter().position(|r| r.contains("> 12")).expect(&text);
+        assert_eq!(input, out + 1, "{text}");
+        a.modal.as_mut().unwrap().done = Some("exited 3".into());
+        let (l, _) = render(&a);
+        assert!(l.iter().any(|r| r.contains("exited 3")), "{}", l.join("\n"));
     }
 
     #[cfg(feature = "scripts")]

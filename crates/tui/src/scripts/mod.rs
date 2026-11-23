@@ -1,3 +1,6 @@
+pub mod modal;
+mod sanitize;
+
 use std::path::Path;
 
 use lossless_proto::Entry;
@@ -8,6 +11,8 @@ use crate::config::Mode;
 /// A script about to run: what to start and what it gets to know.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Run {
+    /// Tells this run's messages from an earlier one's.
+    pub id: u64,
     pub name: String,
     pub command: String,
     pub mode: Mode,
@@ -17,7 +22,7 @@ pub struct Run {
 }
 
 /// The script at `idx` of the Scripts list, set up from the app's state.
-pub fn build(app: &App, idx: usize) -> Option<Run> {
+pub fn build(app: &App, idx: usize, id: u64) -> Option<Run> {
     let s = app.scripts.items.get(idx)?;
     let mut env = vec![(
         "LOSSLESS_SOCKET".to_string(),
@@ -37,6 +42,7 @@ pub fn build(app: &App, idx: usize) -> Option<Run> {
     add("LOSSLESS_MUSIC_DIR", app.music_dir.clone());
     add("LOSSLESS_CURRENT", current(app));
     Some(Run {
+        id,
         name: s.name.clone(),
         command: s.command.clone(),
         mode: s.mode,

@@ -17,7 +17,7 @@ mod ui;
 use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::Instant;
 
 use lossless_proto::profile::{Dirs, Profile};
@@ -69,8 +69,11 @@ fn run(
     conn: &mut Conn,
     dirs: &Dirs,
     rx: &Receiver<Msg>,
+    #[cfg_attr(not(feature = "scripts"), expect(unused_variables))] tx: &Sender<Msg>,
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
 ) -> io::Result<()> {
+    #[cfg(feature = "scripts")]
+    let mut job: Option<scripts::modal::Job> = None;
     set_page(app, terminal);
     terminal.draw(|f| ui::draw(app, f))?;
     while let Some(msg) = next_msg(rx, &app.clock, Instant::now()) {
@@ -92,7 +95,36 @@ fn run(
                     apply(app, conn, r);
                 }
                 #[cfg(feature = "scripts")]
-                Out::Run(run) => app.footer = Some(format!("running {}", run.name)),
+                #[cfg(feature = "scripts")]
+                Out::Run(run) => match run.mode {
+                    config::Mode::Modal => match scripts::modal::start(&run, tx.clone()) {
+                        Ok(j) => {
+                            if let Some(old) = job.replace(j) {
+                                old.kill();
+                            }
+                        }
+                        Err(e) => app.script_failed(run.id, &e.to_string()),
+                    },
+                    config::Mode::Terminal => app.footer = Some(format!("running {}", run.name)),
+                },
+                #[cfg(feature = "scripts")]
+                Out::Stdin(id, line) => {
+                    if let Some(j) = job.as_mut().filter(|j| j.id == id) {
+                        j.send_line(&line);
+                    }
+                }
+                #[cfg(feature = "scripts")]
+                Out::CloseStdin(id) => {
+                    if let Some(j) = job.as_mut().filter(|j| j.id == id) {
+                        j.close_stdin();
+                    }
+                }
+                #[cfg(feature = "scripts")]
+                Out::Kill(id) => {
+                    if let Some(j) = job.take_if(|j| j.id == id) {
+                        j.kill();
+                    }
+                }
             }
         }
         if app.quit {
@@ -180,8 +212,8 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    input::spawn(tx);
-    let result = run(&mut app, &mut conn, &dirs, &rx, &mut terminal);
+    input::spawn(tx.clone());
+    let result = run(&mut app, &mut conn, &dirs, &rx, &tx, &mut terminal);
     drop(guard);
     match result {
         Ok(()) => ExitCode::SUCCESS,

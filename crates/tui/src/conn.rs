@@ -13,6 +13,11 @@ pub enum Msg {
     Key(crossterm::event::KeyEvent),
     Resize,
     Tick,
+    /// A line a modal script printed.
+    #[cfg(feature = "scripts")]
+    ScriptOut(u64, String),
+    #[cfg(feature = "scripts")]
+    ScriptExit(u64, std::process::ExitStatus),
 }
 
 /// Request ids of the replies that follow a (re)connection.

@@ -55,6 +55,14 @@ pub enum Out {
     Switch,
     #[cfg(feature = "scripts")]
     Run(crate::scripts::Run),
+    /// A line for the modal script `id`'s stdin.
+    #[cfg(feature = "scripts")]
+    Stdin(u64, String),
+    #[cfg(feature = "scripts")]
+    CloseStdin(u64),
+    /// Kill script `id`'s process group and forget it.
+    #[cfg(feature = "scripts")]
+    Kill(u64),
 }
 
 /// Miller columns: `items` lists `path`, `parent` the path without its
@@ -99,6 +107,21 @@ pub struct ScriptList {
     pub offset: usize,
 }
 
+/// A modal script's box: its output and the line being typed.
+#[cfg(feature = "scripts")]
+#[derive(Clone, Debug, Default)]
+pub struct Modal {
+    pub id: u64,
+    pub name: String,
+    pub lines: std::collections::VecDeque<String>,
+    pub input: String,
+    /// Lines scrolled back from the bottom.
+    pub scroll: usize,
+    /// How it ended: `exited N`, `killed by signal N`, `failed: ...`.
+    pub done: Option<String>,
+    pub any_output: bool,
+}
+
 pub struct App {
     pub keymap: Keymap,
     pub profiles: Vec<Profile>,
@@ -121,6 +144,10 @@ pub struct App {
     pub last_view: View,
     /// The daemon's socket, for scripts.
     pub socket: PathBuf,
+    #[cfg(feature = "scripts")]
+    pub modal: Option<Modal>,
+    #[cfg(feature = "scripts")]
+    next_job: u64,
     /// Output lines a script's modal keeps (`script_lines`).
     pub script_lines: usize,
     pub library: Local,
@@ -166,6 +193,10 @@ impl App {
             prefix: false,
             last_view: View::Queue,
             socket: PathBuf::new(),
+            #[cfg(feature = "scripts")]
+            modal: None,
+            #[cfg(feature = "scripts")]
+            next_job: 0,
             script_lines: 200,
             library: Local::default(),
             music_dir: None,
@@ -424,6 +455,10 @@ impl App {
             return vec![];
         }
         #[cfg(feature = "scripts")]
+        if self.modal.is_some() {
+            return self.modal_key(key);
+        }
+        #[cfg(feature = "scripts")]
         if self.prefix {
             return self.prefixed(key);
         }
@@ -632,7 +667,86 @@ impl App {
 
     #[cfg(feature = "scripts")]
     fn run_script(&mut self, idx: usize) -> Vec<Out> {
-        crate::scripts::build(self, idx).map_or_else(Vec::new, |r| vec![Out::Run(r)])
+        self.next_job += 1;
+        let Some(run) = crate::scripts::build(self, idx, self.next_job) else {
+            return vec![];
+        };
+        if run.mode == crate::config::Mode::Modal {
+            self.modal = Some(Modal {
+                id: run.id,
+                name: run.name.clone(),
+                ..Modal::default()
+            });
+        }
+        vec![Out::Run(run)]
+    }
+
+    /// Keys while a modal is open; after the end any key closes it.
+    #[cfg(feature = "scripts")]
+    fn modal_key(&mut self, key: KeyEvent) -> Vec<Out> {
+        use crossterm::event::KeyCode;
+        let Some(m) = &mut self.modal else {
+            return vec![];
+        };
+        let id = m.id;
+        let ctrl = key
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::CONTROL);
+        if m.done.is_some() || key.code == KeyCode::Esc {
+            self.modal = None;
+            return vec![Out::Kill(id)];
+        }
+        match key.code {
+            KeyCode::Char('d') if ctrl => return vec![Out::CloseStdin(id)],
+            KeyCode::Char(c) if !ctrl => m.input.push(c),
+            KeyCode::Backspace => {
+                m.input.pop();
+            }
+            KeyCode::Enter => return vec![Out::Stdin(id, std::mem::take(&mut m.input))],
+            KeyCode::PageUp => {
+                m.scroll = (m.scroll + self.page.max(1)).min(m.lines.len().saturating_sub(1));
+            }
+            KeyCode::PageDown => m.scroll = m.scroll.saturating_sub(self.page.max(1)),
+            _ => {}
+        }
+        vec![]
+    }
+
+    #[cfg(feature = "scripts")]
+    fn script_out(&mut self, id: u64, line: String) {
+        if let Some(m) = self.modal.as_mut().filter(|m| m.id == id) {
+            m.any_output = true;
+            m.lines.push_back(line);
+            while m.lines.len() > self.script_lines.max(1) {
+                m.lines.pop_front();
+            }
+        }
+    }
+
+    #[cfg(feature = "scripts")]
+    fn script_exit(&mut self, id: u64, status: std::process::ExitStatus) -> Vec<Out> {
+        use std::os::unix::process::ExitStatusExt;
+        let Some(m) = self.modal.as_mut().filter(|m| m.id == id) else {
+            return vec![];
+        };
+        if status.success() && !m.any_output {
+            self.modal = None;
+            return vec![Out::Kill(id)];
+        }
+        m.done = Some(match (status.code(), status.signal()) {
+            (Some(c), _) => format!("exited {c}"),
+            (None, Some(s)) => format!("killed by signal {s}"),
+            (None, None) => "ended".into(),
+        });
+        vec![]
+    }
+
+    /// The modal script `id` could not start.
+    #[cfg(feature = "scripts")]
+    pub fn script_failed(&mut self, id: u64, err: &str) {
+        if let Some(m) = self.modal.as_mut().filter(|m| m.id == id) {
+            m.done = Some(format!("failed: {err}"));
+        }
     }
 
     /// The key after the prefix: a script's key runs it, Esc cancels.
@@ -1043,6 +1157,13 @@ pub fn update(app: &mut App, msg: Msg, now: Instant) -> Vec<Out> {
         Msg::Server(g, _) | Msg::Disconnected(g) if g != app.generation => vec![],
         Msg::Server(_, ServerMessage::Reply { id, result }) => app.reply(id, result, now),
         Msg::Server(_, ServerMessage::Event { event }) => app.event(event, now),
+        #[cfg(feature = "scripts")]
+        Msg::ScriptOut(id, line) => {
+            app.script_out(id, line);
+            vec![]
+        }
+        #[cfg(feature = "scripts")]
+        Msg::ScriptExit(id, status) => app.script_exit(id, status),
         Msg::Disconnected(_) => {
             app.connected = false;
             app.pending.clear();
@@ -2257,7 +2378,8 @@ mod tests {
         let mut app = scripted();
         app.connected = false;
         assert_eq!(run(&mut app, ch('x')), []);
-        assert_eq!(ran(&run(&mut app, ch('r'))).name, "random");
+        let id = ran(&run(&mut app, ch('r'))).id;
+        assert_eq!(run(&mut app, press(KeyCode::Esc)), [Out::Kill(id)]);
         assert_eq!(run(&mut app, ch('j')), [Out::Reconnect]);
     }
 
@@ -2285,6 +2407,142 @@ mod tests {
         ran(&run(&mut app, ch('r')));
         assert_eq!(app.filters[View::Directories.index()].query, query);
         assert_eq!(app.view, View::Directories);
+    }
+
+    #[cfg(feature = "scripts")]
+    fn exit(code: i32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(code << 8)
+    }
+
+    /// `scripted()` with the modal script "random" started.
+    #[cfg(feature = "scripts")]
+    fn modal_open() -> (App, u64) {
+        let mut app = scripted();
+        run(&mut app, ch('x'));
+        let outs = run(&mut app, ch('r'));
+        let id = ran(&outs).id;
+        assert!(app.modal.is_some());
+        (app, id)
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn lines_capped_at_script_lines() {
+        let (mut app, id) = modal_open();
+        app.script_lines = 200;
+        for i in 0..250 {
+            run(&mut app, Msg::ScriptOut(id, format!("l{i}")));
+        }
+        let m = app.modal.as_ref().unwrap();
+        assert_eq!(m.lines.len(), 200);
+        assert_eq!(m.lines.front().map(String::as_str), Some("l50"));
+        assert_eq!(m.lines.back().map(String::as_str), Some("l249"));
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn silent_success_auto_closes() {
+        let (mut app, id) = modal_open();
+        assert_eq!(run(&mut app, Msg::ScriptExit(id, exit(0))), [Out::Kill(id)]);
+        assert!(app.modal.is_none());
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn output_then_success_stays_open_with_exited_0() {
+        let (mut app, id) = modal_open();
+        run(&mut app, Msg::ScriptOut(id, "hi".into()));
+        assert_eq!(run(&mut app, Msg::ScriptExit(id, exit(0))), []);
+        assert_eq!(
+            app.modal.as_ref().unwrap().done.as_deref(),
+            Some("exited 0")
+        );
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn failure_stays_open_any_key_closes() {
+        let (mut app, id) = modal_open();
+        run(&mut app, Msg::ScriptExit(id, exit(3)));
+        assert_eq!(
+            app.modal.as_ref().unwrap().done.as_deref(),
+            Some("exited 3")
+        );
+        assert_eq!(run(&mut app, ch('q')), [Out::Kill(id)]);
+        assert!(app.modal.is_none());
+        assert!(!app.quit);
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn killed_by_signal_is_shown() {
+        use std::os::unix::process::ExitStatusExt;
+        let (mut app, id) = modal_open();
+        run(
+            &mut app,
+            Msg::ScriptExit(id, std::process::ExitStatus::from_raw(9)),
+        );
+        assert_eq!(
+            app.modal.as_ref().unwrap().done.as_deref(),
+            Some("killed by signal 9")
+        );
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn esc_kills_and_closes() {
+        let (mut app, id) = modal_open();
+        assert_eq!(run(&mut app, press(KeyCode::Esc)), [Out::Kill(id)]);
+        assert!(app.modal.is_none());
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn modal_input_goes_to_stdin() {
+        let (mut app, id) = modal_open();
+        for c in "yes".chars() {
+            assert_eq!(run(&mut app, ch(c)), []);
+        }
+        run(&mut app, press(KeyCode::Backspace));
+        assert_eq!(
+            run(&mut app, press(KeyCode::Enter)),
+            [Out::Stdin(id, "ye".into())]
+        );
+        assert_eq!(app.modal.as_ref().unwrap().input, "");
+        assert_eq!(run(&mut app, ctrl('d')), [Out::CloseStdin(id)]);
+        assert!(!app.quit);
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn stale_job_messages_ignored() {
+        let (mut app, id) = modal_open();
+        run(&mut app, Msg::ScriptOut(id + 100, "old".into()));
+        assert!(app.modal.as_ref().unwrap().lines.is_empty());
+        assert_eq!(run(&mut app, Msg::ScriptExit(id + 100, exit(0))), []);
+        assert!(app.modal.is_some());
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn each_run_gets_a_new_id() {
+        let (mut app, id) = modal_open();
+        run(&mut app, press(KeyCode::Esc));
+        run(&mut app, ch('x'));
+        let outs = run(&mut app, ch('r'));
+        assert_ne!(ran(&outs).id, id);
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn spawn_failure_shows_in_the_modal() {
+        let (mut app, id) = modal_open();
+        app.script_failed(id, "no sh");
+        assert_eq!(
+            app.modal.as_ref().unwrap().done.as_deref(),
+            Some("failed: no sh")
+        );
     }
 
     #[cfg(feature = "scripts")]
