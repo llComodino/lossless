@@ -74,6 +74,7 @@ is the only thing the playback path knows how to do.
 | Volume: DAC hardware mixer, or software gain on the PipeWire path | yes | the bit-perfect path never scales samples; changes from `alsamixer` are reported |
 | Queue and position restored after restart | yes | paused where it was; vanished files dropped |
 | Terminal UI (`losslessd-tui`) | yes | queue, directories, artists, search; switches profiles |
+| Your own scripts in the TUI | optional | build feature `scripts` |
 | MPRIS (media keys, bars) | planned | |
 | Other formats (ALAC, WAV, AIFF, Opus, Vorbis) | later | via symphonia |
 | DSD (DoP / native) | not yet | |
@@ -324,6 +325,71 @@ actions only where their views don't overlap (`d` is `remove` in the queue
 and free elsewhere). The keys of the filter line while typing are fixed. A
 bad file stops the UI before it starts, with the file and, for syntax,
 unknown actions and bad keys, the line and column.
+
+#### Scripts
+
+With the `scripts` build feature the UI runs your own scripts, so things
+like "add ten random tracks" live in a shell script instead of the daemon:
+
+```sh
+cargo build --release -p lossless-tui --features scripts
+```
+
+Register them in the same `tui.ron`:
+
+```ron
+(
+    scripts: [
+        (name: "random 10", command: "~/bin/lossless-random 10", key: "r", mode: Modal),
+        (name: "pick album", command: "lossless-fzf-album", key: "a", mode: Terminal),
+        (name: "tag fix", command: "beet-fix", mode: Terminal),
+    ],
+    script_lines: 200,
+)
+```
+
+`command` runs with `sh -c` in the UI's working directory. `key` is
+optional and uses the key syntax above. Script keys only work after the
+prefix, `x` by default (action `scripts`), so they never clash with other
+keys: `x` then `r` runs "random 10" from any view. `Esc` cancels the
+prefix. The Scripts view (`5`, action `view_scripts`) lists every script;
+`Enter` runs the selected one and `/` filters by name. Scripts also run
+while the daemon is down, since a script may be what starts it.
+
+`mode` says how a script opens:
+
+- `Modal`: a box over the UI shows its output (stdout and stderr, colours
+  stripped, the last `script_lines` lines, default 200) above an input
+  line. `Enter` sends the line to its stdin, `Ctrl-d` closes stdin,
+  `PgUp`/`PgDn` scroll, `Esc` kills it with everything it started. A script
+  that exits 0 without printing closes the box by itself; otherwise the box
+  shows how it ended until you press a key.
+- `Terminal`: the UI steps aside and the script gets the whole terminal
+  (for fzf, an editor, anything full-screen). Ctrl-C reaches the script,
+  not the UI. On exit 0 the UI comes straight back; on failure it shows
+  `[exited N, press any key]` first.
+
+Each script gets, besides your environment:
+
+| Variable | Value |
+|---|---|
+| `LOSSLESS_SOCKET` | the socket of the daemon the UI is on (follows `o`) |
+| `LOSSLESS_PROFILE` | its profile; unset with `--socket` |
+| `LOSSLESS_MUSIC_DIR` | the daemon's `music_dir` (`get music_dir`); unset if none |
+| `LOSSLESS_CURRENT` | the current queue entry's path; unset if none |
+| `LOSSLESS_SELECTION` | a file (mode 0600, removed afterwards) with the selected tracks' absolute paths, one per line |
+
+The selection is the row under the cursor in the view you ran the script
+from (from Scripts, the view before it): one track, or every track of a
+folder, artist or album, in the order `add` would queue them.
+
+Random add, as `~/bin/lossless-random`:
+
+```sh
+#!/bin/sh
+find "$LOSSLESS_MUSIC_DIR" -name '*.flac' | shuf -n "${1:-10}" |
+    xargs -d '\n' lossless --socket "$LOSSLESS_SOCKET" add
+```
 
 ### Running under a supervisor
 
