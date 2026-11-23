@@ -658,7 +658,7 @@ impl Daemon {
                 Some(Box::new(move |batch: &[Event]| {
                     let changes = mpris::changes(&mut seen, batch);
                     if let (false, Some(d)) = (changes.is_empty(), weak.upgrade()) {
-                        bus.emit(&changes, &d.player.snapshot());
+                        bus.emit(&changes, &d, &d.player.snapshot());
                     }
                 }))
             },

@@ -361,3 +361,180 @@ fn name_taken_keeps_serving() {
     let b = Server::start(&bus, "default", None);
     assert!(matches!(b.ask(Cmd::Status), Outcome::Ok(Body::Status(_))));
 }
+
+/// Signals from one daemon, collected on a thread from before the test acts.
+struct Signals {
+    rx: std::sync::mpsc::Receiver<zbus::Message>,
+}
+
+impl Signals {
+    fn watch(c: &Connection, name: &str) -> Signals {
+        let rule = zbus::MatchRule::builder()
+            .msg_type(zbus::message::Type::Signal)
+            .path(PATH)
+            .unwrap()
+            .build();
+        let it = zbus::blocking::MessageIterator::for_match_rule(rule, c, None).unwrap();
+        let owner = zbus::blocking::fdo::DBusProxy::new(c)
+            .unwrap()
+            .get_name_owner(name.try_into().unwrap())
+            .unwrap()
+            .to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            for m in it.flatten() {
+                let from = m.header().sender().map(ToString::to_string);
+                if from.as_deref() == Some(owner.as_str()) && tx.send(m).is_err() {
+                    break;
+                }
+            }
+        });
+        Signals { rx }
+    }
+
+    /// The first signal `pick` accepts within `within`.
+    fn find<T>(
+        &self,
+        within: Duration,
+        mut pick: impl FnMut(&zbus::Message) -> Option<T>,
+    ) -> Option<T> {
+        let end = Instant::now() + within;
+        while let Ok(m) = self
+            .rx
+            .recv_timeout(end.saturating_duration_since(Instant::now()))
+        {
+            if let Some(t) = pick(&m) {
+                return Some(t);
+            }
+        }
+        None
+    }
+
+    fn changed(&self, prop: &str) -> Option<OwnedValue> {
+        self.find(WAIT, |m| {
+            let h = m.header();
+            if h.member().map(|x| x.as_str()) != Some("PropertiesChanged") {
+                return None;
+            }
+            let (iface, props, _): (String, HashMap<String, OwnedValue>, Vec<String>) =
+                m.body().deserialize().ok()?;
+            (iface == PLAYER)
+                .then(|| props.get(prop).cloned())
+                .flatten()
+        })
+    }
+
+    fn seeked(&self, within: Duration) -> Option<i64> {
+        self.find(within, |m| {
+            (m.header().member().map(|x| x.as_str()) == Some("Seeked"))
+                .then(|| m.body().deserialize::<i64>().ok())
+                .flatten()
+        })
+    }
+}
+
+fn watched(bus: &Bus, mixer: Option<Box<dyn Mixer>>) -> (Server, Connection, Signals) {
+    let s = Server::start(bus, "default", mixer);
+    let c = bus.client();
+    until("name", || has_owner(&c, &s.name));
+    let sig = Signals::watch(&c, &s.name);
+    (s, c, sig)
+}
+
+#[test]
+fn play_pause_signals_status() {
+    let bus = bus_or_skip!();
+    let (s, c, sig) = watched(&bus, None);
+    s.add_album();
+    s.player(&c).call_method("PlayPause", &()).unwrap();
+    let v = sig
+        .changed("PlaybackStatus")
+        .expect("no PlaybackStatus signal");
+    assert_eq!(String::try_from(v).unwrap(), "Playing");
+}
+
+#[test]
+fn next_signals_metadata() {
+    let bus = bus_or_skip!();
+    let (s, c, sig) = watched(&bus, None);
+    s.add_album();
+    let p = s.player(&c);
+    p.call_method("Play", &()).unwrap();
+    p.call_method("Next", &()).unwrap();
+    let found = sig.find(WAIT, |m| {
+        let (_, props, _): (String, HashMap<String, OwnedValue>, Vec<String>) =
+            m.body().deserialize().ok()?;
+        let meta: HashMap<String, OwnedValue> = props.get("Metadata")?.clone().try_into().ok()?;
+        let id = ObjectPath::try_from(meta.get("mpris:trackid")?.clone()).ok()?;
+        (id.as_str() == "/org/lossless/track/1").then_some(())
+    });
+    assert!(found.is_some(), "no Metadata signal for track 1");
+}
+
+#[test]
+fn seek_signals_seeked() {
+    let bus = bus_or_skip!();
+    let (s, c, sig) = watched(&bus, None);
+    s.add_album();
+    let p = s.player(&c);
+    p.call_method("Play", &()).unwrap();
+    p.call_method("Pause", &()).unwrap();
+    until("paused", || status_of(&p) == "Paused");
+    assert!(matches!(s.ask(Cmd::Seek { ms: 1_500 }), Outcome::Ok(_)));
+    assert_eq!(sig.seeked(WAIT), Some(1_500_000));
+}
+
+#[test]
+fn gapless_advance_has_no_seeked() {
+    let bus = bus_or_skip!();
+    let (s, c, sig) = watched(&bus, None);
+    s.add_album();
+    let p = s.player(&c);
+    p.call_method("Play", &()).unwrap();
+    let found = sig.find(Duration::from_secs(6), |m| {
+        let (_, props, _): (String, HashMap<String, OwnedValue>, Vec<String>) =
+            m.body().deserialize().ok()?;
+        let meta: HashMap<String, OwnedValue> = props.get("Metadata")?.clone().try_into().ok()?;
+        let id = ObjectPath::try_from(meta.get("mpris:trackid")?.clone()).ok()?;
+        (id.as_str() == "/org/lossless/track/1").then_some(())
+    });
+    assert!(found.is_some(), "never advanced to track 1");
+    assert_eq!(sig.seeked(Duration::from_secs(1)), None);
+}
+
+#[test]
+fn mode_and_volume_signal() {
+    let bus = bus_or_skip!();
+    let (s, _c, sig) = watched(&bus, Some(Box::new(SoftwareMixer::default())));
+    s.ask(Cmd::SetMode {
+        repeat: Some(Repeat::Queue),
+        random: None,
+    });
+    let v = sig.changed("LoopStatus").expect("no LoopStatus signal");
+    assert_eq!(String::try_from(v).unwrap(), "Playlist");
+    s.ask(Cmd::SetMode {
+        repeat: None,
+        random: Some(true),
+    });
+    assert!(bool::try_from(sig.changed("Shuffle").expect("no Shuffle signal")).unwrap());
+    s.ask(Cmd::SetVolume { percent: 30 });
+    let v = f64::try_from(sig.changed("Volume").expect("no Volume signal")).unwrap();
+    assert!((v - 0.3).abs() < 1e-9, "{v}");
+}
+
+#[test]
+fn idle_sends_nothing() {
+    let bus = bus_or_skip!();
+    let (s, c, sig) = watched(&bus, None);
+    s.add_album();
+    let p = s.player(&c);
+    p.call_method("Play", &()).unwrap();
+    p.call_method("Pause", &()).unwrap();
+    until("paused", || status_of(&p) == "Paused");
+    thread::sleep(Duration::from_millis(300));
+    while sig.rx.try_recv().is_ok() {}
+    assert!(
+        sig.find(Duration::from_secs(1), |_| Some(())).is_none(),
+        "signal while idle"
+    );
+}

@@ -1,16 +1,19 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
+use log::debug;
 use lossless_engine::{Command as PlayerCmd, Snapshot};
 use lossless_proto::profile::Profile;
 use zbus::blocking::Connection;
 use zbus::fdo;
+use zbus::names::BusName;
 use zbus::zvariant::{ObjectPath, OwnedValue, Value};
 
 use super::map::{self, Change};
 use crate::State;
 
 const PATH: &str = "/org/mpris/MediaPlayer2";
+const PLAYER: &str = "org.mpris.MediaPlayer2.Player";
 
 /// Where to register: the session bus, or `address` (tests).
 pub struct Mpris {
@@ -44,8 +47,64 @@ impl Bus {
         Ok(Bus { conn })
     }
 
-    pub(crate) fn emit(&self, _changes: &[Change], _snap: &Snapshot) {
-        let _ = &self.conn;
+    /// One `PropertiesChanged` with every property the batch changed, its
+    /// value read from `snap`, then a `Seeked` per seek.
+    pub(crate) fn emit(&self, changes: &[Change], d: &State, snap: &Snapshot) {
+        let can = owned(!snap.queue.is_empty());
+        let mut props: HashMap<&str, OwnedValue> = HashMap::new();
+        let mut put = |k, v: Option<OwnedValue>| {
+            if let Some(v) = v {
+                props.insert(k, v);
+            }
+        };
+        for c in changes {
+            match c {
+                Change::PlaybackStatus => {
+                    put(
+                        "PlaybackStatus",
+                        owned(map::playback_status(snap.status.state)),
+                    );
+                }
+                Change::Metadata => put("Metadata", owned(metadata(d, snap))),
+                Change::Queue => {
+                    for k in ["CanGoNext", "CanGoPrevious", "CanPlay"] {
+                        put(k, can.clone());
+                    }
+                }
+                Change::Modes => {
+                    put("LoopStatus", owned(map::loop_status(snap.status.repeat)));
+                    put("Shuffle", owned(snap.status.random));
+                }
+                Change::Volume => put(
+                    "Volume",
+                    owned(snap.status.volume.map_or(1.0, map::volume_to_mpris)),
+                ),
+                Change::Seeked(_) => {}
+            }
+        }
+        if !props.is_empty() {
+            let body = (PLAYER, props, Vec::<&str>::new());
+            if let Err(e) = self.conn.emit_signal(
+                None::<BusName>,
+                PATH,
+                "org.freedesktop.DBus.Properties",
+                "PropertiesChanged",
+                &body,
+            ) {
+                debug!("mpris: {e}");
+            }
+        }
+        for c in changes {
+            if let Change::Seeked(ms) = c {
+                let us = i64::try_from(ms.saturating_mul(1000)).unwrap_or(i64::MAX);
+                if let Err(e) = self
+                    .conn
+                    .emit_signal(None::<BusName>, PATH, PLAYER, "Seeked", &us)
+                {
+                    debug!("mpris: {e}");
+                }
+            }
+        }
     }
 }
 
