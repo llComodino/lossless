@@ -1,3 +1,6 @@
+#[cfg_attr(not(test), expect(dead_code, reason = "the key table uses it next"))]
+mod key;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
