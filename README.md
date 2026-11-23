@@ -218,6 +218,7 @@ and drive it with the client:
 
 ```sh
 lossless update                  # scan music_dir
+lossless get music_dir           # the daemon's music folder
 lossless search radiohead ok     # tracks matching every word
 lossless browse [Radiohead]      # folders (trailing /) and tracks under music_dir
 lossless artists                 # artist names
@@ -368,7 +369,7 @@ A failed request gets an error with a code and a message:
 | `not_found` | a path that doesn't exist or isn't playable, an empty collection |
 | `out_of_range` | a queue index or `at` outside the queue |
 | `no_mixer` | volume without a mixer |
-| `no_music_dir` | `update` or `browse` without `music_dir` |
+| `no_music_dir` | `update`, `browse` or `get music_dir` without `music_dir` |
 | `scan_running` | `update` while a scan runs |
 | `device` | the output device failed after retries |
 | `decode` | a file failed to decode |
@@ -399,6 +400,14 @@ disconnected; it resyncs on reconnect:
 `removed` (paths) patch a copy taken at `generation - 1`; a client that
 sees a gap in `generation` fetches `tracks` again. `lossless watch` prints
 it as `library changed: 914 tracks (+2 -1)`.
+
+`get` reads one daemon setting. Today the only property is `music_dir`
+(absolute, as configured); without one the reply is `no_music_dir`:
+
+```json
+{"id":4,"cmd":"get","property":"music_dir"}
+{"type":"reply","id":4,"ok":{"kind":"value","data":"/home/me/Music"}}
+```
 
 `volume` follows every `set_volume` and changes made on the card outside the
 daemon; `error` reports a failure the daemon recovered from (a skipped file,
