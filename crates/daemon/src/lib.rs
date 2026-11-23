@@ -15,6 +15,7 @@ use anyhow::{Context, Result, bail};
 use log::{debug, info, warn};
 use lossless_engine::{Command as PlayerCmd, Output, Player, Snapshot, choose};
 use lossless_library::{Library, collect, read_track};
+use lossless_proto::profile::Profile;
 use lossless_proto::{
     Body, Command, Event, Outcome, Property, Request, ServerMessage, Track, decode, encode,
 };
@@ -474,9 +475,15 @@ pub fn run(
     default_socket: PathBuf,
     state: PathBuf,
     log_override: Option<LogLevel>,
+    profile: &Profile,
 ) -> Result<()> {
     let cfg = load_config(config)?;
     init_logging(log_override.unwrap_or(cfg.log_level));
+    #[cfg(not(feature = "mpris"))]
+    if cfg.mpris {
+        info!("mpris: not built in; ignoring the mpris setting");
+    }
+    let _ = profile;
     let dir = state.parent().unwrap_or(Path::new("/"));
     state::prepare(&state)
         .with_context(|| format!("preparing state directory {}", dir.display()))?;

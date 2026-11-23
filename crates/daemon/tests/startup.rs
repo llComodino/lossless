@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use lossless_daemon::run;
 use lossless_engine::fixtures::{BLOCK, Dir, flac_at};
+use lossless_proto::profile::Profile;
 
 fn write_config(dir: &Dir, text: &str) -> PathBuf {
     let p = dir.path("config.toml");
@@ -56,7 +57,7 @@ fn run_serves_the_configured_socket_and_music() {
     );
     let unused = dir.path("default.sock");
     let state = dir.path("state.json");
-    thread::spawn(move || run(&cfg, unused, state, None));
+    thread::spawn(move || run(&cfg, unused, state, None, &Profile::default()));
     let c = connect(&sock);
     assert!(call(&c, r#"{"id":1,"cmd":"status"}"#).contains(r#""state":"stopped""#));
     assert!(call(&c, r#"{"id":2,"cmd":"add","paths":["a.flac"]}"#).contains("done"));
@@ -70,7 +71,7 @@ fn run_falls_back_to_the_default_socket() {
     let sock = dir.path("default.sock");
     let s = sock.clone();
     let state = dir.path("state.json");
-    thread::spawn(move || run(&cfg, s, state, None));
+    thread::spawn(move || run(&cfg, s, state, None, &Profile::default()));
     let c = connect(&sock);
     assert!(call(&c, r#"{"id":1,"cmd":"update"}"#).contains("no music_dir configured"));
 }
@@ -87,7 +88,15 @@ fn a_missing_mixer_card_runs_without_volume() {
         ),
     );
     let state = dir.path("state.json");
-    thread::spawn(move || run(&cfg, PathBuf::from("/nonexistent"), state, None));
+    thread::spawn(move || {
+        run(
+            &cfg,
+            PathBuf::from("/nonexistent"),
+            state,
+            None,
+            &Profile::default(),
+        )
+    });
     let c = connect(&sock);
     let reply = call(&c, r#"{"id":1,"cmd":"set_volume","percent":50}"#);
     assert!(reply.contains(r#""code":"no_mixer""#), "{reply}");
@@ -129,18 +138,39 @@ fn a_missing_mixer_card_is_logged() {
 fn run_stops_on_a_bad_config_or_socket() {
     let dir = Dir::new();
     let bad = write_config(&dir, "device = \"file:'|id'\"\n");
-    let err = run(&bad, dir.path("s.sock"), dir.path("state.json"), None).unwrap_err();
+    let err = run(
+        &bad,
+        dir.path("s.sock"),
+        dir.path("state.json"),
+        None,
+        &Profile::default(),
+    )
+    .unwrap_err();
     assert!(format!("{err:#}").contains("not allowed"), "{err:#}");
     assert!(!dir.path("s.sock").exists(), "bound before validating");
 
     let key = dir.path("key");
     std::fs::write(&key, "secret").unwrap();
     let ok = write_config(&dir, "device = \"null\"\n");
-    let err = run(&ok, key.clone(), dir.path("state.json"), None).unwrap_err();
+    let err = run(
+        &ok,
+        key.clone(),
+        dir.path("state.json"),
+        None,
+        &Profile::default(),
+    )
+    .unwrap_err();
     assert!(format!("{err:#}").contains("not a socket"), "{err:#}");
     assert_eq!(std::fs::read_to_string(&key).unwrap(), "secret");
 
-    let err = run(&ok, dir.path("s.sock"), key.join("state.json"), None).unwrap_err();
+    let err = run(
+        &ok,
+        dir.path("s.sock"),
+        key.join("state.json"),
+        None,
+        &Profile::default(),
+    )
+    .unwrap_err();
     let msg = format!("{err:#}");
     assert!(msg.starts_with("preparing state directory"), "{msg}");
     assert!(!dir.path("s.sock").exists(), "bound before the state check");
@@ -157,7 +187,14 @@ fn run_stops_on_a_read_only_state_dir() {
         return; // root ignores the mode
     }
     let cfg = write_config(&dir, "device = \"null\"\n");
-    let err = run(&cfg, dir.path("s.sock"), ro.join("state.json"), None).unwrap_err();
+    let err = run(
+        &cfg,
+        dir.path("s.sock"),
+        ro.join("state.json"),
+        None,
+        &Profile::default(),
+    )
+    .unwrap_err();
     let msg = format!("{err:#}");
     assert!(msg.starts_with("preparing state directory"), "{msg}");
     assert!(msg.contains("ermission denied"), "{msg}");
@@ -392,7 +429,7 @@ fn run_restores_modes_when_every_entry_is_gone() {
     )
     .unwrap();
     let unused = dir.path("default.sock");
-    thread::spawn(move || run(&cfg, unused, state, None));
+    thread::spawn(move || run(&cfg, unused, state, None, &Profile::default()));
     let c = connect(&sock);
     let st = call(&c, r#"{"id":1,"cmd":"status"}"#);
     assert!(st.contains(r#""repeat":"one""#), "{st}");

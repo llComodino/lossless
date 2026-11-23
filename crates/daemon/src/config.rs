@@ -24,6 +24,14 @@ pub struct Config {
     /// ALSA simple mixer control the hardware mixer drives.
     #[serde(default = "default_control")]
     pub mixer_control: String,
+    /// Register on the session bus as an MPRIS player; needs the `mpris`
+    /// feature.
+    #[serde(default = "yes")]
+    pub mpris: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 fn default_mixer() -> MixerSetting {
@@ -225,6 +233,21 @@ fn is_index(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mpris_defaults_on() {
+        assert!(parse_config("").unwrap().mpris);
+    }
+
+    #[test]
+    fn mpris_can_be_off() {
+        assert!(!parse_config("mpris = false").unwrap().mpris);
+    }
+
+    #[test]
+    fn mpris_must_be_bool() {
+        assert!(parse_config("mpris = \"yes\"").is_err());
+    }
 
     #[test]
     fn plain_devices_are_accepted() {
