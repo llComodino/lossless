@@ -1,7 +1,9 @@
 use std::process::Command;
 
 fn tui() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_losslessd-tui"))
+    let mut c = Command::new(env!("CARGO_BIN_EXE_losslessd-tui"));
+    c.env("XDG_CONFIG_HOME", "/nonexistent/lossless-tui-test");
+    c
 }
 
 #[test]
@@ -131,4 +133,20 @@ mod parity {
             .collect();
         assert_eq!(found, want);
     }
+}
+
+#[test]
+fn broken_tui_ron_exits_2() {
+    let dir = std::env::temp_dir().join(format!("tui-badron-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("lossless")).unwrap();
+    std::fs::write(dir.join("lossless/tui.ron"), r#"(keys: {"nope": []})"#).unwrap();
+    let out = tui()
+        .env("XDG_CONFIG_HOME", &dir)
+        .args(["--socket", "/nonexistent.sock"])
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains("tui.ron:1:") && err.contains("nope"), "{err}");
 }
