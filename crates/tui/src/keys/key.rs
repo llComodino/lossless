@@ -32,9 +32,11 @@ fn named(s: &str) -> Option<KeyCode> {
     if s == "pgdown" {
         return Some(KeyCode::PageDown);
     }
-    if let Some(n) = s.strip_prefix('f').and_then(|n| n.parse::<u8>().ok())
+    if let Some(d) = s.strip_prefix('f')
+        && !d.starts_with('0')
+        && d.bytes().all(|b| b.is_ascii_digit())
+        && let Ok(n) = d.parse::<u8>()
         && (1..=12).contains(&n)
-        && !s[1..].starts_with('0')
     {
         return Some(KeyCode::F(n));
     }
@@ -65,7 +67,7 @@ impl Key {
         }
         let mut chars = rest.chars();
         let code = match (chars.next(), chars.next()) {
-            (Some(c), None) => KeyCode::Char(c),
+            (Some(c), None) if !c.is_control() => KeyCode::Char(c),
             _ => named(rest).ok_or_else(bad)?,
         };
         Ok(Key { code, ctrl, alt })
@@ -154,6 +156,11 @@ mod tests {
             "meta-x",
             "Space",
             "ctrl-ctrl-x",
+            "f+1",
+            "f 1",
+            "\t",
+            "\u{7}",
+            "ctrl-\n",
         ] {
             assert!(Key::parse(s).is_err(), "{s}");
         }
