@@ -589,3 +589,98 @@ fn flags_in_any_order() {
         assert!(err.contains(USAGE), "{args:?}: {err}");
     }
 }
+
+#[cfg(feature = "mpris")]
+mod mpris {
+    use super::*;
+
+    /// Killed and reaped on drop, so a failed assert leaves nothing running
+    /// (an orphan would also hold the test's output pipe open).
+    struct Reap(std::process::Child);
+
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// A private bus for one test; `None` without `dbus-daemon`.
+    fn private_bus(dir: &Dir) -> Option<(Reap, String)> {
+        let mut child = Command::new("dbus-daemon")
+            .args(["--session", "--nofork", "--print-address=1"])
+            .arg(format!("--address=unix:path={}", dir.path("bus").display()))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let mut line = String::new();
+        BufReader::new(child.stdout.take()?)
+            .read_line(&mut line)
+            .ok()?;
+        Some((Reap(child), line.trim().to_string()))
+    }
+
+    fn owned(address: &str, name: &str) -> bool {
+        let c = zbus::blocking::connection::Builder::address(address)
+            .unwrap()
+            .build()
+            .unwrap();
+        zbus::blocking::fdo::DBusProxy::new(&c)
+            .unwrap()
+            .name_has_owner(name.try_into().unwrap())
+            .unwrap()
+    }
+
+    fn daemon(dir: &Dir, address: &str, extra: &str) -> Reap {
+        std::fs::create_dir_all(dir.path("xdg/lossless")).unwrap();
+        std::fs::write(
+            dir.path("xdg/lossless/t1.toml"),
+            format!(
+                "device = \"null\"\nsocket = \"{}\"\n{extra}",
+                dir.path("s.sock").display()
+            ),
+        )
+        .unwrap();
+        Reap(spawn_env(
+            dir,
+            &["--profile", "t1"],
+            &[
+                ("XDG_STATE_HOME", &dir.path("state")),
+                ("DBUS_SESSION_BUS_ADDRESS", Path::new(address)),
+            ],
+        ))
+    }
+
+    const NAME: &str = "org.mpris.MediaPlayer2.lossless.t1";
+
+    #[test]
+    fn losslessd_registers_on_session_bus() {
+        let dir = Dir::new();
+        let Some((_bus, address)) = private_bus(&dir) else {
+            eprintln!("skipped: no dbus-daemon");
+            return;
+        };
+        let _child = daemon(&dir, &address, "");
+        let _ = connect(&dir.path("s.sock"));
+        let end = Instant::now() + Duration::from_secs(5);
+        while !owned(&address, NAME) {
+            assert!(Instant::now() < end, "{NAME} never registered");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn mpris_false_stays_off_the_bus() {
+        let dir = Dir::new();
+        let Some((_bus, address)) = private_bus(&dir) else {
+            eprintln!("skipped: no dbus-daemon");
+            return;
+        };
+        let _child = daemon(&dir, &address, "mpris = false\n");
+        let c = connect(&dir.path("s.sock"));
+        assert!(call(&c, r#"{"id":1,"cmd":"status"}"#).contains("status"));
+        thread::sleep(Duration::from_secs(1));
+        assert!(!owned(&address, NAME), "registered despite mpris = false");
+    }
+}
