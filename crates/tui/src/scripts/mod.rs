@@ -1,5 +1,6 @@
 pub mod modal;
 mod sanitize;
+pub mod terminal;
 
 use std::path::Path;
 
@@ -98,5 +99,15 @@ pub fn selection(app: &App, view: View) -> Vec<String> {
             (Some(Entry::Dir { name, .. }), [artist, ..]) => app.found(Some(artist), Some(name)),
             (None, _) => vec![],
         },
+    }
+}
+
+/// `exited N` or `killed by signal N`.
+pub fn status_text(st: std::process::ExitStatus) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    match (st.code(), st.signal()) {
+        (Some(c), _) => format!("exited {c}"),
+        (None, Some(s)) => format!("killed by signal {s}"),
+        (None, None) => "ended".into(),
     }
 }

@@ -26,7 +26,7 @@ pub struct Job {
     selection: PathBuf,
 }
 
-fn selection_file(run: &Run) -> io::Result<PathBuf> {
+pub(super) fn selection_file(run: &Run) -> io::Result<PathBuf> {
     let dir = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(std::env::temp_dir, PathBuf::from);
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let n = SEQ.fetch_add(1, Ordering::Relaxed);

@@ -23,6 +23,18 @@ impl Drop for Guard {
     }
 }
 
+/// Gives the terminal back as a shell has it, for a script to use.
+#[cfg(feature = "scripts")]
+pub fn suspend() {
+    restore();
+}
+
+#[cfg(feature = "scripts")]
+pub fn resume() -> io::Result<()> {
+    enable_raw_mode()?;
+    execute!(io::stdout(), EnterAlternateScreen, Hide)
+}
+
 fn restore() {
     let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
     let _ = disable_raw_mode();

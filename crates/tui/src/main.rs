@@ -70,6 +70,7 @@ fn run(
     dirs: &Dirs,
     rx: &Receiver<Msg>,
     #[cfg_attr(not(feature = "scripts"), expect(unused_variables))] tx: &Sender<Msg>,
+    gate: &input::Gate,
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
 ) -> io::Result<()> {
     #[cfg(feature = "scripts")]
@@ -78,6 +79,7 @@ fn run(
     terminal.draw(|f| ui::draw(app, f))?;
     while let Some(msg) = next_msg(rx, &app.clock, Instant::now()) {
         let resize = matches!(msg, Msg::Resize);
+        let input = matches!(msg, Msg::Key(_) | Msg::Resize);
         for out in update(app, msg, Instant::now()) {
             match out {
                 Out::Send(cmd, pending) => {
@@ -105,7 +107,20 @@ fn run(
                         }
                         Err(e) => app.script_failed(run.id, &e.to_string()),
                     },
-                    config::Mode::Terminal => app.footer = Some(format!("running {}", run.name)),
+                    config::Mode::Terminal => {
+                        if let Err(e) = scripts::terminal::run(&run) {
+                            app.footer = Some(format!("error: {}: {e}", run.name));
+                        }
+                        // `clear` would query the cursor position; this
+                        // clears and forces a full redraw without asking.
+                        let size = terminal.size()?;
+                        terminal.resize(ratatui::layout::Rect::new(
+                            0,
+                            0,
+                            size.width,
+                            size.height,
+                        ))?;
+                    }
                 },
                 #[cfg(feature = "scripts")]
                 Out::Stdin(id, line) => {
@@ -134,6 +149,9 @@ fn run(
             set_page(app, terminal);
         }
         terminal.draw(|f| ui::draw(app, f))?;
+        if input {
+            gate.open();
+        }
     }
     Ok(())
 }
@@ -212,8 +230,12 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    input::spawn(tx.clone());
-    let result = run(&mut app, &mut conn, &dirs, &rx, &tx, &mut terminal);
+    #[cfg(feature = "scripts")]
+    for sig in [signal_hook::consts::SIGINT, signal_hook::consts::SIGQUIT] {
+        let _ = signal_hook::flag::register(sig, std::sync::Arc::default());
+    }
+    let gate = input::spawn(tx.clone());
+    let result = run(&mut app, &mut conn, &dirs, &rx, &tx, &gate, &mut terminal);
     drop(guard);
     match result {
         Ok(()) => ExitCode::SUCCESS,

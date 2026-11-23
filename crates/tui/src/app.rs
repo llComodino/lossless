@@ -725,7 +725,6 @@ impl App {
 
     #[cfg(feature = "scripts")]
     fn script_exit(&mut self, id: u64, status: std::process::ExitStatus) -> Vec<Out> {
-        use std::os::unix::process::ExitStatusExt;
         let Some(m) = self.modal.as_mut().filter(|m| m.id == id) else {
             return vec![];
         };
@@ -733,11 +732,7 @@ impl App {
             self.modal = None;
             return vec![Out::Kill(id)];
         }
-        m.done = Some(match (status.code(), status.signal()) {
-            (Some(c), _) => format!("exited {c}"),
-            (None, Some(s)) => format!("killed by signal {s}"),
-            (None, None) => "ended".into(),
-        });
+        m.done = Some(crate::scripts::status_text(status));
         vec![]
     }
 
