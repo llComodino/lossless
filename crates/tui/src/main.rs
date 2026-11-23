@@ -117,6 +117,7 @@ fn run(
                             size.width,
                             size.height,
                         ))?;
+                        set_page(app, terminal);
                     }
                 },
                 #[cfg(feature = "scripts")]
