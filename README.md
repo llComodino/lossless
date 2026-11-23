@@ -280,9 +280,9 @@ whole-second progress while playing.
 #### Keys
 
 Every key can be remapped in `$XDG_CONFIG_HOME/lossless/tui.ron`
-(`~/.config/lossless/tui.ron`), read once at start. A missing or empty file
-keeps the defaults; list only what you change. An entry replaces all of an
-action's keys, and `[]` unbinds it:
+(`~/.config/lossless/tui.ron`), read once at start. A missing file, or one
+with only comments, keeps the defaults; list only what you change. An entry
+replaces all of an action's keys, and `[]` unbinds it:
 
 ```ron
 (
