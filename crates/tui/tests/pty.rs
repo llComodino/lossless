@@ -70,7 +70,17 @@ struct Session {
 }
 
 fn session(names: &[&str]) -> Session {
+    session_with(names, None)
+}
+
+/// `tui_ron` becomes `$XDG_CONFIG_HOME/lossless/tui.ron`; the config home is
+/// always the test's own, never the user's.
+fn session_with(names: &[&str], tui_ron: Option<&str>) -> Session {
     let dir = Dir::new();
+    if let Some(text) = tui_ron {
+        std::fs::create_dir_all(dir.path("config/lossless")).unwrap();
+        std::fs::write(dir.path("config/lossless/tui.ron"), text).unwrap();
+    }
     let album = dir.path("music/album");
     std::fs::create_dir_all(&album).unwrap();
     for n in names {
@@ -103,6 +113,7 @@ fn session(names: &[&str]) -> Session {
     cmd.arg("--socket");
     cmd.arg(&sock);
     cmd.env("XDG_RUNTIME_DIR", dir.path(""));
+    cmd.env("XDG_CONFIG_HOME", dir.path("config"));
     cmd.env("TERM", "xterm-256color");
     let child = Kill(pair.slave.spawn_command(cmd).unwrap());
     drop(pair.slave);
@@ -207,4 +218,36 @@ fn typing_reranks_rows_live() {
         assert!(Instant::now() < end, "tui did not exit");
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn exits_within(
+    child: &mut Kill,
+    rx: &Receiver<Vec<u8>>,
+    d: Duration,
+) -> Option<portable_pty::ExitStatus> {
+    let end = Instant::now() + d;
+    loop {
+        while rx.try_recv().is_ok() {}
+        if let Some(st) = child.0.try_wait().unwrap() {
+            return Some(st);
+        }
+        if Instant::now() >= end {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn tui_ron_remaps_quit() {
+    let mut s = session_with(&["01 one.flac"], Some(r#"(keys: {"quit": ["Q"]})"#));
+    wait_for(&s.rx, &mut s.seen, "Queue");
+    s.keys.write_all(b"q").unwrap();
+    assert!(
+        exits_within(&mut s.child, &s.rx, Duration::from_millis(500)).is_none(),
+        "q still quits"
+    );
+    s.keys.write_all(b"Q").unwrap();
+    let code = exits_within(&mut s.child, &s.rx, WAIT).expect("Q did not quit");
+    assert!(code.success(), "{code:?}");
 }

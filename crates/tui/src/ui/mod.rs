@@ -38,7 +38,7 @@ pub fn draw(app: &App, f: &mut Frame) {
     }
     footer::draw(app, f, foot);
     if app.help {
-        help::draw(f);
+        help::draw(f, &app.keymap);
     }
 }
 
@@ -100,7 +100,12 @@ mod tests {
     }
 
     fn app(profile: &str, volume: Option<u8>) -> App {
-        let mut app = App::new(vec![Profile::parse(profile).unwrap()], 0, true);
+        let mut app = App::new(
+            vec![Profile::parse(profile).unwrap()],
+            0,
+            true,
+            crate::keys::Keymap::default(),
+        );
         app.connected = true;
         app.queue = vec![
             track("Kenshi Yonezu", "IRIS OUT"),
@@ -296,45 +301,15 @@ mod tests {
         let (without, _) = render(&a);
         a.help = true;
         let (l, _) = render(&a);
-        for (k, d) in super::help::KEYS {
-            let row = super::help::row(k, d);
+        let rows = super::help::lines(&a.keymap);
+        assert_eq!(rows.len(), 18);
+        for row in rows {
             assert!(
                 l.iter().any(|r| r.contains(&row)),
                 "row {row:?} missing:\n{}",
                 l.join("\n")
             );
             assert!(!without.iter().any(|r| r.contains(&row)));
-        }
-        let keys: String = super::help::KEYS
-            .iter()
-            .map(|(k, _)| *k)
-            .collect::<Vec<_>>()
-            .join(" | ");
-        for k in [
-            "j/k",
-            "g/G",
-            "Ctrl-d/Ctrl-u",
-            "h/l",
-            "1-4",
-            "Tab/S-Tab",
-            "Enter",
-            "a / A",
-            "d / D",
-            "J/K",
-            "p or Space",
-            "s",
-            ">/<",
-            "f/b",
-            "r / z",
-            "+/-",
-            "/",
-            "Esc",
-            "u",
-            "o",
-            "?",
-            "q",
-        ] {
-            assert!(keys.contains(k), "{k} not in the key table");
         }
     }
 

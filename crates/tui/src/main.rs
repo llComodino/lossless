@@ -2,6 +2,7 @@
 
 mod app;
 mod clock;
+mod config;
 mod conn;
 mod filter;
 mod input;
@@ -125,6 +126,13 @@ fn main() -> ExitCode {
         }
     }
     let dirs = Dirs::from_env();
+    let config = match config::load(&config::path(&dirs)) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("losslessd-tui: {e}");
+            return ExitCode::from(2);
+        }
+    };
     let switchable = socket.is_none();
     let path = socket.unwrap_or_else(|| dirs.socket(&profile));
     let (tx, rx) = mpsc::channel();
@@ -146,7 +154,7 @@ fn main() -> ExitCode {
                 .unwrap_or_default()
         }
     };
-    let mut app = App::new(profiles, start, switchable);
+    let mut app = App::new(profiles, start, switchable, config.keymap);
     app.connected(conn.generation(), &resync);
     term::install_panic_hook();
     let guard = match term::Guard::new() {

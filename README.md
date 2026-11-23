@@ -277,6 +277,53 @@ Colors are Gruber Darker, painted as 24-bit RGB on a `#181818` background.
 The UI is event-driven: it redraws only on input, daemon events and
 whole-second progress while playing.
 
+#### Keys
+
+Every key can be remapped in `$XDG_CONFIG_HOME/lossless/tui.ron`
+(`~/.config/lossless/tui.ron`), read once at start. A missing file, or one
+with only comments, keeps the defaults; list only what you change. An entry
+replaces all of an action's keys, and `[]` unbinds it:
+
+```ron
+(
+    keys: {
+        "toggle": ["space"],
+        "quit": ["Q"],
+        "remove": ["x"],
+    },
+)
+```
+
+Keys are a single character (`"j"`, `"G"`, `"+"`) or one of `space enter
+esc tab backtab backspace up down left right home end pgup pgdown f1`-`f12`,
+optionally after `ctrl-` and/or `alt-` (`"ctrl-d"`). Shift is never written:
+an uppercase letter or a shifted symbol is that character.
+
+| Action | Default | Views |
+|--------|---------|-------|
+| `down` `up` `first` `last` | `j` `k` `g` `G` | all |
+| `half_down` `half_up` | `ctrl-d` `ctrl-u` | all |
+| `left` `right` | `h` `l` | Directories, Artists |
+| `view_queue` `view_directories` `view_artists` `view_search` | `1` `2` `3` `4` | all |
+| `next_view` `prev_view` | `tab` `backtab` | all |
+| `enter` | `enter` | all |
+| `add` `add_next` | `a` `A` | Directories, Artists, Search |
+| `remove` `clear` `move_down` `move_up` | `d` `D` `J` `K` | Queue |
+| `toggle` | `p` `space` | all |
+| `stop` `next` `previous` | `s` `>` `<` | all |
+| `seek_forward` `seek_back` | `f` `b` | all |
+| `repeat` `random` | `r` `z` | all |
+| `volume_up` `volume_down` | `+` `-` | all |
+| `edit_query` `clear_filter` | `/` `esc` | all |
+| `update` `switch_profile` | `u` `o` | all |
+| `help` `quit` | `?` `q` | all |
+
+Views are fixed per action; only keys change. One key may serve two
+actions only where their views don't overlap (`d` is `remove` in the queue
+and free elsewhere). The keys of the filter line while typing are fixed. A
+bad file stops the UI before it starts, with the file and, for syntax,
+unknown actions and bad keys, the line and column.
+
 ### Running under a supervisor
 
 `losslessd` stays in the foreground and exits non-zero on fatal errors, so
