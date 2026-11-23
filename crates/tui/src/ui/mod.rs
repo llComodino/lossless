@@ -3,6 +3,8 @@ mod footer;
 mod header;
 mod help;
 mod queue;
+#[cfg(feature = "scripts")]
+mod scripts;
 mod search;
 
 use std::time::Instant;
@@ -35,6 +37,9 @@ pub fn draw(app: &App, f: &mut Frame) {
         View::Directories => columns::draw(&app.dirs, &app.filters[1], f, inner),
         View::Artists => columns::draw(&app.artists, &app.filters[2], f, inner),
         View::Search => search::draw(app, f, inner),
+        #[cfg(feature = "scripts")]
+        View::Scripts => scripts::draw(app, f, inner),
+        #[cfg(not(feature = "scripts"))]
         View::Scripts => {}
     }
     footer::draw(app, f, foot);
@@ -295,6 +300,49 @@ mod tests {
             msg.starts_with("error: d/d/") && msg.ends_with("..."),
             "{row:?}"
         );
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn scripts_view_lists_scripts() {
+        use crate::config::{Mode, Script};
+        let mut a = app("default", None);
+        a.scripts.items = vec![
+            Script {
+                name: "random".into(),
+                command: "~/bin/random 10".into(),
+                key: Some(crate::keys::Key::parse("r").unwrap()),
+                mode: Mode::Modal,
+            },
+            Script {
+                name: "pick".into(),
+                command: "fzf".into(),
+                key: None,
+                mode: Mode::Terminal,
+            },
+        ];
+        a.view = View::Scripts;
+        let (l, _) = render(&a);
+        let text = l.join("\n");
+        assert!(text.contains("5 Scripts"), "{text}");
+        assert!(
+            l.iter()
+                .any(|r| r.contains("r  random  modal     ~/bin/random 10")),
+            "{text}"
+        );
+        assert!(
+            l.iter().any(|r| r.contains("-  pick    terminal  fzf")),
+            "{text}"
+        );
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn armed_prefix_shows_in_the_footer() {
+        let mut a = app("default", None);
+        a.prefix = true;
+        let (l, _) = render(&a);
+        assert!(l[23].starts_with("x-"), "{:?}", l[23]);
     }
 
     #[test]

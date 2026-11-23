@@ -8,6 +8,8 @@ mod filter;
 mod input;
 mod keys;
 mod local;
+#[cfg(feature = "scripts")]
+mod scripts;
 mod term;
 mod theme;
 mod ui;
@@ -85,9 +87,12 @@ fn run(
                     apply(app, conn, r);
                 }
                 Out::Switch => {
-                    let r = conn.switch(&dirs.socket(&app.profiles[app.profile]));
+                    app.socket = dirs.socket(&app.profiles[app.profile]);
+                    let r = conn.switch(&app.socket);
                     apply(app, conn, r);
                 }
+                #[cfg(feature = "scripts")]
+                Out::Run(run) => app.footer = Some(format!("running {}", run.name)),
             }
         }
         if app.quit {
@@ -157,6 +162,7 @@ fn main() -> ExitCode {
     let mut app = App::new(profiles, start, switchable, config.keymap);
     app.scripts.items = config.scripts;
     app.script_lines = config.script_lines;
+    app.socket = path.clone();
     app.connected(conn.generation(), &resync);
     term::install_panic_hook();
     let guard = match term::Guard::new() {

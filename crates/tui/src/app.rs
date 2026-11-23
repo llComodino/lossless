@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use crossterm::event::{KeyEvent, KeyEventKind};
@@ -52,6 +53,8 @@ pub enum Out {
     Send(Command, Pending),
     Reconnect,
     Switch,
+    #[cfg(feature = "scripts")]
+    Run(crate::scripts::Run),
 }
 
 /// Miller columns: `items` lists `path`, `parent` the path without its
@@ -114,6 +117,10 @@ pub struct App {
     pub scripts: ScriptList,
     /// `scripts` was pressed: the next key picks a script.
     pub prefix: bool,
+    /// The view a script's selection comes from when run from Scripts.
+    pub last_view: View,
+    /// The daemon's socket, for scripts.
+    pub socket: PathBuf,
     /// Output lines a script's modal keeps (`script_lines`).
     pub script_lines: usize,
     pub library: Local,
@@ -157,6 +164,8 @@ impl App {
             search: Search::default(),
             scripts: ScriptList::default(),
             prefix: false,
+            last_view: View::Queue,
+            socket: PathBuf::new(),
             script_lines: 200,
             library: Local::default(),
             music_dir: None,
@@ -289,7 +298,7 @@ impl App {
         }
     }
 
-    fn visible(&self, view: View) -> usize {
+    pub(crate) fn visible(&self, view: View) -> usize {
         self.filters[view.index()].len(self.total(view))
     }
 
@@ -304,11 +313,11 @@ impl App {
     }
 
     /// The real index of `view`'s selection.
-    fn real(&self, view: View) -> Option<usize> {
+    pub(crate) fn real(&self, view: View) -> Option<usize> {
         self.filters[view.index()].real(self.selected(view), self.total(view))
     }
 
-    fn chosen(&self, view: View) -> Option<&Entry> {
+    pub(crate) fn chosen(&self, view: View) -> Option<&Entry> {
         self.real(view).and_then(|i| self.cols(view).items.get(i))
     }
 
@@ -414,8 +423,19 @@ impl App {
             self.help = false;
             return vec![];
         }
+        #[cfg(feature = "scripts")]
+        if self.prefix {
+            return self.prefixed(key);
+        }
         let editing = self.connected && self.filters[self.view.index()].editing;
         let action = keys::action(&self.keymap, self.view, key, editing);
+        #[cfg(feature = "scripts")]
+        if !self.connected
+            && (action == Some(Action::Prefix)
+                || (action == Some(Action::Enter) && self.view == View::Scripts))
+        {
+            return self.act(action.unwrap_or(Action::Prefix), now);
+        }
         if !self.connected {
             return match action {
                 Some(Action::Quit) => self.act(Action::Quit, now),
@@ -444,6 +464,10 @@ impl App {
             Enter if self.view == View::Queue => {
                 self.on_queue(|i| Command::Play { index: Some(i) })
             }
+            #[cfg(feature = "scripts")]
+            Enter if self.view == View::Scripts => self
+                .real(View::Scripts)
+                .map_or_else(Vec::new, |i| self.run_script(i)),
             Enter => self.take(Op::Replace),
             Add => self.take(Op::Add(None)),
             AddNext => self.take(Op::Add(
@@ -517,6 +541,9 @@ impl App {
     }
 
     fn show(&mut self, view: View) -> Vec<Out> {
+        if view != View::Scripts {
+            self.last_view = view;
+        }
         self.view = view;
         vec![]
     }
@@ -593,14 +620,42 @@ impl App {
         vec![done(op.command(vec![path]))]
     }
 
-    fn take_found(&self, artist: Option<&str>, album: Option<&str>, op: Op) -> Vec<Out> {
+    /// Paths of an artist's (or one album's) tracks, in library order.
+    pub(crate) fn found(&self, artist: Option<&str>, album: Option<&str>) -> Vec<String> {
         let lib = &self.library;
-        let paths: Vec<String> = lib
-            .catalog
+        lib.catalog
             .find(&lib.tracks, artist, album)
             .into_iter()
             .map(|i| lib.tracks[i].path.clone())
-            .collect();
+            .collect()
+    }
+
+    #[cfg(feature = "scripts")]
+    fn run_script(&mut self, idx: usize) -> Vec<Out> {
+        crate::scripts::build(self, idx).map_or_else(Vec::new, |r| vec![Out::Run(r)])
+    }
+
+    /// The key after the prefix: a script's key runs it, Esc cancels.
+    #[cfg(feature = "scripts")]
+    fn prefixed(&mut self, key: KeyEvent) -> Vec<Out> {
+        self.prefix = false;
+        let Some(k) = keys::Key::from_event(&key) else {
+            return vec![];
+        };
+        if k.code == crossterm::event::KeyCode::Esc && !k.ctrl && !k.alt {
+            return vec![];
+        }
+        match self.scripts.items.iter().position(|s| s.key == Some(k)) {
+            Some(i) => self.run_script(i),
+            None => {
+                self.footer = Some(format!("no script on {k}"));
+                vec![]
+            }
+        }
+    }
+
+    fn take_found(&self, artist: Option<&str>, album: Option<&str>, op: Op) -> Vec<Out> {
+        let paths = self.found(artist, album);
         if paths.is_empty() {
             vec![]
         } else {
@@ -2026,6 +2081,210 @@ mod tests {
             reply(2, r2.music_dir, Outcome::Ok(Body::Value("/n".into()))),
         );
         assert_eq!(app.music_dir.as_deref(), Some("/n"));
+    }
+
+    #[cfg(feature = "scripts")]
+    fn scripted() -> App {
+        use crate::config::{Mode, Script};
+        let mut app = app();
+        app.socket = PathBuf::from("/run/l.sock");
+        app.music_dir = Some("/m".into());
+        app.scripts.items = vec![
+            Script {
+                name: "random".into(),
+                command: "echo r".into(),
+                key: Some(crate::keys::Key::parse("r").unwrap()),
+                mode: Mode::Modal,
+            },
+            Script {
+                name: "pick".into(),
+                command: "fzf".into(),
+                key: None,
+                mode: Mode::Terminal,
+            },
+        ];
+        app
+    }
+
+    #[cfg(feature = "scripts")]
+    fn ran(outs: &[Out]) -> &crate::scripts::Run {
+        match outs {
+            [Out::Run(r)] => r,
+            o => panic!("not a run: {o:?}"),
+        }
+    }
+
+    #[cfg(feature = "scripts")]
+    fn env<'a>(r: &'a crate::scripts::Run, k: &str) -> Option<&'a str> {
+        r.env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str())
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn prefix_then_key_runs() {
+        let mut app = scripted();
+        assert_eq!(run(&mut app, ch('x')), []);
+        assert!(app.prefix);
+        let outs = run(&mut app, ch('r'));
+        assert_eq!(ran(&outs).name, "random");
+        assert_eq!(ran(&outs).command, "echo r");
+        assert!(!app.prefix);
+        assert_eq!(app.footer, None);
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn prefix_then_esc_cancels() {
+        let mut app = scripted();
+        run(&mut app, ch('x'));
+        assert_eq!(run(&mut app, press(KeyCode::Esc)), []);
+        assert!(!app.prefix);
+        assert_eq!(app.footer, None);
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn prefix_then_unknown_key() {
+        let mut app = scripted();
+        run(&mut app, ch('x'));
+        assert_eq!(run(&mut app, ch('q')), []);
+        assert!(!app.quit);
+        assert!(!app.prefix);
+        assert_eq!(app.footer.as_deref(), Some("no script on q"));
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn enter_in_scripts_view_runs_selected() {
+        let mut app = scripted();
+        run(&mut app, ch('5'));
+        assert_eq!(app.view, View::Scripts);
+        run(&mut app, ch('j'));
+        let outs = run(&mut app, press(KeyCode::Enter));
+        assert_eq!(ran(&outs).name, "pick");
+        assert_eq!(ran(&outs).mode, crate::config::Mode::Terminal);
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn env_carries_daemon_and_current() {
+        let mut app = scripted();
+        app.profile = 1;
+        app.queue = vec![track("/m/q0.flac"), track("/m/q1.flac")];
+        let outs = run(&mut app, ch('x'));
+        assert!(outs.is_empty());
+        let outs = run(&mut app, ch('r'));
+        let r = ran(&outs);
+        assert_eq!(env(r, "LOSSLESS_SOCKET"), Some("/run/l.sock"));
+        assert_eq!(env(r, "LOSSLESS_PROFILE"), Some("pw"));
+        assert_eq!(env(r, "LOSSLESS_MUSIC_DIR"), Some("/m"));
+        assert_eq!(env(r, "LOSSLESS_CURRENT"), Some("/m/q1.flac"));
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn env_omits_unknowns() {
+        let mut app = scripted();
+        app.switchable = false;
+        app.music_dir = None;
+        app.status = Some(status(None, None));
+        run(&mut app, ch('x'));
+        let outs = run(&mut app, ch('r'));
+        let r = ran(&outs);
+        for k in ["LOSSLESS_PROFILE", "LOSSLESS_MUSIC_DIR", "LOSSLESS_CURRENT"] {
+            assert_eq!(env(r, k), None, "{k}");
+        }
+        assert_eq!(env(r, "LOSSLESS_SOCKET"), Some("/run/l.sock"));
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn selection_per_view() {
+        let mut app = scripted();
+        app.queue = vec![track("/m/q0.flac"), track("/m/q1.flac")];
+        app.queue_selected = 1;
+        assert_eq!(crate::scripts::selection(&app, View::Queue), ["/m/q1.flac"]);
+        app.search.selected = 0;
+        assert_eq!(crate::scripts::selection(&app, View::Search), ["hit.flac"]);
+        app.dirs.selected = 2;
+        assert_eq!(
+            crate::scripts::selection(&app, View::Directories),
+            ["x.flac"]
+        );
+        app.artists.selected = 0;
+        assert_eq!(
+            crate::scripts::selection(&app, View::Artists),
+            ["m/a3.flac", "m/a1.flac", "m/a2.flac"]
+        );
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn selection_uses_current_music_dir() {
+        let mut app = scripted();
+        app.library.replace(
+            2,
+            vec![
+                track("/m/Queen II/b.flac"),
+                track("/m/Queen/a.flac"),
+                track("/m/Queen/c.flac"),
+            ],
+        );
+        app.dirs.items = vec![dir("Queen", "Queen"), dir("Queen II", "Queen II")];
+        app.dirs.selected = 0;
+        assert_eq!(
+            crate::scripts::selection(&app, View::Directories),
+            ["/m/Queen/a.flac", "/m/Queen/c.flac"]
+        );
+        app.music_dir = None;
+        assert!(crate::scripts::selection(&app, View::Directories).is_empty());
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn selection_from_scripts_view_uses_last_view() {
+        let mut app = scripted();
+        app.queue = vec![track("/m/q0.flac"), track("/m/q1.flac")];
+        app.queue_selected = 0;
+        run(&mut app, ch('5'));
+        let outs = run(&mut app, press(KeyCode::Enter));
+        assert_eq!(ran(&outs).selection, ["/m/q0.flac"]);
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn scripts_run_while_disconnected() {
+        let mut app = scripted();
+        app.connected = false;
+        assert_eq!(run(&mut app, ch('x')), []);
+        assert_eq!(ran(&run(&mut app, ch('r'))).name, "random");
+        assert_eq!(run(&mut app, ch('j')), [Out::Reconnect]);
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn scripts_view_filters_by_name() {
+        let mut app = scripted();
+        run(&mut app, ch('5'));
+        typed(&mut app, "pick");
+        run(&mut app, press(KeyCode::Enter));
+        assert_eq!(app.visible(View::Scripts), 1);
+        let outs = run(&mut app, press(KeyCode::Enter));
+        assert_eq!(ran(&outs).name, "pick");
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn silent_script_keeps_filter_state() {
+        let mut app = scripted();
+        run(&mut app, ch('2'));
+        typed(&mut app, "a");
+        run(&mut app, press(KeyCode::Enter));
+        let query = app.filters[View::Directories.index()].query.clone();
+        run(&mut app, ch('x'));
+        ran(&run(&mut app, ch('r')));
+        assert_eq!(app.filters[View::Directories.index()].query, query);
+        assert_eq!(app.view, View::Directories);
     }
 
     #[cfg(feature = "scripts")]
