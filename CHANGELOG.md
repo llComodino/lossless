@@ -70,9 +70,14 @@ First development version, not yet tagged.
   clears; moving queue entries is off while filtered); the UI keeps a local
   library copy patched from the deltas.
 - `losslessd-tui`: Gruber Darker colors on a `#181818` background.
+- `get` reads a daemon setting (`music_dir`); `lossless get music_dir`.
 - `losslessd-tui`: every key is configurable in
   `$XDG_CONFIG_HOME/lossless/tui.ron`; defaults unchanged, `?` shows the
   keys in effect.
+- `losslessd-tui` (build feature `scripts`): run your own scripts from
+  `tui.ron`, after a prefix key or from a Scripts view, in a modal or with
+  the whole terminal; they get the daemon's socket, profile, music folder,
+  current track and selection.
 
 ### Fixed
 

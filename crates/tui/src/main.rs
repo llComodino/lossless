@@ -8,6 +8,8 @@ mod filter;
 mod input;
 mod keys;
 mod local;
+#[cfg(feature = "scripts")]
+mod scripts;
 mod term;
 mod theme;
 mod ui;
@@ -15,7 +17,7 @@ mod ui;
 use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::Instant;
 
 use lossless_proto::profile::{Dirs, Profile};
@@ -67,12 +69,17 @@ fn run(
     conn: &mut Conn,
     dirs: &Dirs,
     rx: &Receiver<Msg>,
+    #[cfg_attr(not(feature = "scripts"), expect(unused_variables))] tx: &Sender<Msg>,
+    gate: &input::Gate,
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
 ) -> io::Result<()> {
+    #[cfg(feature = "scripts")]
+    let mut job: Option<scripts::modal::Job> = None;
     set_page(app, terminal);
     terminal.draw(|f| ui::draw(app, f))?;
     while let Some(msg) = next_msg(rx, &app.clock, Instant::now()) {
         let resize = matches!(msg, Msg::Resize);
+        let input = matches!(msg, Msg::Key(_) | Msg::Resize);
         for out in update(app, msg, Instant::now()) {
             match out {
                 Out::Send(cmd, pending) => {
@@ -85,9 +92,48 @@ fn run(
                     apply(app, conn, r);
                 }
                 Out::Switch => {
-                    let r = conn.switch(&dirs.socket(&app.profiles[app.profile]));
+                    app.socket = dirs.socket(&app.profiles[app.profile]);
+                    let r = conn.switch(&app.socket);
                     apply(app, conn, r);
                 }
+                #[cfg(feature = "scripts")]
+                #[cfg(feature = "scripts")]
+                Out::Run(run) => match run.mode {
+                    config::Mode::Modal => {
+                        match scripts::modal::start(&run, app.script_lines, tx.clone()) {
+                            Ok(j) => drop(job.replace(j)),
+                            Err(e) => app.script_failed(run.id, &e.to_string()),
+                        }
+                    }
+                    config::Mode::Terminal => {
+                        if let Err(e) = scripts::terminal::run(&run) {
+                            app.footer = Some(format!("error: {}: {e}", run.name));
+                        }
+                        // `clear` would query the cursor position; this
+                        // clears and forces a full redraw without asking.
+                        let size = terminal.size()?;
+                        terminal.resize(ratatui::layout::Rect::new(
+                            0,
+                            0,
+                            size.width,
+                            size.height,
+                        ))?;
+                    }
+                },
+                #[cfg(feature = "scripts")]
+                Out::Stdin(id, line) => {
+                    if let Some(j) = job.as_mut().filter(|j| j.id == id) {
+                        j.send_line(&line);
+                    }
+                }
+                #[cfg(feature = "scripts")]
+                Out::CloseStdin(id) => {
+                    if let Some(j) = job.as_mut().filter(|j| j.id == id) {
+                        j.close_stdin();
+                    }
+                }
+                #[cfg(feature = "scripts")]
+                Out::Kill(id) => drop(job.take_if(|j| j.id == id)),
             }
         }
         if app.quit {
@@ -97,6 +143,9 @@ fn run(
             set_page(app, terminal);
         }
         terminal.draw(|f| ui::draw(app, f))?;
+        if input {
+            gate.open();
+        }
     }
     Ok(())
 }
@@ -155,6 +204,9 @@ fn main() -> ExitCode {
         }
     };
     let mut app = App::new(profiles, start, switchable, config.keymap);
+    app.scripts.items = config.scripts;
+    app.script_lines = config.script_lines;
+    app.socket = path.clone();
     app.connected(conn.generation(), &resync);
     term::install_panic_hook();
     let guard = match term::Guard::new() {
@@ -172,8 +224,12 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    input::spawn(tx);
-    let result = run(&mut app, &mut conn, &dirs, &rx, &mut terminal);
+    #[cfg(feature = "scripts")]
+    for sig in [signal_hook::consts::SIGINT, signal_hook::consts::SIGQUIT] {
+        let _ = signal_hook::flag::register(sig, std::sync::Arc::default());
+    }
+    let gate = input::spawn(tx.clone());
+    let result = run(&mut app, &mut conn, &dirs, &rx, &tx, &gate, &mut terminal);
     drop(guard);
     match result {
         Ok(()) => ExitCode::SUCCESS,

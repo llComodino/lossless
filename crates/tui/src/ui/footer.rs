@@ -25,6 +25,11 @@ fn query(app: &App) -> Option<String> {
 
 pub fn draw(app: &App, f: &mut Frame, area: Rect) {
     let query = query(app);
+    let armed = app
+        .keymap
+        .bound(crate::keys::Name::Scripts)
+        .map(|k| format!("{}-", k.split(' ').next().unwrap_or_default()));
+    let query = if app.prefix { armed } else { query };
     let text = match (&app.footer, &query, app.connected) {
         (Some(t), ..) => t.as_str(),
         (None, _, false) => "disconnected",

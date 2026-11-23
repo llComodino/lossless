@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, anyhow, bail};
 use lossless_proto::profile::{Dirs, Profile};
 use lossless_proto::{
-    Body, Command, Entry, Event, Outcome, PlayState, Repeat, Request, ServerMessage, Status, Track,
-    decode, encode,
+    Body, Command, Entry, Event, Outcome, PlayState, Property, Repeat, Request, ServerMessage,
+    Status, Track, decode, encode,
 };
 use lossless_proto::{clock, describe, fit, format_str};
 
@@ -92,6 +92,12 @@ fn parse(args: &[String]) -> Result<Command> {
         "clear" => none(Command::Clear),
         "watch" => none(Command::Subscribe),
         "update" => none(Command::Update),
+        "get" => match rest {
+            [p] if p == "music_dir" => Ok(Command::Get {
+                property: Property::MusicDir,
+            }),
+            _ => bail!("get takes one property: music_dir"),
+        },
         "search" if !rest.is_empty() => Ok(Command::Search {
             query: rest.join(" "),
         }),
@@ -396,6 +402,7 @@ fn main() -> Result<()> {
                             Body::Tracks(tracks) | Body::Library { tracks, .. } => {
                                 print_tracks(&tracks)
                             }
+                            Body::Value(v) => out!("{v}"),
                             Body::Names(names) => {
                                 for n in names {
                                     out!("{n}");

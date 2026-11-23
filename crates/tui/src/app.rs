@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use crossterm::event::{KeyEvent, KeyEventKind};
@@ -9,6 +10,7 @@ use lossless_proto::{
 };
 
 use crate::clock::Clock;
+use crate::config::Script;
 use crate::conn::{Msg, Resync};
 use crate::filter::{Filter, Ranker};
 pub use crate::keys::View;
@@ -42,6 +44,7 @@ pub enum Pending {
         select: Option<String>,
     },
     Tracks,
+    MusicDir,
     Done,
 }
 
@@ -50,6 +53,16 @@ pub enum Out {
     Send(Command, Pending),
     Reconnect,
     Switch,
+    #[cfg(feature = "scripts")]
+    Run(crate::scripts::Run),
+    /// A line for the modal script `id`'s stdin.
+    #[cfg(feature = "scripts")]
+    Stdin(u64, String),
+    #[cfg(feature = "scripts")]
+    CloseStdin(u64),
+    /// Kill script `id`'s process group and forget it.
+    #[cfg(feature = "scripts")]
+    Kill(u64),
 }
 
 /// Miller columns: `items` lists `path`, `parent` the path without its
@@ -86,6 +99,29 @@ pub struct Search {
     pub offset: usize,
 }
 
+/// The Scripts view's rows (the scripts from `tui.ron`).
+#[derive(Clone, Debug, Default)]
+pub struct ScriptList {
+    pub items: Vec<Script>,
+    pub selected: usize,
+    pub offset: usize,
+}
+
+/// A modal script's box: its output and the line being typed.
+#[cfg(feature = "scripts")]
+#[derive(Clone, Debug, Default)]
+pub struct Modal {
+    pub id: u64,
+    pub name: String,
+    pub lines: std::collections::VecDeque<String>,
+    pub input: String,
+    /// Lines scrolled back from the bottom.
+    pub scroll: usize,
+    /// How it ended: `exited N`, `killed by signal N`, `failed: ...`.
+    pub done: Option<String>,
+    pub any_output: bool,
+}
+
 pub struct App {
     pub keymap: Keymap,
     pub profiles: Vec<Profile>,
@@ -101,10 +137,25 @@ pub struct App {
     pub dirs: Columns<Entry>,
     pub artists: Columns<Entry>,
     pub search: Search,
+    pub scripts: ScriptList,
+    /// `scripts` was pressed: the next key picks a script.
+    pub prefix: bool,
+    /// The view a script's selection comes from when run from Scripts.
+    pub last_view: View,
+    /// The daemon's socket, for scripts.
+    pub socket: PathBuf,
+    #[cfg(feature = "scripts")]
+    pub modal: Option<Modal>,
+    #[cfg(feature = "scripts")]
+    next_job: u64,
+    /// Output lines a script's modal keeps (`script_lines`).
+    pub script_lines: usize,
     pub library: Local,
+    /// The daemon's music folder (`get music_dir`), for absolute paths.
+    pub music_dir: Option<String>,
     /// One per view, by `View::index()`; each view's `selected` and
     /// `offset` are positions in its filtered list.
-    pub filters: [Filter; 4],
+    pub filters: [Filter; 5],
     ranker: Ranker,
     pub footer: Option<String>,
     pub connected: bool,
@@ -138,7 +189,17 @@ impl App {
             dirs: Columns::default(),
             artists: Columns::default(),
             search: Search::default(),
+            scripts: ScriptList::default(),
+            prefix: false,
+            last_view: View::Queue,
+            socket: PathBuf::new(),
+            #[cfg(feature = "scripts")]
+            modal: None,
+            #[cfg(feature = "scripts")]
+            next_job: 0,
+            script_lines: 200,
             library: Local::default(),
+            music_dir: None,
             filters: Default::default(),
             ranker: Ranker::new(),
             footer: None,
@@ -165,6 +226,7 @@ impl App {
         self.expect(resync.subscribe, Pending::Subscribe);
         self.expect(resync.status, Pending::Status);
         self.expect(resync.queue, Pending::Queue);
+        self.expect(resync.music_dir, Pending::MusicDir);
         self.first_queue = true;
     }
 
@@ -200,6 +262,7 @@ impl App {
 
     fn reset(&mut self, generation: u32) {
         self.generation = generation;
+        self.music_dir = None;
         self.pending.clear();
         self.stop_editing();
         self.status = None;
@@ -226,11 +289,19 @@ impl App {
     /// selection would leave it, and clamps it after a shrink or resize.
     pub fn follow(&mut self) {
         let page = self.page.max(1);
-        let [q, d, a, s] = View::ALL.map(|v| self.visible(v));
+        let [q, d, a, s, x] = [
+            View::Queue,
+            View::Directories,
+            View::Artists,
+            View::Search,
+            View::Scripts,
+        ]
+        .map(|v| self.visible(v));
         scroll(&mut self.queue_offset, self.queue_selected, q, page);
         scroll(&mut self.dirs.offset, self.dirs.selected, d, page);
         scroll(&mut self.artists.offset, self.artists.selected, a, page);
         scroll(&mut self.search.offset, self.search.selected, s, page);
+        scroll(&mut self.scripts.offset, self.scripts.selected, x, page);
     }
 
     fn columns(&mut self, view: View) -> &mut Columns<Entry> {
@@ -254,10 +325,11 @@ impl App {
             View::Directories => self.dirs.items.len(),
             View::Artists => self.artists.items.len(),
             View::Search => self.library.tracks.len(),
+            View::Scripts => self.scripts.items.len(),
         }
     }
 
-    fn visible(&self, view: View) -> usize {
+    pub(crate) fn visible(&self, view: View) -> usize {
         self.filters[view.index()].len(self.total(view))
     }
 
@@ -267,15 +339,16 @@ impl App {
             View::Directories => self.dirs.selected,
             View::Artists => self.artists.selected,
             View::Search => self.search.selected,
+            View::Scripts => self.scripts.selected,
         }
     }
 
     /// The real index of `view`'s selection.
-    fn real(&self, view: View) -> Option<usize> {
+    pub(crate) fn real(&self, view: View) -> Option<usize> {
         self.filters[view.index()].real(self.selected(view), self.total(view))
     }
 
-    fn chosen(&self, view: View) -> Option<&Entry> {
+    pub(crate) fn chosen(&self, view: View) -> Option<&Entry> {
         self.real(view).and_then(|i| self.cols(view).items.get(i))
     }
 
@@ -286,6 +359,7 @@ impl App {
             View::Directories => &mut self.dirs.selected,
             View::Artists => &mut self.artists.selected,
             View::Search => &mut self.search.selected,
+            View::Scripts => &mut self.scripts.selected,
         };
         (sel, len)
     }
@@ -307,6 +381,7 @@ impl App {
             View::Directories => r.rank(q, self.dirs.items.iter().map(name)),
             View::Artists => r.rank(q, self.artists.items.iter().map(name)),
             View::Search => r.rank(q, self.library.tracks.iter().map(describe)),
+            View::Scripts => r.rank(q, self.scripts.items.iter().map(|s| s.name.as_str())),
         });
     }
 
@@ -379,8 +454,23 @@ impl App {
             self.help = false;
             return vec![];
         }
+        #[cfg(feature = "scripts")]
+        if self.modal.is_some() {
+            return self.modal_key(key);
+        }
+        #[cfg(feature = "scripts")]
+        if self.prefix {
+            return self.prefixed(key);
+        }
         let editing = self.connected && self.filters[self.view.index()].editing;
         let action = keys::action(&self.keymap, self.view, key, editing);
+        #[cfg(feature = "scripts")]
+        if !self.connected
+            && (action == Some(Action::Prefix)
+                || (action == Some(Action::Enter) && self.view == View::Scripts))
+        {
+            return self.act(action.unwrap_or(Action::Prefix), now);
+        }
         if !self.connected {
             return match action {
                 Some(Action::Quit) => self.act(Action::Quit, now),
@@ -404,11 +494,15 @@ impl App {
             Left => self.left(),
             Right => self.right(),
             Show(v) => self.show(v),
-            NextView => self.show(View::ALL[(self.view.index() + 1) % 4]),
-            PrevView => self.show(View::ALL[(self.view.index() + 3) % 4]),
+            NextView => self.cycle(1),
+            PrevView => self.cycle(View::ALL.len() - 1),
             Enter if self.view == View::Queue => {
                 self.on_queue(|i| Command::Play { index: Some(i) })
             }
+            #[cfg(feature = "scripts")]
+            Enter if self.view == View::Scripts => self
+                .real(View::Scripts)
+                .map_or_else(Vec::new, |i| self.run_script(i)),
             Enter => self.take(Op::Replace),
             Add => self.take(Op::Add(None)),
             AddNext => self.take(Op::Add(
@@ -468,10 +562,23 @@ impl App {
                 vec![]
             }
             Cancel | ClearFilter => self.clear_filter(),
+            Prefix => {
+                self.prefix = true;
+                vec![]
+            }
         }
     }
 
+    fn cycle(&mut self, by: usize) -> Vec<Out> {
+        let n = View::ALL.len();
+        let at = View::ALL.iter().position(|v| *v == self.view).unwrap_or(0);
+        self.show(View::ALL[(at + by) % n])
+    }
+
     fn show(&mut self, view: View) -> Vec<Out> {
+        if view != View::Scripts {
+            self.last_view = view;
+        }
         self.view = view;
         vec![]
     }
@@ -548,14 +655,114 @@ impl App {
         vec![done(op.command(vec![path]))]
     }
 
-    fn take_found(&self, artist: Option<&str>, album: Option<&str>, op: Op) -> Vec<Out> {
+    /// Paths of an artist's (or one album's) tracks, in library order.
+    pub(crate) fn found(&self, artist: Option<&str>, album: Option<&str>) -> Vec<String> {
         let lib = &self.library;
-        let paths: Vec<String> = lib
-            .catalog
+        lib.catalog
             .find(&lib.tracks, artist, album)
             .into_iter()
             .map(|i| lib.tracks[i].path.clone())
-            .collect();
+            .collect()
+    }
+
+    #[cfg(feature = "scripts")]
+    fn run_script(&mut self, idx: usize) -> Vec<Out> {
+        self.next_job += 1;
+        let Some(run) = crate::scripts::build(self, idx, self.next_job) else {
+            return vec![];
+        };
+        if run.mode == crate::config::Mode::Modal {
+            self.modal = Some(Modal {
+                id: run.id,
+                name: run.name.clone(),
+                ..Modal::default()
+            });
+        }
+        vec![Out::Run(run)]
+    }
+
+    /// Keys while a modal is open; after the end any key closes it.
+    #[cfg(feature = "scripts")]
+    fn modal_key(&mut self, key: KeyEvent) -> Vec<Out> {
+        use crossterm::event::KeyCode;
+        let Some(m) = &mut self.modal else {
+            return vec![];
+        };
+        let id = m.id;
+        let ctrl = key
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::CONTROL);
+        if m.done.is_some() || key.code == KeyCode::Esc {
+            self.modal = None;
+            return vec![Out::Kill(id)];
+        }
+        match key.code {
+            KeyCode::Char('d') if ctrl => return vec![Out::CloseStdin(id)],
+            KeyCode::Char(c) if !ctrl => m.input.push(c),
+            KeyCode::Backspace => {
+                m.input.pop();
+            }
+            KeyCode::Enter => return vec![Out::Stdin(id, std::mem::take(&mut m.input))],
+            KeyCode::PageUp => {
+                m.scroll = (m.scroll + self.page.max(1)).min(m.lines.len().saturating_sub(1));
+            }
+            KeyCode::PageDown => m.scroll = m.scroll.saturating_sub(self.page.max(1)),
+            _ => {}
+        }
+        vec![]
+    }
+
+    #[cfg(feature = "scripts")]
+    fn script_out(&mut self, id: u64, out: &crate::scripts::modal::Output) {
+        if let Some(m) = self.modal.as_mut().filter(|m| m.id == id) {
+            let (lines, printed) = out.take();
+            m.lines = lines;
+            m.any_output |= printed;
+        }
+    }
+
+    #[cfg(feature = "scripts")]
+    fn script_exit(&mut self, id: u64, status: std::process::ExitStatus) -> Vec<Out> {
+        let Some(m) = self.modal.as_mut().filter(|m| m.id == id) else {
+            return vec![];
+        };
+        if status.success() && !m.any_output {
+            self.modal = None;
+            return vec![Out::Kill(id)];
+        }
+        m.done = Some(crate::scripts::status_text(status));
+        vec![]
+    }
+
+    /// The modal script `id` could not start.
+    #[cfg(feature = "scripts")]
+    pub fn script_failed(&mut self, id: u64, err: &str) {
+        if let Some(m) = self.modal.as_mut().filter(|m| m.id == id) {
+            m.done = Some(format!("failed: {err}"));
+        }
+    }
+
+    /// The key after the prefix: a script's key runs it, Esc cancels.
+    #[cfg(feature = "scripts")]
+    fn prefixed(&mut self, key: KeyEvent) -> Vec<Out> {
+        self.prefix = false;
+        let Some(k) = keys::Key::from_event(&key) else {
+            return vec![];
+        };
+        if k.code == crossterm::event::KeyCode::Esc && !k.ctrl && !k.alt {
+            return vec![];
+        }
+        match self.scripts.items.iter().position(|s| s.key == Some(k)) {
+            Some(i) => self.run_script(i),
+            None => {
+                self.footer = Some(format!("no script on {k}"));
+                vec![]
+            }
+        }
+    }
+
+    fn take_found(&self, artist: Option<&str>, album: Option<&str>, op: Op) -> Vec<Out> {
+        let paths = self.found(artist, album);
         if paths.is_empty() {
             vec![]
         } else {
@@ -731,9 +938,14 @@ impl App {
         let Some(pending) = self.pending.remove(&id) else {
             return vec![];
         };
-        let body = match result {
-            Outcome::Ok(body) => body,
-            Outcome::Err(e) => {
+        let body = match (result, &pending) {
+            (Outcome::Ok(Body::Value(v)), Pending::MusicDir) => {
+                self.music_dir = Some(v);
+                return vec![];
+            }
+            (_, Pending::MusicDir) => return vec![],
+            (Outcome::Ok(body), _) => body,
+            (Outcome::Err(e), _) => {
                 self.footer = Some(format!("error: {e}"));
                 return vec![];
             }
@@ -938,6 +1150,13 @@ pub fn update(app: &mut App, msg: Msg, now: Instant) -> Vec<Out> {
         Msg::Server(g, _) | Msg::Disconnected(g) if g != app.generation => vec![],
         Msg::Server(_, ServerMessage::Reply { id, result }) => app.reply(id, result, now),
         Msg::Server(_, ServerMessage::Event { event }) => app.event(event, now),
+        #[cfg(feature = "scripts")]
+        Msg::ScriptOut(id, out) => {
+            app.script_out(id, &out);
+            vec![]
+        }
+        #[cfg(feature = "scripts")]
+        Msg::ScriptExit(id, status) => app.script_exit(id, status),
         Msg::Disconnected(_) => {
             app.connected = false;
             app.pending.clear();
@@ -1378,6 +1597,7 @@ mod tests {
         assert_eq!(app.queue_selected, 1);
     }
 
+    #[cfg(not(feature = "scripts"))]
     #[test]
     fn views_switch_by_number_and_tab() {
         let mut app = app();
@@ -1846,6 +2066,7 @@ mod tests {
                 subscribe: 10,
                 status: 11,
                 queue: 12,
+                music_dir: 13,
             },
         );
         run(
@@ -1888,6 +2109,7 @@ mod tests {
                 subscribe: 10,
                 status: 11,
                 queue: 12,
+                music_dir: 13,
             },
         );
         assert!(app.connected);
@@ -1916,6 +2138,429 @@ mod tests {
         assert_eq!(app.footer.as_deref(), Some("--socket given: no profiles"));
     }
 
+    fn resync(base: u64) -> Resync {
+        Resync {
+            subscribe: base,
+            status: base + 1,
+            queue: base + 2,
+            music_dir: base + 3,
+        }
+    }
+
+    #[test]
+    fn music_dir_from_reply() {
+        let mut app = app();
+        let r = resync(10);
+        app.connected(1, &r);
+        run(
+            &mut app,
+            reply(1, r.music_dir, Outcome::Ok(Body::Value("/m".into()))),
+        );
+        assert_eq!(app.music_dir.as_deref(), Some("/m"));
+    }
+
+    #[test]
+    fn music_dir_error_is_silent() {
+        let mut app = app();
+        let r = resync(10);
+        app.connected(1, &r);
+        let e = WireError {
+            code: ErrorCode::NoMusicDir,
+            message: "no music_dir configured".into(),
+        };
+        run(&mut app, reply(1, r.music_dir, Outcome::Err(e)));
+        assert_eq!(app.music_dir, None);
+        assert_eq!(app.footer, None);
+    }
+
+    #[test]
+    fn music_dir_follows_the_connection() {
+        let mut app = app();
+        let r = resync(10);
+        app.connected(1, &r);
+        run(
+            &mut app,
+            reply(1, r.music_dir, Outcome::Ok(Body::Value("/m".into()))),
+        );
+        let r2 = resync(20);
+        app.connected(2, &r2);
+        assert_eq!(app.music_dir, None);
+        run(
+            &mut app,
+            reply(1, r.music_dir, Outcome::Ok(Body::Value("/old".into()))),
+        );
+        assert_eq!(app.music_dir, None);
+        run(
+            &mut app,
+            reply(2, r2.music_dir, Outcome::Ok(Body::Value("/n".into()))),
+        );
+        assert_eq!(app.music_dir.as_deref(), Some("/n"));
+    }
+
+    #[cfg(feature = "scripts")]
+    fn scripted() -> App {
+        use crate::config::{Mode, Script};
+        let mut app = app();
+        app.socket = PathBuf::from("/run/l.sock");
+        app.music_dir = Some("/m".into());
+        app.scripts.items = vec![
+            Script {
+                name: "random".into(),
+                command: "echo r".into(),
+                key: Some(crate::keys::Key::parse("r").unwrap()),
+                mode: Mode::Modal,
+            },
+            Script {
+                name: "pick".into(),
+                command: "fzf".into(),
+                key: None,
+                mode: Mode::Terminal,
+            },
+        ];
+        app
+    }
+
+    #[cfg(feature = "scripts")]
+    fn ran(outs: &[Out]) -> &crate::scripts::Run {
+        match outs {
+            [Out::Run(r)] => r,
+            o => panic!("not a run: {o:?}"),
+        }
+    }
+
+    #[cfg(feature = "scripts")]
+    fn env<'a>(r: &'a crate::scripts::Run, k: &str) -> Option<&'a str> {
+        r.env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str())
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn prefix_then_key_runs() {
+        let mut app = scripted();
+        assert_eq!(run(&mut app, ch('x')), []);
+        assert!(app.prefix);
+        let outs = run(&mut app, ch('r'));
+        assert_eq!(ran(&outs).name, "random");
+        assert_eq!(ran(&outs).command, "echo r");
+        assert!(!app.prefix);
+        assert_eq!(app.footer, None);
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn prefix_then_esc_cancels() {
+        let mut app = scripted();
+        run(&mut app, ch('x'));
+        assert_eq!(run(&mut app, press(KeyCode::Esc)), []);
+        assert!(!app.prefix);
+        assert_eq!(app.footer, None);
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn prefix_then_unknown_key() {
+        let mut app = scripted();
+        run(&mut app, ch('x'));
+        assert_eq!(run(&mut app, ch('q')), []);
+        assert!(!app.quit);
+        assert!(!app.prefix);
+        assert_eq!(app.footer.as_deref(), Some("no script on q"));
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn enter_in_scripts_view_runs_selected() {
+        let mut app = scripted();
+        run(&mut app, ch('5'));
+        assert_eq!(app.view, View::Scripts);
+        run(&mut app, ch('j'));
+        let outs = run(&mut app, press(KeyCode::Enter));
+        assert_eq!(ran(&outs).name, "pick");
+        assert_eq!(ran(&outs).mode, crate::config::Mode::Terminal);
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn env_carries_daemon_and_current() {
+        let mut app = scripted();
+        app.profile = 1;
+        app.queue = vec![track("/m/q0.flac"), track("/m/q1.flac")];
+        let outs = run(&mut app, ch('x'));
+        assert!(outs.is_empty());
+        let outs = run(&mut app, ch('r'));
+        let r = ran(&outs);
+        assert_eq!(env(r, "LOSSLESS_SOCKET"), Some("/run/l.sock"));
+        assert_eq!(env(r, "LOSSLESS_PROFILE"), Some("pw"));
+        assert_eq!(env(r, "LOSSLESS_MUSIC_DIR"), Some("/m"));
+        assert_eq!(env(r, "LOSSLESS_CURRENT"), Some("/m/q1.flac"));
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn env_omits_unknowns() {
+        let mut app = scripted();
+        app.switchable = false;
+        app.music_dir = None;
+        app.status = Some(status(None, None));
+        run(&mut app, ch('x'));
+        let outs = run(&mut app, ch('r'));
+        let r = ran(&outs);
+        for k in ["LOSSLESS_PROFILE", "LOSSLESS_MUSIC_DIR", "LOSSLESS_CURRENT"] {
+            assert_eq!(env(r, k), None, "{k}");
+        }
+        assert_eq!(env(r, "LOSSLESS_SOCKET"), Some("/run/l.sock"));
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn selection_per_view() {
+        let mut app = scripted();
+        app.queue = vec![track("/m/q0.flac"), track("/m/q1.flac")];
+        app.queue_selected = 1;
+        assert_eq!(crate::scripts::selection(&app, View::Queue), ["/m/q1.flac"]);
+        app.search.selected = 0;
+        assert_eq!(crate::scripts::selection(&app, View::Search), ["hit.flac"]);
+        app.dirs.selected = 2;
+        assert_eq!(
+            crate::scripts::selection(&app, View::Directories),
+            ["x.flac"]
+        );
+        app.artists.selected = 0;
+        assert_eq!(
+            crate::scripts::selection(&app, View::Artists),
+            ["m/a3.flac", "m/a1.flac", "m/a2.flac"]
+        );
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn selection_uses_current_music_dir() {
+        let mut app = scripted();
+        app.library.replace(
+            2,
+            vec![
+                track("/m/Queen II/b.flac"),
+                track("/m/Queen/a.flac"),
+                track("/m/Queen/c.flac"),
+            ],
+        );
+        app.dirs.items = vec![dir("Queen", "Queen"), dir("Queen II", "Queen II")];
+        app.dirs.selected = 0;
+        assert_eq!(
+            crate::scripts::selection(&app, View::Directories),
+            ["/m/Queen/a.flac", "/m/Queen/c.flac"]
+        );
+        app.music_dir = None;
+        assert!(crate::scripts::selection(&app, View::Directories).is_empty());
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn selection_from_scripts_view_uses_last_view() {
+        let mut app = scripted();
+        app.queue = vec![track("/m/q0.flac"), track("/m/q1.flac")];
+        app.queue_selected = 0;
+        run(&mut app, ch('5'));
+        let outs = run(&mut app, press(KeyCode::Enter));
+        assert_eq!(ran(&outs).selection, ["/m/q0.flac"]);
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn scripts_run_while_disconnected() {
+        let mut app = scripted();
+        app.connected = false;
+        assert_eq!(run(&mut app, ch('x')), []);
+        let id = ran(&run(&mut app, ch('r'))).id;
+        assert_eq!(run(&mut app, press(KeyCode::Esc)), [Out::Kill(id)]);
+        assert_eq!(run(&mut app, ch('j')), [Out::Reconnect]);
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn scripts_view_filters_by_name() {
+        let mut app = scripted();
+        run(&mut app, ch('5'));
+        typed(&mut app, "pick");
+        run(&mut app, press(KeyCode::Enter));
+        assert_eq!(app.visible(View::Scripts), 1);
+        let outs = run(&mut app, press(KeyCode::Enter));
+        assert_eq!(ran(&outs).name, "pick");
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn silent_script_keeps_filter_state() {
+        let mut app = scripted();
+        run(&mut app, ch('2'));
+        typed(&mut app, "a");
+        run(&mut app, press(KeyCode::Enter));
+        let query = app.filters[View::Directories.index()].query.clone();
+        run(&mut app, ch('x'));
+        ran(&run(&mut app, ch('r')));
+        assert_eq!(app.filters[View::Directories.index()].query, query);
+        assert_eq!(app.view, View::Directories);
+    }
+
+    #[cfg(feature = "scripts")]
+    fn exit(code: i32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(code << 8)
+    }
+
+    /// `scripted()` with the modal script "random" started.
+    #[cfg(feature = "scripts")]
+    fn modal_open() -> (App, u64) {
+        let mut app = scripted();
+        run(&mut app, ch('x'));
+        let outs = run(&mut app, ch('r'));
+        let id = ran(&outs).id;
+        assert!(app.modal.is_some());
+        (app, id)
+    }
+
+    #[cfg(feature = "scripts")]
+    fn printed(lines: &[&str]) -> std::sync::Arc<crate::scripts::modal::Output> {
+        let out = crate::scripts::modal::Output::new(200);
+        for l in lines {
+            out.push((*l).to_string());
+        }
+        std::sync::Arc::new(out)
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn output_replaces_the_modal_lines() {
+        let (mut app, id) = modal_open();
+        let out = printed(&["a", "b"]);
+        run(&mut app, Msg::ScriptOut(id, out.clone()));
+        out.push("c".into());
+        run(&mut app, Msg::ScriptOut(id, out));
+        let m = app.modal.as_ref().unwrap();
+        assert_eq!(m.lines, ["a", "b", "c"]);
+        assert!(m.any_output);
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn silent_success_auto_closes() {
+        let (mut app, id) = modal_open();
+        assert_eq!(run(&mut app, Msg::ScriptExit(id, exit(0))), [Out::Kill(id)]);
+        assert!(app.modal.is_none());
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn output_then_success_stays_open_with_exited_0() {
+        let (mut app, id) = modal_open();
+        run(&mut app, Msg::ScriptOut(id, printed(&["hi"])));
+        assert_eq!(run(&mut app, Msg::ScriptExit(id, exit(0))), []);
+        assert_eq!(
+            app.modal.as_ref().unwrap().done.as_deref(),
+            Some("exited 0")
+        );
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn failure_stays_open_any_key_closes() {
+        let (mut app, id) = modal_open();
+        run(&mut app, Msg::ScriptExit(id, exit(3)));
+        assert_eq!(
+            app.modal.as_ref().unwrap().done.as_deref(),
+            Some("exited 3")
+        );
+        assert_eq!(run(&mut app, ch('q')), [Out::Kill(id)]);
+        assert!(app.modal.is_none());
+        assert!(!app.quit);
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn killed_by_signal_is_shown() {
+        use std::os::unix::process::ExitStatusExt;
+        let (mut app, id) = modal_open();
+        run(
+            &mut app,
+            Msg::ScriptExit(id, std::process::ExitStatus::from_raw(9)),
+        );
+        assert_eq!(
+            app.modal.as_ref().unwrap().done.as_deref(),
+            Some("killed by signal 9")
+        );
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn esc_kills_and_closes() {
+        let (mut app, id) = modal_open();
+        assert_eq!(run(&mut app, press(KeyCode::Esc)), [Out::Kill(id)]);
+        assert!(app.modal.is_none());
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn modal_input_goes_to_stdin() {
+        let (mut app, id) = modal_open();
+        for c in "yes".chars() {
+            assert_eq!(run(&mut app, ch(c)), []);
+        }
+        run(&mut app, press(KeyCode::Backspace));
+        assert_eq!(
+            run(&mut app, press(KeyCode::Enter)),
+            [Out::Stdin(id, "ye".into())]
+        );
+        assert_eq!(app.modal.as_ref().unwrap().input, "");
+        assert_eq!(run(&mut app, ctrl('d')), [Out::CloseStdin(id)]);
+        assert!(!app.quit);
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn stale_job_messages_ignored() {
+        let (mut app, id) = modal_open();
+        run(&mut app, Msg::ScriptOut(id + 100, printed(&["old"])));
+        assert!(app.modal.as_ref().unwrap().lines.is_empty());
+        assert_eq!(run(&mut app, Msg::ScriptExit(id + 100, exit(0))), []);
+        assert!(app.modal.is_some());
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn each_run_gets_a_new_id() {
+        let (mut app, id) = modal_open();
+        run(&mut app, press(KeyCode::Esc));
+        run(&mut app, ch('x'));
+        let outs = run(&mut app, ch('r'));
+        assert_ne!(ran(&outs).id, id);
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn spawn_failure_shows_in_the_modal() {
+        let (mut app, id) = modal_open();
+        app.script_failed(id, "no sh");
+        assert_eq!(
+            app.modal.as_ref().unwrap().done.as_deref(),
+            Some("failed: no sh")
+        );
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn tab_cycles_five_views() {
+        let mut app = app();
+        let mut seen = vec![app.view];
+        for _ in 0..5 {
+            run(&mut app, press(KeyCode::Tab));
+            seen.push(app.view);
+        }
+        assert_eq!(seen[4], View::Scripts);
+        assert_eq!(seen[5], View::Queue);
+        run(&mut app, press(KeyCode::BackTab));
+        assert_eq!(app.view, View::Scripts);
+    }
+
     #[test]
     fn switching_drops_the_old_daemons_replies() {
         let mut app = app();
@@ -1927,6 +2572,7 @@ mod tests {
             subscribe: 10,
             status: 11,
             queue: 12,
+            music_dir: 13,
         };
         app.connected(2, &resync);
         assert_eq!(app.status, None);
@@ -1973,6 +2619,7 @@ mod tests {
             subscribe: 10,
             status: 11,
             queue: 12,
+            music_dir: 13,
         };
         app.connected(2, &resync);
         let outs = run(&mut app, reply(2, 10, Outcome::Ok(Body::Done)));
@@ -2075,6 +2722,7 @@ mod tests {
             subscribe: 10,
             status: 11,
             queue: 12,
+            music_dir: 13,
         };
         app.connected(2, &resync);
         assert!(app.library.tracks.is_empty());
@@ -2203,14 +2851,14 @@ mod tests {
 
         let mut app = filtered_queue();
         app.keymap =
-            Keymap::with_overrides(vec![(Name::ClearFilter, vec![Key::parse("x").unwrap()])])
+            Keymap::with_overrides(vec![(Name::ClearFilter, vec![Key::parse("w").unwrap()])])
                 .unwrap();
         typed(&mut app, "abba");
         run(&mut app, press(KeyCode::Enter));
         run(&mut app, ch('J'));
         assert_eq!(
             app.footer.as_deref(),
-            Some("clear the filter (x) to move entries")
+            Some("clear the filter (w) to move entries")
         );
         app.keymap = Keymap::with_overrides(vec![(Name::ClearFilter, vec![])]).unwrap();
         run(&mut app, ch('J'));
@@ -2511,6 +3159,7 @@ mod tests {
             subscribe: 10,
             status: 11,
             queue: 12,
+            music_dir: 13,
         };
         app.connected(2, &resync);
         assert_eq!(app.filters[0].hits, Some(vec![]));

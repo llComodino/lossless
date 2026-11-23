@@ -251,3 +251,139 @@ fn tui_ron_remaps_quit() {
     let code = exits_within(&mut s.child, &s.rx, WAIT).expect("Q did not quit");
     assert!(code.success(), "{code:?}");
 }
+
+#[cfg(feature = "scripts")]
+mod scripts {
+    use super::*;
+
+    const RON: &str = r#"(scripts: [
+        (name: "ask", command: "echo name?; read n; echo \"hello $n\" > \"$XDG_RUNTIME_DIR/hello\"; echo bye", key: "m", mode: Modal),
+        (name: "quiet", command: "echo y > \"$XDG_RUNTIME_DIR/ran\"", key: "s", mode: Modal),
+        (name: "term", command: "sleep 1; read x; echo \"got:$x\" > \"$XDG_RUNTIME_DIR/out\"", key: "t", mode: Terminal),
+        (name: "fail", command: "echo oops; exit 3", key: "f", mode: Terminal),
+        (name: "nap", command: "sleep 5", key: "c", mode: Terminal),
+        (name: "flood", command: "yes", key: "y", mode: Modal),
+    ])"#;
+
+    fn started() -> Session {
+        let mut s = session_with(&["01 one.flac"], Some(RON));
+        wait_for(&s.rx, &mut s.seen, "Queue");
+        s
+    }
+
+    fn quits(s: &mut Session) {
+        s.keys.write_all(b"q").unwrap();
+        let end = Instant::now() + WAIT;
+        let code = loop {
+            while let Ok(c) = s.rx.try_recv() {
+                s.seen.extend(c);
+            }
+            if let Some(st) = s.child.0.try_wait().unwrap() {
+                break st;
+            }
+            assert!(Instant::now() < end, "q did not quit");
+            thread::sleep(Duration::from_millis(20));
+        };
+        while let Ok(c) = s.rx.recv_timeout(Duration::from_millis(100)) {
+            s.seen.extend(c);
+        }
+        let text = String::from_utf8_lossy(&s.seen);
+        let tail: String = text
+            .chars()
+            .rev()
+            .take(300)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        assert!(code.success(), "{code:?}: ...{tail}");
+    }
+
+    fn wait_file(path: &std::path::Path) -> String {
+        let end = Instant::now() + WAIT;
+        loop {
+            if let Ok(t) = std::fs::read_to_string(path)
+                && !t.is_empty()
+            {
+                return t;
+            }
+            assert!(Instant::now() < end, "{} never written", path.display());
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn modal_script_round_trip() {
+        let mut s = started();
+        s.keys.write_all(b"xm").unwrap();
+        wait_for(&s.rx, &mut s.seen, "name?");
+        s.keys.write_all(b"bo\r").unwrap();
+        assert_eq!(wait_file(&s._dir.path("hello")), "hello bo\n");
+        thread::sleep(Duration::from_millis(300));
+        // The box stays (it printed); the first key closes it, so q must not
+        // quit yet.
+        s.keys.write_all(b"q").unwrap();
+        assert!(
+            exits_within(&mut s.child, &s.rx, Duration::from_millis(500)).is_none(),
+            "q quit through the open box"
+        );
+        quits(&mut s);
+    }
+
+    #[test]
+    fn silent_script_auto_closes() {
+        let mut s = started();
+        s.keys.write_all(b"xs").unwrap();
+        assert_eq!(wait_file(&s._dir.path("ran")), "y\n");
+        thread::sleep(Duration::from_millis(300));
+        quits(&mut s);
+    }
+
+    #[test]
+    fn terminal_script_owns_stdin() {
+        let mut s = started();
+        s.keys.write_all(b"xt").unwrap();
+        thread::sleep(Duration::from_millis(300));
+        s.keys.write_all(b"z\r").unwrap();
+        assert_eq!(wait_file(&s._dir.path("out")), "got:z\n");
+        thread::sleep(Duration::from_millis(300));
+        quits(&mut s);
+    }
+
+    #[test]
+    fn terminal_failure_waits_for_a_key() {
+        let mut s = started();
+        s.keys.write_all(b"xf").unwrap();
+        wait_for(&s.rx, &mut s.seen, "[exited 3, press any key]");
+        s.keys.write_all(b"q").unwrap();
+        assert!(
+            exits_within(&mut s.child, &s.rx, Duration::from_millis(500)).is_none(),
+            "the key that ended the pause also quit"
+        );
+        quits(&mut s);
+    }
+
+    #[test]
+    fn ctrl_c_in_terminal_script_spares_the_tui() {
+        let mut s = started();
+        s.keys.write_all(b"xc").unwrap();
+        thread::sleep(Duration::from_millis(500));
+        s.keys.write_all(b"\x03").unwrap();
+        wait_for(&s.rx, &mut s.seen, "[killed by signal 2, press any key]");
+        s.keys.write_all(b" ").unwrap();
+        quits(&mut s);
+    }
+
+    #[test]
+    fn flooding_script_still_closes_on_esc() {
+        let mut s = started();
+        s.keys.write_all(b"xy").unwrap();
+        thread::sleep(Duration::from_millis(500));
+        s.keys.write_all(b"\x1b").unwrap();
+        thread::sleep(Duration::from_millis(300));
+        s.keys.write_all(b"q").unwrap();
+        let code = exits_within(&mut s.child, &s.rx, Duration::from_secs(2))
+            .expect("Esc and q never got through the script's output");
+        assert!(code.success(), "{code:?}");
+    }
+}

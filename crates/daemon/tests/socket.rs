@@ -12,8 +12,8 @@ use lossless_daemon::{Daemon, MAX_REQUEST, bind, parse_config};
 use lossless_engine::fixtures::{BLOCK, Dir, PacedSink, flac_at};
 use lossless_engine::{Mixer, Player, SoftwareMixer};
 use lossless_proto::{
-    Body, Command, Entry, ErrorCode, Event, Outcome, PlayState, Repeat, Request, ServerMessage,
-    WireError, decode, encode,
+    Body, Command, Entry, ErrorCode, Event, Outcome, PlayState, Property, Repeat, Request,
+    ServerMessage, WireError, decode, encode,
 };
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -932,4 +932,23 @@ fn restart_restores_queue_paused_at_position() {
     assert_eq!(queue(&mut c), vec![track.display().to_string(); 2]);
     c.ok(Command::Toggle);
     assert_eq!(status(&mut c).state, PlayState::Playing);
+}
+
+#[test]
+fn get_music_dir() {
+    let s = Server::start(true);
+    let want = s.music().display().to_string();
+    let got = s.connect().ok(Command::Get {
+        property: Property::MusicDir,
+    });
+    assert_eq!(got, Body::Value(want));
+}
+
+#[test]
+fn get_music_dir_without_one() {
+    let s = Server::start(false);
+    let e = s.connect().err(Command::Get {
+        property: Property::MusicDir,
+    });
+    assert_eq!(e.code, ErrorCode::NoMusicDir);
 }
