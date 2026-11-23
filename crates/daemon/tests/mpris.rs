@@ -530,11 +530,80 @@ fn idle_sends_nothing() {
     let p = s.player(&c);
     p.call_method("Play", &()).unwrap();
     p.call_method("Pause", &()).unwrap();
-    until("paused", || status_of(&p) == "Paused");
-    thread::sleep(Duration::from_millis(300));
+    // The snapshot says Paused before the signals for it go out: wait for
+    // the signal itself, not a fixed time.
+    let paused = sig.find(WAIT, |m| {
+        let (_, props, _): (String, HashMap<String, OwnedValue>, Vec<String>) =
+            m.body().deserialize().ok()?;
+        let v = String::try_from(props.get("PlaybackStatus")?.clone()).ok()?;
+        (v == "Paused").then_some(())
+    });
+    assert!(paused.is_some(), "no Paused signal");
     while sig.rx.try_recv().is_ok() {}
     assert!(
         sig.find(Duration::from_secs(1), |_| Some(())).is_none(),
         "signal while idle"
     );
+}
+
+/// A subscriber on the daemon's socket, reading events on a thread.
+fn subscribe(s: &Server) -> std::sync::mpsc::Receiver<String> {
+    let mut sock = UnixStream::connect(s.sock()).unwrap();
+    sock.write_all(
+        encode(&Request {
+            id: 1,
+            command: Cmd::Subscribe,
+        })
+        .unwrap()
+        .as_bytes(),
+    )
+    .unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(sock).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+#[test]
+fn a_stalled_bus_does_not_stall_socket_clients() {
+    let bus = bus_or_skip!();
+    let (s, _c, _sig) = watched(&bus, None);
+    let events = subscribe(&s);
+    thread::sleep(Duration::from_millis(200));
+    let stop = |sig: &str| {
+        Command::new("kill")
+            .args([sig, &bus.child.id().to_string()])
+            .status()
+            .unwrap();
+    };
+    stop("-STOP");
+    let mut random = false;
+    let end = Instant::now() + Duration::from_secs(20);
+    for _ in 0..3000 {
+        random = !random;
+        s.ask(Cmd::SetMode {
+            repeat: None,
+            random: Some(random),
+        });
+        if Instant::now() > end {
+            break;
+        }
+    }
+    let want = format!("\"random\":{random}");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut last = String::new();
+    while Instant::now() < deadline {
+        match events.recv_timeout(Duration::from_millis(100)) {
+            Ok(l) => last = l,
+            Err(_) if last.contains(&want) => break,
+            Err(_) => {}
+        }
+    }
+    stop("-CONT");
+    assert!(last.contains(&want), "subscriber stuck at {last:?}");
 }

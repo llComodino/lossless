@@ -653,12 +653,17 @@ impl Daemon {
                         return None;
                     }
                 };
-                let weak = weak.clone();
+                let state = weak.clone();
+                let relay = mpris::relay(move |changes| {
+                    if let Some(d) = state.upgrade() {
+                        bus.emit(changes, &d, &d.player.snapshot());
+                    }
+                });
                 let mut seen = mpris::Seen::default();
                 Some(Box::new(move |batch: &[Event]| {
                     let changes = mpris::changes(&mut seen, batch);
-                    if let (false, Some(d)) = (changes.is_empty(), weak.upgrade()) {
-                        bus.emit(&changes, &d, &d.player.snapshot());
+                    if !changes.is_empty() {
+                        relay.send(changes);
                     }
                 }))
             },
