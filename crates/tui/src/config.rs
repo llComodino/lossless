@@ -23,7 +23,25 @@ pub fn path(dirs: &Dirs) -> PathBuf {
     dirs.config.join("lossless/tui.ron")
 }
 
-/// `path` read once; a missing or empty file gives the defaults.
+/// Nothing but whitespace and comments.
+fn blank(mut s: &str) -> bool {
+    loop {
+        s = s.trim_start();
+        if let Some(r) = s.strip_prefix("//") {
+            s = r.split_once('\n').map_or("", |(_, r)| r);
+        } else if let Some(r) = s.strip_prefix("/*") {
+            match r.split_once("*/") {
+                Some((_, r)) => s = r,
+                None => return false,
+            }
+        } else {
+            return s.is_empty();
+        }
+    }
+}
+
+/// `path` read once; a missing file, or one with only comments, gives the
+/// defaults.
 pub fn load(path: &Path) -> Result<Config, String> {
     let shown = path.display();
     let text = match std::fs::read_to_string(path) {
@@ -31,7 +49,7 @@ pub fn load(path: &Path) -> Result<Config, String> {
         Err(e) if e.kind() == ErrorKind::NotFound => String::new(),
         Err(e) => return Err(format!("{shown}: {e}")),
     };
-    let file: File = if text.trim().is_empty() {
+    let file: File = if blank(&text) {
         File::default()
     } else {
         ron::from_str(&text).map_err(|e| {
@@ -72,6 +90,19 @@ mod tests {
     fn empty_file_is_defaults() {
         let dir = Dir::new();
         for t in ["", "  \n", "()"] {
+            let c = load(&file(&dir, t)).unwrap();
+            assert_eq!(quit_keys(&c), vec![Key::parse("q").unwrap()], "{t:?}");
+        }
+    }
+
+    #[test]
+    fn comment_only_file_is_defaults() {
+        let dir = Dir::new();
+        for t in [
+            "// all off\n// (keys: {})\n",
+            "/* (keys: {\"quit\": [\"Q\"]}) */",
+            " // x\n /* y */ \n",
+        ] {
             let c = load(&file(&dir, t)).unwrap();
             assert_eq!(quit_keys(&c), vec![Key::parse("q").unwrap()], "{t:?}");
         }
