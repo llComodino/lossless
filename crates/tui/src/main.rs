@@ -97,7 +97,6 @@ fn run(
                     apply(app, conn, r);
                 }
                 #[cfg(feature = "scripts")]
-                #[cfg(feature = "scripts")]
                 Out::Run(run) => match run.mode {
                     config::Mode::Modal => {
                         match scripts::modal::start(&run, app.script_lines, tx.clone()) {
