@@ -155,6 +155,8 @@ fn main() -> ExitCode {
         }
     };
     let mut app = App::new(profiles, start, switchable, config.keymap);
+    app.scripts.items = config.scripts;
+    app.script_lines = config.script_lines;
     app.connected(conn.generation(), &resync);
     term::install_panic_hook();
     let guard = match term::Guard::new() {

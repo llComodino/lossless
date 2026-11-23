@@ -10,7 +10,11 @@ repository.workspace = true
 name = "losslessd-tui"
 path = "src/main.rs"
 
+[features]
+scripts = ["dep:signal-hook"]
+
 [dependencies]
+signal-hook = { version = "0.3", optional = true }
 ron = "0.12"
 serde = { workspace = true }
 crossterm = "0.29.0"

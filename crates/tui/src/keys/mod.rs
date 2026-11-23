@@ -12,10 +12,22 @@ pub enum View {
     Directories,
     Artists,
     Search,
+    /// Reachable only with the `scripts` feature.
+    #[cfg_attr(not(feature = "scripts"), allow(dead_code))]
+    Scripts,
 }
 
 impl View {
+    #[cfg(not(feature = "scripts"))]
     pub const ALL: [View; 4] = [View::Queue, View::Directories, View::Artists, View::Search];
+    #[cfg(feature = "scripts")]
+    pub const ALL: [View; 5] = [
+        View::Queue,
+        View::Directories,
+        View::Artists,
+        View::Search,
+        View::Scripts,
+    ];
 
     pub fn index(self) -> usize {
         self as usize
@@ -62,6 +74,9 @@ pub enum Action {
     Submit,
     Cancel,
     ClearFilter,
+    /// The next key runs the script bound to it.
+    #[cfg_attr(not(feature = "scripts"), allow(dead_code))]
+    Prefix,
 }
 
 pub fn action(map: &Keymap, view: View, key: KeyEvent, editing: bool) -> Option<Action> {

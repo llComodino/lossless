@@ -132,6 +132,11 @@ impl Name {
             SwitchProfile => Action::SwitchProfile,
             Help => Action::Help,
             Quit => Action::Quit,
+            #[cfg(feature = "scripts")]
+            ViewScripts => Action::Show(View::Scripts),
+            #[cfg(feature = "scripts")]
+            Scripts => Action::Prefix,
+            #[cfg(not(feature = "scripts"))]
             ViewScripts | Scripts => return None,
         })
     }
@@ -162,7 +167,14 @@ impl Default for Keymap {
                 (n, keys.collect())
             })
             .collect();
-        Keymap { keys }
+        let mut map = Keymap { keys };
+        if cfg!(feature = "scripts") {
+            for (n, k) in [(Name::Scripts, "x"), (Name::ViewScripts, "5")] {
+                map.keys
+                    .insert(n, vec![Key::parse(k).expect("default key")]);
+            }
+        }
+        map
     }
 }
 
@@ -269,16 +281,35 @@ mod tests {
     #[test]
     fn disjoint_scopes_may_share_a_key() {
         Keymap::with_overrides(vec![
-            (Name::Add, vec![k("x")]),
-            (Name::Remove, vec![k("x")]),
+            (Name::Add, vec![k("w")]),
+            (Name::Remove, vec![k("w")]),
         ])
         .unwrap();
     }
 
+    #[cfg(not(feature = "scripts"))]
     #[test]
-    fn scripts_names_do_nothing_yet() {
+    fn x_and_5_do_nothing_without_the_feature() {
         assert_eq!(Name::Scripts.action(), None);
         assert_eq!(Name::ViewScripts.action(), None);
-        assert!(Keymap::default().keys(Name::Scripts).is_empty());
+        let m = Keymap::default();
+        assert!(m.keys(Name::Scripts).is_empty());
+        assert_eq!(m.lookup(View::Queue, k("x")), None);
+        assert_eq!(m.lookup(View::Queue, k("5")), None);
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn feature_defaults() {
+        let m = Keymap::default();
+        m.check().unwrap();
+        for v in View::ALL {
+            assert_eq!(m.lookup(v, k("x")), Some(Action::Prefix), "{v:?}");
+            assert_eq!(
+                m.lookup(v, k("5")),
+                Some(Action::Show(View::Scripts)),
+                "{v:?}"
+            );
+        }
     }
 }

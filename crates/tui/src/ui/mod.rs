@@ -35,6 +35,7 @@ pub fn draw(app: &App, f: &mut Frame) {
         View::Directories => columns::draw(&app.dirs, &app.filters[1], f, inner),
         View::Artists => columns::draw(&app.artists, &app.filters[2], f, inner),
         View::Search => search::draw(app, f, inner),
+        View::Scripts => {}
     }
     footer::draw(app, f, foot);
     if app.help {
@@ -48,6 +49,7 @@ fn label(view: View) -> &'static str {
         View::Directories => "Directories",
         View::Artists => "Artists",
         View::Search => "Search",
+        View::Scripts => "Scripts",
     }
 }
 

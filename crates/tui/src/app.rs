@@ -9,6 +9,7 @@ use lossless_proto::{
 };
 
 use crate::clock::Clock;
+use crate::config::Script;
 use crate::conn::{Msg, Resync};
 use crate::filter::{Filter, Ranker};
 pub use crate::keys::View;
@@ -87,6 +88,14 @@ pub struct Search {
     pub offset: usize,
 }
 
+/// The Scripts view's rows (the scripts from `tui.ron`).
+#[derive(Clone, Debug, Default)]
+pub struct ScriptList {
+    pub items: Vec<Script>,
+    pub selected: usize,
+    pub offset: usize,
+}
+
 pub struct App {
     pub keymap: Keymap,
     pub profiles: Vec<Profile>,
@@ -102,12 +111,17 @@ pub struct App {
     pub dirs: Columns<Entry>,
     pub artists: Columns<Entry>,
     pub search: Search,
+    pub scripts: ScriptList,
+    /// `scripts` was pressed: the next key picks a script.
+    pub prefix: bool,
+    /// Output lines a script's modal keeps (`script_lines`).
+    pub script_lines: usize,
     pub library: Local,
     /// The daemon's music folder (`get music_dir`), for absolute paths.
     pub music_dir: Option<String>,
     /// One per view, by `View::index()`; each view's `selected` and
     /// `offset` are positions in its filtered list.
-    pub filters: [Filter; 4],
+    pub filters: [Filter; 5],
     ranker: Ranker,
     pub footer: Option<String>,
     pub connected: bool,
@@ -141,6 +155,9 @@ impl App {
             dirs: Columns::default(),
             artists: Columns::default(),
             search: Search::default(),
+            scripts: ScriptList::default(),
+            prefix: false,
+            script_lines: 200,
             library: Local::default(),
             music_dir: None,
             filters: Default::default(),
@@ -232,11 +249,19 @@ impl App {
     /// selection would leave it, and clamps it after a shrink or resize.
     pub fn follow(&mut self) {
         let page = self.page.max(1);
-        let [q, d, a, s] = View::ALL.map(|v| self.visible(v));
+        let [q, d, a, s, x] = [
+            View::Queue,
+            View::Directories,
+            View::Artists,
+            View::Search,
+            View::Scripts,
+        ]
+        .map(|v| self.visible(v));
         scroll(&mut self.queue_offset, self.queue_selected, q, page);
         scroll(&mut self.dirs.offset, self.dirs.selected, d, page);
         scroll(&mut self.artists.offset, self.artists.selected, a, page);
         scroll(&mut self.search.offset, self.search.selected, s, page);
+        scroll(&mut self.scripts.offset, self.scripts.selected, x, page);
     }
 
     fn columns(&mut self, view: View) -> &mut Columns<Entry> {
@@ -260,6 +285,7 @@ impl App {
             View::Directories => self.dirs.items.len(),
             View::Artists => self.artists.items.len(),
             View::Search => self.library.tracks.len(),
+            View::Scripts => self.scripts.items.len(),
         }
     }
 
@@ -273,6 +299,7 @@ impl App {
             View::Directories => self.dirs.selected,
             View::Artists => self.artists.selected,
             View::Search => self.search.selected,
+            View::Scripts => self.scripts.selected,
         }
     }
 
@@ -292,6 +319,7 @@ impl App {
             View::Directories => &mut self.dirs.selected,
             View::Artists => &mut self.artists.selected,
             View::Search => &mut self.search.selected,
+            View::Scripts => &mut self.scripts.selected,
         };
         (sel, len)
     }
@@ -313,6 +341,7 @@ impl App {
             View::Directories => r.rank(q, self.dirs.items.iter().map(name)),
             View::Artists => r.rank(q, self.artists.items.iter().map(name)),
             View::Search => r.rank(q, self.library.tracks.iter().map(describe)),
+            View::Scripts => r.rank(q, self.scripts.items.iter().map(|s| s.name.as_str())),
         });
     }
 
@@ -410,8 +439,8 @@ impl App {
             Left => self.left(),
             Right => self.right(),
             Show(v) => self.show(v),
-            NextView => self.show(View::ALL[(self.view.index() + 1) % 4]),
-            PrevView => self.show(View::ALL[(self.view.index() + 3) % 4]),
+            NextView => self.cycle(1),
+            PrevView => self.cycle(View::ALL.len() - 1),
             Enter if self.view == View::Queue => {
                 self.on_queue(|i| Command::Play { index: Some(i) })
             }
@@ -474,7 +503,17 @@ impl App {
                 vec![]
             }
             Cancel | ClearFilter => self.clear_filter(),
+            Prefix => {
+                self.prefix = true;
+                vec![]
+            }
         }
+    }
+
+    fn cycle(&mut self, by: usize) -> Vec<Out> {
+        let n = View::ALL.len();
+        let at = View::ALL.iter().position(|v| *v == self.view).unwrap_or(0);
+        self.show(View::ALL[(at + by) % n])
     }
 
     fn show(&mut self, view: View) -> Vec<Out> {
@@ -1389,6 +1428,7 @@ mod tests {
         assert_eq!(app.queue_selected, 1);
     }
 
+    #[cfg(not(feature = "scripts"))]
     #[test]
     fn views_switch_by_number_and_tab() {
         let mut app = app();
@@ -1988,6 +2028,21 @@ mod tests {
         assert_eq!(app.music_dir.as_deref(), Some("/n"));
     }
 
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn tab_cycles_five_views() {
+        let mut app = app();
+        let mut seen = vec![app.view];
+        for _ in 0..5 {
+            run(&mut app, press(KeyCode::Tab));
+            seen.push(app.view);
+        }
+        assert_eq!(seen[4], View::Scripts);
+        assert_eq!(seen[5], View::Queue);
+        run(&mut app, press(KeyCode::BackTab));
+        assert_eq!(app.view, View::Scripts);
+    }
+
     #[test]
     fn switching_drops_the_old_daemons_replies() {
         let mut app = app();
@@ -2278,14 +2333,14 @@ mod tests {
 
         let mut app = filtered_queue();
         app.keymap =
-            Keymap::with_overrides(vec![(Name::ClearFilter, vec![Key::parse("x").unwrap()])])
+            Keymap::with_overrides(vec![(Name::ClearFilter, vec![Key::parse("w").unwrap()])])
                 .unwrap();
         typed(&mut app, "abba");
         run(&mut app, press(KeyCode::Enter));
         run(&mut app, ch('J'));
         assert_eq!(
             app.footer.as_deref(),
-            Some("clear the filter (x) to move entries")
+            Some("clear the filter (w) to move entries")
         );
         app.keymap = Keymap::with_overrides(vec![(Name::ClearFilter, vec![])]).unwrap();
         run(&mut app, ch('J'));
