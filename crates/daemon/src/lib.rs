@@ -33,6 +33,8 @@ pub use config::{
 };
 pub use error::RequestError;
 pub use logger::init_logging;
+#[cfg(feature = "mpris")]
+pub use mpris::Mpris;
 
 /// Bind the socket, owner-only. An existing path is replaced only if it is
 /// itself a stale socket: never a live daemon, a symlink or any other file.
@@ -169,10 +171,15 @@ fn saved(snap: &Snapshot) -> state::Saved {
 /// save the state once per batch of queued events if any changes it (before
 /// broadcasting, so a client that saw the event can rely on the file). The stream ends only when the
 /// player thread is gone, so `on_player_gone` runs.
+/// Told about every batch of player events, after it is saved and before
+/// clients hear of it.
+type Observer = Box<dyn FnMut(&[Event]) + Send>;
+
 fn fan_out(
     events: Receiver<Event>,
     mut save: impl FnMut(),
     subscribers: Subscribers,
+    mut observe: Option<Observer>,
     on_player_gone: Box<dyn FnOnce() + Send>,
 ) {
     while let Ok(first) = events.recv() {
@@ -187,6 +194,9 @@ fn fan_out(
             )
         }) {
             save();
+        }
+        if let Some(o) = &mut observe {
+            o(&batch);
         }
         for event in batch {
             broadcast(&subscribers, event);
@@ -483,6 +493,7 @@ pub fn run(
     if cfg.mpris {
         info!("mpris: not built in; ignoring the mpris setting");
     }
+    #[cfg(not(feature = "mpris"))]
     let _ = profile;
     let dir = state.parent().unwrap_or(Path::new("/"));
     state::prepare(&state)
@@ -496,6 +507,17 @@ pub fn run(
         eprintln!("losslessd: player thread died; exiting");
         std::process::exit(70);
     });
+    #[cfg(feature = "mpris")]
+    let daemon = if cfg.mpris {
+        let mpris = Mpris {
+            profile: profile.clone(),
+            address: None,
+        };
+        Daemon::start_with_mpris(player, events, cfg.music_dir, state, on_player_gone, mpris)?
+    } else {
+        Daemon::start(player, events, cfg.music_dir, state, on_player_gone)?
+    };
+    #[cfg(not(feature = "mpris"))]
     let daemon = Daemon::start(player, events, cfg.music_dir, state, on_player_gone)?;
     if let Err(e) = daemon.rescan() {
         warn!("library: {e}");
@@ -596,6 +618,61 @@ impl Daemon {
         state_file: PathBuf,
         on_player_gone: Box<dyn FnOnce() + Send>,
     ) -> Result<Self> {
+        Self::launch(
+            player,
+            events,
+            music_dir,
+            state_file,
+            on_player_gone,
+            |_| None,
+        )
+    }
+
+    /// `start`, also serving MPRIS on the bus `mpris` names. Without a bus,
+    /// or with the name taken, the daemon runs without it.
+    #[cfg(feature = "mpris")]
+    pub fn start_with_mpris(
+        player: Player,
+        events: Receiver<Event>,
+        music_dir: Option<PathBuf>,
+        state_file: PathBuf,
+        on_player_gone: Box<dyn FnOnce() + Send>,
+        mpris: Mpris,
+    ) -> Result<Self> {
+        Self::launch(
+            player,
+            events,
+            music_dir,
+            state_file,
+            on_player_gone,
+            |weak| {
+                let bus = match mpris::Bus::connect(&mpris, weak.clone()) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!("mpris: {e}; running without it");
+                        return None;
+                    }
+                };
+                let weak = weak.clone();
+                let mut seen = mpris::Seen::default();
+                Some(Box::new(move |batch: &[Event]| {
+                    let changes = mpris::changes(&mut seen, batch);
+                    if let (false, Some(d)) = (changes.is_empty(), weak.upgrade()) {
+                        bus.emit(&changes, &d.player.snapshot());
+                    }
+                }))
+            },
+        )
+    }
+
+    fn launch(
+        player: Player,
+        events: Receiver<Event>,
+        music_dir: Option<PathBuf>,
+        state_file: PathBuf,
+        on_player_gone: Box<dyn FnOnce() + Send>,
+        observer: impl FnOnce(&Weak<State>) -> Option<Observer>,
+    ) -> Result<Self> {
         restore(&player, &state_file)?;
         let subscribers = Arc::new(Mutex::new(Vec::new()));
         let state = Arc::new(State {
@@ -607,6 +684,7 @@ impl Daemon {
             scanning: Arc::new(AtomicBool::new(false)),
         });
         let weak = Arc::downgrade(&state);
+        let observe = observer(&weak);
         thread::Builder::new()
             .name("events".into())
             .spawn(move || {
@@ -614,6 +692,7 @@ impl Daemon {
                     events,
                     move || save_state(&weak),
                     subscribers,
+                    observe,
                     on_player_gone,
                 )
             })?;
@@ -932,7 +1011,7 @@ mod tests {
         drop(player);
         let mut saves = 0;
         let subs = Arc::new(Mutex::new(Vec::new()));
-        super::fan_out(events, || saves += 1, subs, Box::new(|| {}));
+        super::fan_out(events, || saves += 1, subs, None, Box::new(|| {}));
         saves
     }
 
