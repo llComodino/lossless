@@ -12,7 +12,7 @@ use crate::clock::Clock;
 use crate::conn::{Msg, Resync};
 use crate::filter::{Filter, Ranker};
 pub use crate::keys::View;
-use crate::keys::{self, Action, Keymap};
+use crate::keys::{self, Action, Keymap, Name};
 use crate::local::{Delta, Local};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -173,7 +173,10 @@ impl App {
         self.reset(generation);
         self.connected = false;
         self.footer = Some(match self.profiles.get(self.profile) {
-            Some(p) if self.switchable => format!("{}: not running (o to switch)", p.name()),
+            Some(p) if self.switchable => match self.keymap.bound(Name::SwitchProfile) {
+                Some(k) => format!("{}: not running ({k} to switch)", p.name()),
+                None => format!("{}: not running", p.name()),
+            },
             _ => DISCONNECTED.into(),
         });
     }
@@ -490,7 +493,10 @@ impl App {
 
     fn shift(&mut self, down: bool) -> Vec<Out> {
         if self.filters[View::Queue.index()].hits.is_some() {
-            self.footer = Some("clear the filter (Esc) to move entries".into());
+            self.footer = Some(match self.keymap.bound(Name::ClearFilter) {
+                Some(k) => format!("clear the filter ({k}) to move entries"),
+                None => "clear the filter to move entries".into(),
+            });
             return vec![];
         }
         let from = self.queue_selected;
@@ -2182,6 +2188,39 @@ mod tests {
     }
 
     #[test]
+    fn footer_hints_follow_the_keymap() {
+        use crate::keys::{Key, Name};
+        let mut app = app();
+        app.keymap =
+            Keymap::with_overrides(vec![(Name::SwitchProfile, vec![Key::parse("O").unwrap()])])
+                .unwrap();
+        app.profile = 1;
+        app.connect_failed(2);
+        assert_eq!(app.footer.as_deref(), Some("pw: not running (O to switch)"));
+        app.keymap = Keymap::with_overrides(vec![(Name::SwitchProfile, vec![])]).unwrap();
+        app.connect_failed(3);
+        assert_eq!(app.footer.as_deref(), Some("pw: not running"));
+
+        let mut app = filtered_queue();
+        app.keymap =
+            Keymap::with_overrides(vec![(Name::ClearFilter, vec![Key::parse("x").unwrap()])])
+                .unwrap();
+        typed(&mut app, "abba");
+        run(&mut app, press(KeyCode::Enter));
+        run(&mut app, ch('J'));
+        assert_eq!(
+            app.footer.as_deref(),
+            Some("clear the filter (x) to move entries")
+        );
+        app.keymap = Keymap::with_overrides(vec![(Name::ClearFilter, vec![])]).unwrap();
+        run(&mut app, ch('J'));
+        assert_eq!(
+            app.footer.as_deref(),
+            Some("clear the filter to move entries")
+        );
+    }
+
+    #[test]
     fn move_is_refused_while_filtered() {
         let mut app = filtered_queue();
         typed(&mut app, "abba");
@@ -2190,7 +2229,7 @@ mod tests {
             assert_eq!(run(&mut app, ch(k)), []);
             assert_eq!(
                 app.footer.as_deref(),
-                Some("clear the filter (Esc) to move entries")
+                Some("clear the filter (esc) to move entries")
             );
         }
     }
@@ -2455,7 +2494,7 @@ mod tests {
             footer_of(&app)
         );
         run(&mut app, ch('J'));
-        assert!(footer_of(&app).starts_with("clear the filter (Esc) to move entries"));
+        assert!(footer_of(&app).starts_with("clear the filter (esc) to move entries"));
         app.view = View::Search;
         assert!(!footer_of(&app).contains("/ wt"));
         app.view = View::Queue;

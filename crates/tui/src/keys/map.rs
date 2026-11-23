@@ -206,6 +206,12 @@ impl Keymap {
     pub fn keys(&self, name: Name) -> &[Key] {
         self.keys.get(&name).map_or(&[], Vec::as_slice)
     }
+
+    /// The action's keys, space-separated; `None` when unbound.
+    pub fn bound(&self, name: Name) -> Option<String> {
+        let ks: Vec<String> = self.keys(name).iter().map(ToString::to_string).collect();
+        (!ks.is_empty()).then(|| ks.join(" "))
+    }
 }
 
 #[cfg(test)]
