@@ -70,6 +70,9 @@ First development version, not yet tagged.
   clears; moving queue entries is off while filtered); the UI keeps a local
   library copy patched from the deltas.
 - `losslessd-tui`: Gruber Darker colors on a `#181818` background.
+- `losslessd-tui`: every key is configurable in
+  `$XDG_CONFIG_HOME/lossless/tui.ron`; defaults unchanged, `?` shows the
+  keys in effect.
 
 ### Fixed
 
