@@ -83,10 +83,14 @@ pub(super) fn selection_file(run: &Run) -> io::Result<PathBuf> {
         .create_new(true)
         .mode(0o600)
         .open(&path)?;
-    for p in &run.selection {
-        writeln!(f, "{p}")?;
+    let text: String = run.selection.iter().map(|p| format!("{p}\n")).collect();
+    match f.write_all(text.as_bytes()) {
+        Ok(()) => Ok(path),
+        Err(e) => {
+            let _ = std::fs::remove_file(&path);
+            Err(e)
+        }
     }
-    Ok(path)
 }
 
 pub fn start(run: &Run, cap: usize, tx: Sender<Msg>) -> io::Result<Job> {
