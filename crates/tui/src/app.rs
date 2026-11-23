@@ -12,7 +12,7 @@ use crate::clock::Clock;
 use crate::conn::{Msg, Resync};
 use crate::filter::{Filter, Ranker};
 pub use crate::keys::View;
-use crate::keys::{self, Action};
+use crate::keys::{self, Action, Keymap};
 use crate::local::{Delta, Local};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,6 +87,7 @@ pub struct Search {
 }
 
 pub struct App {
+    pub keymap: Keymap,
     pub profiles: Vec<Profile>,
     pub profile: usize,
     pub switchable: bool,
@@ -121,8 +122,9 @@ fn stopped() -> Clock {
 }
 
 impl App {
-    pub fn new(profiles: Vec<Profile>, start: usize, switchable: bool) -> App {
+    pub fn new(profiles: Vec<Profile>, start: usize, switchable: bool, keymap: Keymap) -> App {
         App {
+            keymap,
             profiles,
             profile: start,
             switchable,
@@ -375,7 +377,7 @@ impl App {
             return vec![];
         }
         let editing = self.connected && self.filters[self.view.index()].editing;
-        let action = keys::action(self.view, key, editing);
+        let action = keys::action(&self.keymap, self.view, key, editing);
         if !self.connected {
             return match action {
                 Some(Action::Quit) => self.act(Action::Quit, now),
@@ -996,7 +998,12 @@ mod tests {
     }
 
     fn app() -> App {
-        let mut app = App::new(profiles(&["default", "pw", "usb"]), 0, true);
+        let mut app = App::new(
+            profiles(&["default", "pw", "usb"]),
+            0,
+            true,
+            Keymap::default(),
+        );
         app.generation = 1;
         app.connected = true;
         app.status = Some(status(Some(1), Some(50)));
@@ -1897,7 +1904,7 @@ mod tests {
         run(&mut app, ch('/'));
         assert_eq!(run(&mut app, ch('o')), []);
         assert_eq!(app.profile, 0);
-        let mut app = App::new(profiles(&["default"]), 0, false);
+        let mut app = App::new(profiles(&["default"]), 0, false, Keymap::default());
         app.connected = true;
         assert_eq!(run(&mut app, ch('o')), []);
         assert_eq!(app.footer.as_deref(), Some("--socket given: no profiles"));
@@ -2082,7 +2089,7 @@ mod tests {
         app.connect_failed(3);
         assert_eq!(run(&mut app, ch('o')), [Out::Switch]);
         assert_eq!(app.profile, 2);
-        let mut app = App::new(profiles(&["default"]), 0, false);
+        let mut app = App::new(profiles(&["default"]), 0, false, Keymap::default());
         app.connect_failed(2);
         assert_eq!(
             app.footer.as_deref(),

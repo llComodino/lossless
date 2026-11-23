@@ -1,5 +1,8 @@
-#[cfg_attr(not(test), expect(dead_code, reason = "the key table uses it next"))]
 mod key;
+mod map;
+
+pub use key::Key;
+pub use map::{Keymap, Name};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
@@ -61,7 +64,7 @@ pub enum Action {
     ClearFilter,
 }
 
-pub fn action(view: View, key: KeyEvent, editing: bool) -> Option<Action> {
+pub fn action(map: &Keymap, view: View, key: KeyEvent, editing: bool) -> Option<Action> {
     use Action::*;
     use KeyCode::Char;
     if key.kind == KeyEventKind::Release {
@@ -84,46 +87,7 @@ pub fn action(view: View, key: KeyEvent, editing: bool) -> Option<Action> {
             _ => None,
         };
     }
-    let columns = matches!(view, View::Directories | View::Artists);
-    let queue = view == View::Queue;
-    Some(match key.code {
-        Char('d') if ctrl => HalfDown,
-        Char('u') if ctrl => HalfUp,
-        Char(_) if !plain => return None,
-        Char('j') => Down,
-        Char('k') => Up,
-        Char('g') => First,
-        Char('G') => Last,
-        Char('h') if columns => Left,
-        Char('l') if columns => Right,
-        Char(c @ '1'..='4') => Show(View::ALL[usize::from(c as u8 - b'1')]),
-        KeyCode::Tab => NextView,
-        KeyCode::BackTab => PrevView,
-        KeyCode::Enter => Enter,
-        KeyCode::Esc => ClearFilter,
-        Char('a') if !queue => Add,
-        Char('A') if !queue => AddNext,
-        Char('d') if queue => Remove,
-        Char('D') if queue => Clear,
-        Char('J') if queue => MoveDown,
-        Char('K') if queue => MoveUp,
-        Char('p' | ' ') => Toggle,
-        Char('s') => Stop,
-        Char('>') => Next,
-        Char('<') => Previous,
-        Char('f') => SeekForward,
-        Char('b') => SeekBack,
-        Char('r') => Repeat,
-        Char('z') => Random,
-        Char('+') => VolumeUp,
-        Char('-') => VolumeDown,
-        Char('/') => EditQuery,
-        Char('u') => Update,
-        Char('o') => SwitchProfile,
-        Char('?') => Help,
-        Char('q') => Quit,
-        _ => return None,
-    })
+    map.lookup(view, Key::from_event(&key)?)
 }
 
 #[cfg(test)]
@@ -190,7 +154,11 @@ mod tests {
             (View::Artists, key(KeyCode::Esc, none), Some(ClearFilter)),
         ];
         for (view, k, want) in rows {
-            assert_eq!(action(view, k, false), want, "{view:?} {k:?}");
+            assert_eq!(
+                action(&Keymap::default(), view, k, false),
+                want,
+                "{view:?} {k:?}"
+            );
         }
     }
 
@@ -216,7 +184,11 @@ mod tests {
         ];
         for view in View::ALL {
             for (k, want) in rows {
-                assert_eq!(action(view, k, true), want, "{view:?} {k:?}");
+                assert_eq!(
+                    action(&Keymap::default(), view, k, true),
+                    want,
+                    "{view:?} {k:?}"
+                );
             }
         }
     }
@@ -229,6 +201,6 @@ mod tests {
             KeyEventKind::Release,
             KeyEventState::NONE,
         );
-        assert_eq!(action(View::Queue, k, false), None);
+        assert_eq!(action(&Keymap::default(), View::Queue, k, false), None);
     }
 }

@@ -100,7 +100,12 @@ mod tests {
     }
 
     fn app(profile: &str, volume: Option<u8>) -> App {
-        let mut app = App::new(vec![Profile::parse(profile).unwrap()], 0, true);
+        let mut app = App::new(
+            vec![Profile::parse(profile).unwrap()],
+            0,
+            true,
+            crate::keys::Keymap::default(),
+        );
         app.connected = true;
         app.queue = vec![
             track("Kenshi Yonezu", "IRIS OUT"),

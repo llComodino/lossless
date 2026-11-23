@@ -146,7 +146,7 @@ fn main() -> ExitCode {
                 .unwrap_or_default()
         }
     };
-    let mut app = App::new(profiles, start, switchable);
+    let mut app = App::new(profiles, start, switchable, keys::Keymap::default());
     app.connected(conn.generation(), &resync);
     term::install_panic_hook();
     let guard = match term::Guard::new() {
