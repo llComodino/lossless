@@ -35,6 +35,7 @@ fn main() -> ExitCode {
         dirs.socket(&profile),
         dirs.state_path(&profile),
         level,
+        &profile,
     )
     .map_or_else(fatal, |()| ExitCode::SUCCESS)
 }

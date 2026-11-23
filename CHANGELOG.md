@@ -71,6 +71,9 @@ First development version, not yet tagged.
   library copy patched from the deltas.
 - `losslessd-tui`: Gruber Darker colors on a `#181818` background.
 - `get` reads a daemon setting (`music_dir`); `lossless get music_dir`.
+- `losslessd` (build feature `mpris`): an MPRIS player on the session bus
+  per daemon (`org.mpris.MediaPlayer2.lossless[.<profile>]`), with
+  `mpris = false` per profile.
 - `losslessd-tui`: every key is configurable in
   `$XDG_CONFIG_HOME/lossless/tui.ron`; defaults unchanged, `?` shows the
   keys in effect.

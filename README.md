@@ -75,7 +75,7 @@ is the only thing the playback path knows how to do.
 | Queue and position restored after restart | yes | paused where it was; vanished files dropped |
 | Terminal UI (`losslessd-tui`) | yes | queue, directories, artists, search; switches profiles |
 | Your own scripts in the TUI | optional | build feature `scripts` |
-| MPRIS (media keys, bars) | planned | |
+| MPRIS (media keys, bars) | optional | build feature `mpris` |
 | Other formats (ALAC, WAV, AIFF, Opus, Vorbis) | later | via symphonia |
 | DSD (DoP / native) | not yet | |
 | MPD protocol compatibility | no | own JSON protocol instead |
@@ -412,6 +412,46 @@ export XDG_RUNTIME_DIR /run/user/${UID}
 plus a `finish` script that sleeps a second or two, so a broken config
 can't respawn in a tight loop.
 
+### MPRIS
+
+Built with the `mpris` feature, each daemon is an MPRIS player on the
+session bus, so media keys, `playerctl` and bar widgets can drive it:
+
+```sh
+cargo build --release -p lossless-daemon --features mpris
+```
+
+Without the feature no D-Bus code is built in. With it, `mpris = false` in
+a profile's config keeps that daemon off the bus. Each daemon registers its
+own name: `org.mpris.MediaPlayer2.lossless` for the default profile,
+`org.mpris.MediaPlayer2.lossless.<profile>` for the others, with `-` turned
+into `_` and a `_` before a leading digit (so `a-b` and `a_b` collide, and
+the second runs without MPRIS). No bus or a taken name only costs MPRIS: the
+daemon logs a warning and keeps playing.
+
+Supported: play, pause, play-pause, stop, next, previous, seek and set
+position; playback status, position, loop (off/queue/one as
+None/Playlist/Track), shuffle, volume (the daemon's mixer; without one it
+reads 1.0 and can't be set), and metadata (title, artist, album, track
+number, length, `file://` URL), all with change signals. Not supported: the
+track list, playlists, cover art, OpenUri, Raise/Quit.
+
+playerctl treats `lossless.<profile>` as an instance of `lossless`, so
+`-p lossless` alone drives whichever lossless daemon it finds first. To
+bind keys per daemon, name the profile, and for the default one ignore the
+others:
+
+```sh
+playerctl -p lossless.pw play-pause                 # only the pw profile
+playerctl -p lossless -i lossless.pw play-pause     # only the default one
+playerctl -p lossless play-pause                    # any lossless daemon
+```
+
+`playerctld` instead follows the player you used last.
+
+Under a supervisor the run script must export the session bus, e.g.
+`export DBUS_SESSION_BUS_ADDRESS unix:path=/run/user/${UID}/bus`.
+
 ## Protocol
 
 Newline-delimited JSON over the unix socket. Each request carries an `id`
@@ -521,10 +561,6 @@ cargo reldeps      # what the release binaries link
 
 - Hardware test with digital silence only:
   `LOSSLESS_TEST_DEVICE=hw:CARD=<id>,DEV=0 cargo thw`.
-
-## Roadmap
-
-1. MPRIS bridge.
 
 ## License
 

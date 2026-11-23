@@ -12,12 +12,18 @@ use std::time::{Duration, Instant};
 
 use lossless_daemon::run;
 use lossless_engine::fixtures::{BLOCK, Dir, flac_at};
+use lossless_proto::profile::Profile;
 
+/// In-process daemons never register on the real session bus.
 fn write_config(dir: &Dir, text: &str) -> PathBuf {
     let p = dir.path("config.toml");
-    std::fs::write(&p, text).unwrap();
+    std::fs::write(&p, format!("{text}\nmpris = false\n")).unwrap();
     p
 }
+
+/// Nothing listens here: a daemon built with `mpris` must not reach the
+/// real session bus (zbus would fall back to /run/user/UID/bus).
+const NO_BUS: &str = "unix:path=/nonexistent/lossless-test-bus";
 
 /// Connect once `run` has bound the socket (it binds before serving).
 fn connect(socket: &Path) -> UnixStream {
@@ -56,7 +62,7 @@ fn run_serves_the_configured_socket_and_music() {
     );
     let unused = dir.path("default.sock");
     let state = dir.path("state.json");
-    thread::spawn(move || run(&cfg, unused, state, None));
+    thread::spawn(move || run(&cfg, unused, state, None, &Profile::default()));
     let c = connect(&sock);
     assert!(call(&c, r#"{"id":1,"cmd":"status"}"#).contains(r#""state":"stopped""#));
     assert!(call(&c, r#"{"id":2,"cmd":"add","paths":["a.flac"]}"#).contains("done"));
@@ -70,7 +76,7 @@ fn run_falls_back_to_the_default_socket() {
     let sock = dir.path("default.sock");
     let s = sock.clone();
     let state = dir.path("state.json");
-    thread::spawn(move || run(&cfg, s, state, None));
+    thread::spawn(move || run(&cfg, s, state, None, &Profile::default()));
     let c = connect(&sock);
     assert!(call(&c, r#"{"id":1,"cmd":"update"}"#).contains("no music_dir configured"));
 }
@@ -87,7 +93,15 @@ fn a_missing_mixer_card_runs_without_volume() {
         ),
     );
     let state = dir.path("state.json");
-    thread::spawn(move || run(&cfg, PathBuf::from("/nonexistent"), state, None));
+    thread::spawn(move || {
+        run(
+            &cfg,
+            PathBuf::from("/nonexistent"),
+            state,
+            None,
+            &Profile::default(),
+        )
+    });
     let c = connect(&sock);
     let reply = call(&c, r#"{"id":1,"cmd":"set_volume","percent":50}"#);
     assert!(reply.contains(r#""code":"no_mixer""#), "{reply}");
@@ -129,18 +143,39 @@ fn a_missing_mixer_card_is_logged() {
 fn run_stops_on_a_bad_config_or_socket() {
     let dir = Dir::new();
     let bad = write_config(&dir, "device = \"file:'|id'\"\n");
-    let err = run(&bad, dir.path("s.sock"), dir.path("state.json"), None).unwrap_err();
+    let err = run(
+        &bad,
+        dir.path("s.sock"),
+        dir.path("state.json"),
+        None,
+        &Profile::default(),
+    )
+    .unwrap_err();
     assert!(format!("{err:#}").contains("not allowed"), "{err:#}");
     assert!(!dir.path("s.sock").exists(), "bound before validating");
 
     let key = dir.path("key");
     std::fs::write(&key, "secret").unwrap();
     let ok = write_config(&dir, "device = \"null\"\n");
-    let err = run(&ok, key.clone(), dir.path("state.json"), None).unwrap_err();
+    let err = run(
+        &ok,
+        key.clone(),
+        dir.path("state.json"),
+        None,
+        &Profile::default(),
+    )
+    .unwrap_err();
     assert!(format!("{err:#}").contains("not a socket"), "{err:#}");
     assert_eq!(std::fs::read_to_string(&key).unwrap(), "secret");
 
-    let err = run(&ok, dir.path("s.sock"), key.join("state.json"), None).unwrap_err();
+    let err = run(
+        &ok,
+        dir.path("s.sock"),
+        key.join("state.json"),
+        None,
+        &Profile::default(),
+    )
+    .unwrap_err();
     let msg = format!("{err:#}");
     assert!(msg.starts_with("preparing state directory"), "{msg}");
     assert!(!dir.path("s.sock").exists(), "bound before the state check");
@@ -157,7 +192,14 @@ fn run_stops_on_a_read_only_state_dir() {
         return; // root ignores the mode
     }
     let cfg = write_config(&dir, "device = \"null\"\n");
-    let err = run(&cfg, dir.path("s.sock"), ro.join("state.json"), None).unwrap_err();
+    let err = run(
+        &cfg,
+        dir.path("s.sock"),
+        ro.join("state.json"),
+        None,
+        &Profile::default(),
+    )
+    .unwrap_err();
     let msg = format!("{err:#}");
     assert!(msg.starts_with("preparing state directory"), "{msg}");
     assert!(msg.contains("ermission denied"), "{msg}");
@@ -168,6 +210,7 @@ fn run_stops_on_a_read_only_state_dir() {
 fn losslessd(env: &[(&str, &Path)]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_losslessd"));
     cmd.env_remove("HOME")
+        .env("DBUS_SESSION_BUS_ADDRESS", NO_BUS)
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_RUNTIME_DIR")
         .env_remove("XDG_STATE_HOME");
@@ -227,6 +270,7 @@ fn spawn_with(dir: &Dir, args: &[&str]) -> std::process::Child {
 fn spawn_env(dir: &Dir, args: &[&str], env: &[(&str, &Path)]) -> std::process::Child {
     Command::new(env!("CARGO_BIN_EXE_losslessd"))
         .env_remove("HOME")
+        .env("DBUS_SESSION_BUS_ADDRESS", NO_BUS)
         .env("XDG_CONFIG_HOME", dir.path("xdg"))
         .env_remove("XDG_RUNTIME_DIR")
         .env_remove("XDG_STATE_HOME")
@@ -392,7 +436,7 @@ fn run_restores_modes_when_every_entry_is_gone() {
     )
     .unwrap();
     let unused = dir.path("default.sock");
-    thread::spawn(move || run(&cfg, unused, state, None));
+    thread::spawn(move || run(&cfg, unused, state, None, &Profile::default()));
     let c = connect(&sock);
     let st = call(&c, r#"{"id":1,"cmd":"status"}"#);
     assert!(st.contains(r#""repeat":"one""#), "{st}");
@@ -543,5 +587,100 @@ fn flags_in_any_order() {
         let err = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(2), "{args:?}: {err}");
         assert!(err.contains(USAGE), "{args:?}: {err}");
+    }
+}
+
+#[cfg(feature = "mpris")]
+mod mpris {
+    use super::*;
+
+    /// Killed and reaped on drop, so a failed assert leaves nothing running
+    /// (an orphan would also hold the test's output pipe open).
+    struct Reap(std::process::Child);
+
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// A private bus for one test; `None` without `dbus-daemon`.
+    fn private_bus(dir: &Dir) -> Option<(Reap, String)> {
+        let mut child = Command::new("dbus-daemon")
+            .args(["--session", "--nofork", "--print-address=1"])
+            .arg(format!("--address=unix:path={}", dir.path("bus").display()))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let mut line = String::new();
+        BufReader::new(child.stdout.take()?)
+            .read_line(&mut line)
+            .ok()?;
+        Some((Reap(child), line.trim().to_string()))
+    }
+
+    fn owned(address: &str, name: &str) -> bool {
+        let c = zbus::blocking::connection::Builder::address(address)
+            .unwrap()
+            .build()
+            .unwrap();
+        zbus::blocking::fdo::DBusProxy::new(&c)
+            .unwrap()
+            .name_has_owner(name.try_into().unwrap())
+            .unwrap()
+    }
+
+    fn daemon(dir: &Dir, address: &str, extra: &str) -> Reap {
+        std::fs::create_dir_all(dir.path("xdg/lossless")).unwrap();
+        std::fs::write(
+            dir.path("xdg/lossless/t1.toml"),
+            format!(
+                "device = \"null\"\nsocket = \"{}\"\n{extra}",
+                dir.path("s.sock").display()
+            ),
+        )
+        .unwrap();
+        Reap(spawn_env(
+            dir,
+            &["--profile", "t1"],
+            &[
+                ("XDG_STATE_HOME", &dir.path("state")),
+                ("DBUS_SESSION_BUS_ADDRESS", Path::new(address)),
+            ],
+        ))
+    }
+
+    const NAME: &str = "org.mpris.MediaPlayer2.lossless.t1";
+
+    #[test]
+    fn losslessd_registers_on_session_bus() {
+        let dir = Dir::new();
+        let Some((_bus, address)) = private_bus(&dir) else {
+            eprintln!("skipped: no dbus-daemon");
+            return;
+        };
+        let _child = daemon(&dir, &address, "");
+        let _ = connect(&dir.path("s.sock"));
+        let end = Instant::now() + Duration::from_secs(5);
+        while !owned(&address, NAME) {
+            assert!(Instant::now() < end, "{NAME} never registered");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn mpris_false_stays_off_the_bus() {
+        let dir = Dir::new();
+        let Some((_bus, address)) = private_bus(&dir) else {
+            eprintln!("skipped: no dbus-daemon");
+            return;
+        };
+        let _child = daemon(&dir, &address, "mpris = false\n");
+        let c = connect(&dir.path("s.sock"));
+        assert!(call(&c, r#"{"id":1,"cmd":"status"}"#).contains("status"));
+        thread::sleep(Duration::from_secs(1));
+        assert!(!owned(&address, NAME), "registered despite mpris = false");
     }
 }
