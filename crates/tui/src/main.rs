@@ -229,10 +229,6 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    #[cfg(feature = "scripts")]
-    for sig in [signal_hook::consts::SIGINT, signal_hook::consts::SIGQUIT] {
-        let _ = signal_hook::flag::register(sig, std::sync::Arc::default());
-    }
     let gate = input::spawn(tx.clone());
     let result = run(&mut app, &mut conn, &dirs, &rx, &tx, &gate, &mut terminal);
     drop(guard);
