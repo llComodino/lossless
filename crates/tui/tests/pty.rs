@@ -386,4 +386,18 @@ mod scripts {
             .expect("Esc and q never got through the script's output");
         assert!(code.success(), "{code:?}");
     }
+
+    #[test]
+    fn sigint_still_stops_an_idle_tui() {
+        let mut s = started();
+        let pid = s.child.0.process_id().expect("pid");
+        std::process::Command::new("kill")
+            .args(["-INT", &pid.to_string()])
+            .status()
+            .unwrap();
+        assert!(
+            exits_within(&mut s.child, &s.rx, Duration::from_secs(2)).is_some(),
+            "SIGINT ignored outside a Terminal script"
+        );
+    }
 }

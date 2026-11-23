@@ -319,6 +319,7 @@ an uppercase letter or a shifted symbol is that character.
 | `edit_query` `clear_filter` | `/` `esc` | all |
 | `update` `switch_profile` | `u` `o` | all |
 | `help` `quit` | `?` `q` | all |
+| `scripts` `view_scripts` | `x` `5` (only with the `scripts` feature) | all |
 
 Views are fixed per action; only keys change. One key may serve two
 actions only where their views don't overlap (`d` is `remove` in the queue

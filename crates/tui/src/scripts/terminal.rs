@@ -1,8 +1,10 @@
 use std::io::{self, Write};
 use std::process::Command;
+use std::sync::Arc;
 
 use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::terminal::enable_raw_mode;
+use signal_hook::consts::{SIGINT, SIGQUIT};
 
 use super::{Run, modal::selection_file, status_text};
 use crate::term;
@@ -11,6 +13,12 @@ use crate::term;
 /// screen until a key is pressed. The caller redraws afterwards.
 pub fn run(run: &Run) -> io::Result<()> {
     let selection = selection_file(run)?;
+    // Ctrl-C in cooked mode signals the whole foreground group: while the
+    // script runs, only it may die of that.
+    let guards: Vec<_> = [SIGINT, SIGQUIT]
+        .into_iter()
+        .filter_map(|s| signal_hook::flag::register(s, Arc::default()).ok())
+        .collect();
     term::suspend();
     let status = Command::new("sh")
         .arg("-c")
@@ -34,6 +42,9 @@ pub fn run(run: &Run) -> io::Result<()> {
         Ok(_) => Ok(()),
         Err(e) => Err(e),
     };
+    for g in guards {
+        signal_hook::low_level::unregister(g);
+    }
     term::resume()?;
     result
 }

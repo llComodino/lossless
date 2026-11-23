@@ -97,7 +97,6 @@ fn run(
                     apply(app, conn, r);
                 }
                 #[cfg(feature = "scripts")]
-                #[cfg(feature = "scripts")]
                 Out::Run(run) => match run.mode {
                     config::Mode::Modal => {
                         match scripts::modal::start(&run, app.script_lines, tx.clone()) {
@@ -118,6 +117,7 @@ fn run(
                             size.width,
                             size.height,
                         ))?;
+                        set_page(app, terminal);
                     }
                 },
                 #[cfg(feature = "scripts")]
@@ -133,7 +133,13 @@ fn run(
                     }
                 }
                 #[cfg(feature = "scripts")]
-                Out::Kill(id) => drop(job.take_if(|j| j.id == id)),
+                Out::Kill(id) => {
+                    if let Some(j) = job.take_if(|j| j.id == id)
+                        && let Err(e) = j.kill()
+                    {
+                        app.footer = Some(format!("error: kill: {e}"));
+                    }
+                }
             }
         }
         if app.quit {
@@ -224,10 +230,6 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    #[cfg(feature = "scripts")]
-    for sig in [signal_hook::consts::SIGINT, signal_hook::consts::SIGQUIT] {
-        let _ = signal_hook::flag::register(sig, std::sync::Arc::default());
-    }
     let gate = input::spawn(tx.clone());
     let result = run(&mut app, &mut conn, &dirs, &rx, &tx, &gate, &mut terminal);
     drop(guard);
