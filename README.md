@@ -363,7 +363,9 @@ while the daemon is down, since a script may be what starts it.
   line. `Enter` sends the line to its stdin, `Ctrl-d` closes stdin,
   `PgUp`/`PgDn` scroll, `Esc` kills it with everything it started. A script
   that exits 0 without printing closes the box by itself; otherwise the box
-  shows how it ended until you press a key.
+  shows how it ended until you press a key. Once a script has exited,
+  whatever it left running in the background is left alone (a daemon it
+  started keeps running).
 - `Terminal`: the UI steps aside and the script gets the whole terminal
   (for fzf, an editor, anything full-screen). Ctrl-C reaches the script,
   not the UI. On exit 0 the UI comes straight back; on failure it shows
@@ -377,7 +379,7 @@ Each script gets, besides your environment:
 | `LOSSLESS_PROFILE` | its profile; unset with `--socket` |
 | `LOSSLESS_MUSIC_DIR` | the daemon's `music_dir` (`get music_dir`); unset if none |
 | `LOSSLESS_CURRENT` | the current queue entry's path; unset if none |
-| `LOSSLESS_SELECTION` | a file (mode 0600, removed afterwards) with the selected tracks' absolute paths, one per line |
+| `LOSSLESS_SELECTION` | a file (mode 0600, removed when the script is done with) with the selected tracks' absolute paths, one per line |
 
 The selection is the row under the cursor in the view you ran the script
 from (from Scripts, the view before it): one track, or every track of a

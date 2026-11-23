@@ -262,6 +262,7 @@ mod scripts {
         (name: "term", command: "sleep 1; read x; echo \"got:$x\" > \"$XDG_RUNTIME_DIR/out\"", key: "t", mode: Terminal),
         (name: "fail", command: "echo oops; exit 3", key: "f", mode: Terminal),
         (name: "nap", command: "sleep 5", key: "c", mode: Terminal),
+        (name: "flood", command: "yes", key: "y", mode: Modal),
     ])"#;
 
     fn started() -> Session {
@@ -371,5 +372,18 @@ mod scripts {
         wait_for(&s.rx, &mut s.seen, "[killed by signal 2, press any key]");
         s.keys.write_all(b" ").unwrap();
         quits(&mut s);
+    }
+
+    #[test]
+    fn flooding_script_still_closes_on_esc() {
+        let mut s = started();
+        s.keys.write_all(b"xy").unwrap();
+        thread::sleep(Duration::from_millis(500));
+        s.keys.write_all(b"\x1b").unwrap();
+        thread::sleep(Duration::from_millis(300));
+        s.keys.write_all(b"q").unwrap();
+        let code = exits_within(&mut s.child, &s.rx, Duration::from_secs(2))
+            .expect("Esc and q never got through the script's output");
+        assert!(code.success(), "{code:?}");
     }
 }

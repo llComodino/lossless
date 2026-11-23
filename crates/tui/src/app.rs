@@ -713,13 +713,11 @@ impl App {
     }
 
     #[cfg(feature = "scripts")]
-    fn script_out(&mut self, id: u64, line: String) {
+    fn script_out(&mut self, id: u64, out: &crate::scripts::modal::Output) {
         if let Some(m) = self.modal.as_mut().filter(|m| m.id == id) {
-            m.any_output = true;
-            m.lines.push_back(line);
-            while m.lines.len() > self.script_lines.max(1) {
-                m.lines.pop_front();
-            }
+            let (lines, printed) = out.take();
+            m.lines = lines;
+            m.any_output |= printed;
         }
     }
 
@@ -1153,8 +1151,8 @@ pub fn update(app: &mut App, msg: Msg, now: Instant) -> Vec<Out> {
         Msg::Server(_, ServerMessage::Reply { id, result }) => app.reply(id, result, now),
         Msg::Server(_, ServerMessage::Event { event }) => app.event(event, now),
         #[cfg(feature = "scripts")]
-        Msg::ScriptOut(id, line) => {
-            app.script_out(id, line);
+        Msg::ScriptOut(id, out) => {
+            app.script_out(id, &out);
             vec![]
         }
         #[cfg(feature = "scripts")]
@@ -2422,17 +2420,25 @@ mod tests {
     }
 
     #[cfg(feature = "scripts")]
-    #[test]
-    fn lines_capped_at_script_lines() {
-        let (mut app, id) = modal_open();
-        app.script_lines = 200;
-        for i in 0..250 {
-            run(&mut app, Msg::ScriptOut(id, format!("l{i}")));
+    fn printed(lines: &[&str]) -> std::sync::Arc<crate::scripts::modal::Output> {
+        let out = crate::scripts::modal::Output::new(200);
+        for l in lines {
+            out.push((*l).to_string());
         }
+        std::sync::Arc::new(out)
+    }
+
+    #[cfg(feature = "scripts")]
+    #[test]
+    fn output_replaces_the_modal_lines() {
+        let (mut app, id) = modal_open();
+        let out = printed(&["a", "b"]);
+        run(&mut app, Msg::ScriptOut(id, out.clone()));
+        out.push("c".into());
+        run(&mut app, Msg::ScriptOut(id, out));
         let m = app.modal.as_ref().unwrap();
-        assert_eq!(m.lines.len(), 200);
-        assert_eq!(m.lines.front().map(String::as_str), Some("l50"));
-        assert_eq!(m.lines.back().map(String::as_str), Some("l249"));
+        assert_eq!(m.lines, ["a", "b", "c"]);
+        assert!(m.any_output);
     }
 
     #[cfg(feature = "scripts")]
@@ -2447,7 +2453,7 @@ mod tests {
     #[test]
     fn output_then_success_stays_open_with_exited_0() {
         let (mut app, id) = modal_open();
-        run(&mut app, Msg::ScriptOut(id, "hi".into()));
+        run(&mut app, Msg::ScriptOut(id, printed(&["hi"])));
         assert_eq!(run(&mut app, Msg::ScriptExit(id, exit(0))), []);
         assert_eq!(
             app.modal.as_ref().unwrap().done.as_deref(),
@@ -2513,7 +2519,7 @@ mod tests {
     #[test]
     fn stale_job_messages_ignored() {
         let (mut app, id) = modal_open();
-        run(&mut app, Msg::ScriptOut(id + 100, "old".into()));
+        run(&mut app, Msg::ScriptOut(id + 100, printed(&["old"])));
         assert!(app.modal.as_ref().unwrap().lines.is_empty());
         assert_eq!(run(&mut app, Msg::ScriptExit(id + 100, exit(0))), []);
         assert!(app.modal.is_some());

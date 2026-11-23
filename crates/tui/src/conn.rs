@@ -13,9 +13,9 @@ pub enum Msg {
     Key(crossterm::event::KeyEvent),
     Resize,
     Tick,
-    /// A line a modal script printed.
+    /// A modal script printed more.
     #[cfg(feature = "scripts")]
-    ScriptOut(u64, String),
+    ScriptOut(u64, std::sync::Arc<crate::scripts::modal::Output>),
     #[cfg(feature = "scripts")]
     ScriptExit(u64, std::process::ExitStatus),
 }

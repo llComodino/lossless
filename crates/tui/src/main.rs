@@ -99,14 +99,12 @@ fn run(
                 #[cfg(feature = "scripts")]
                 #[cfg(feature = "scripts")]
                 Out::Run(run) => match run.mode {
-                    config::Mode::Modal => match scripts::modal::start(&run, tx.clone()) {
-                        Ok(j) => {
-                            if let Some(old) = job.replace(j) {
-                                old.kill();
-                            }
+                    config::Mode::Modal => {
+                        match scripts::modal::start(&run, app.script_lines, tx.clone()) {
+                            Ok(j) => drop(job.replace(j)),
+                            Err(e) => app.script_failed(run.id, &e.to_string()),
                         }
-                        Err(e) => app.script_failed(run.id, &e.to_string()),
-                    },
+                    }
                     config::Mode::Terminal => {
                         if let Err(e) = scripts::terminal::run(&run) {
                             app.footer = Some(format!("error: {}: {e}", run.name));
@@ -135,11 +133,7 @@ fn run(
                     }
                 }
                 #[cfg(feature = "scripts")]
-                Out::Kill(id) => {
-                    if let Some(j) = job.take_if(|j| j.id == id) {
-                        j.kill();
-                    }
-                }
+                Out::Kill(id) => drop(job.take_if(|j| j.id == id)),
             }
         }
         if app.quit {
