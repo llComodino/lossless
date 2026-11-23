@@ -1,6 +1,8 @@
 # Scoped test runs: extra arguments are appended, so a module path narrows
 # further, e.g. `cargo te player::`, `cargo te source::tests::seek`.
 [alias]
+tm = "test -p lossless-daemon --features mpris"
+cm = "clippy --workspace --all-targets --features lossless-daemon/mpris"
 ts = "test -p lossless-tui --features scripts"
 cs = "clippy --workspace --all-targets --features lossless-tui/scripts"
 t = "test --workspace"

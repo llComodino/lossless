@@ -22,6 +22,8 @@ use lossless_proto::{
 mod config;
 mod error;
 mod logger;
+#[cfg(feature = "mpris")]
+mod mpris;
 pub mod state;
 
 use config::expand_tilde;

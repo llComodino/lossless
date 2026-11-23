@@ -14,7 +14,11 @@ path = "src/lib.rs"
 name = "losslessd"
 path = "src/main.rs"
 
+[features]
+mpris = ["dep:zbus"]
+
 [dependencies]
+zbus = { version = "5.19", default-features = false, features = ["async-io", "blocking-api"], optional = true }
 lossless-proto.workspace = true
 lossless-engine.workspace = true
 lossless-library.workspace = true
