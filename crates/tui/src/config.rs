@@ -10,7 +10,7 @@ use crate::keys::{Key, Keymap, Name};
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct File {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "unique_keys")]
     keys: HashMap<Name, Vec<Key>>,
     #[serde(default)]
     scripts: Vec<Script>,
@@ -26,6 +26,37 @@ impl Default for File {
             script_lines: script_lines(),
         }
     }
+}
+
+/// The `keys` map, refusing an action listed twice (RON keeps the last).
+fn unique_keys<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<HashMap<Name, Vec<Key>>, D::Error> {
+    struct Unique;
+    impl<'de> serde::de::Visitor<'de> for Unique {
+        type Value = HashMap<Name, Vec<Key>>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a map of action names to key lists")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut m: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut keys = HashMap::new();
+            while let Some((name, list)) = m.next_entry::<Name, Vec<Key>>()? {
+                if keys.insert(name, list).is_some() {
+                    return Err(serde::de::Error::custom(format!(
+                        "action {:?} twice",
+                        name.as_str()
+                    )));
+                }
+            }
+            Ok(keys)
+        }
+    }
+    d.deserialize_map(Unique)
 }
 
 fn script_lines() -> usize {
@@ -251,6 +282,16 @@ mod tests {
         ))
         .unwrap_err();
         assert!(e.contains("tui.ron:1:"), "{e}");
+    }
+
+    #[test]
+    fn duplicate_action_is_an_error() {
+        let dir = Dir::new();
+        let e = load(&file(&dir, r#"(keys: {"quit": ["Q"], "quit": ["w"]})"#)).unwrap_err();
+        assert!(
+            e.contains("tui.ron:1:") && e.contains("\"quit\" twice"),
+            "{e}"
+        );
     }
 
     #[test]
