@@ -117,7 +117,7 @@ mod tests {
     use std::cell::RefCell;
     use std::sync::Arc;
     use std::sync::mpsc::{self, Receiver, Sender};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use lossless_daemon::{Daemon, bind};
     use lossless_engine::Player;
@@ -136,7 +136,18 @@ mod tests {
     impl Server {
         fn launch(dir: &Dir) -> Arc<Daemon> {
             std::fs::create_dir_all(dir.path("music")).unwrap();
-            let listener = bind(&dir.path("sock")).unwrap();
+            // A daemon just shut down may hold its listener a moment longer.
+            let end = Instant::now() + Duration::from_secs(5);
+            let listener = loop {
+                match bind(&dir.path("sock")) {
+                    Ok(l) => break l,
+                    Err(e) if Instant::now() < end => {
+                        assert!(e.to_string().contains("another daemon"), "{e}");
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+            };
             let (player, events) = Player::spawn_with_mixer(PacedSink::default(), None);
             let daemon = Arc::new(
                 Daemon::start(
