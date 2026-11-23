@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::Run;
 use super::sanitize::{MAX_CHARS, sanitize};
@@ -24,7 +24,9 @@ const DRAIN: Duration = Duration::from_millis(100);
 pub struct Job {
     pub id: u64,
     pub pgid: u32,
-    stdin: Option<ChildStdin>,
+    /// Lines for a writer thread, so a script that stops reading never
+    /// blocks the UI; dropping it closes the script's stdin.
+    stdin: Option<Sender<String>>,
     selection: PathBuf,
     /// `sh` has been reaped: its group number may belong to someone else.
     exited: Arc<AtomicBool>,
@@ -121,15 +123,19 @@ pub fn start(run: &Run, cap: usize, tx: Sender<Msg>) -> io::Result<Job> {
         });
     }
     drop(done_tx);
-    let stdin = child.stdin.take();
+    let stdin = child.stdin.take().map(writer);
     let pgid = child.id();
     let exited = Arc::new(AtomicBool::new(false));
     let reaped = Arc::clone(&exited);
     thread::spawn(move || {
         let status = child.wait();
         reaped.store(true, Ordering::Release);
+        let end = Instant::now() + DRAIN;
         for _ in 0..2 {
-            if done_rx.recv_timeout(DRAIN).is_err() {
+            if done_rx
+                .recv_timeout(end.saturating_duration_since(Instant::now()))
+                .is_err()
+            {
                 break;
             }
         }
@@ -144,6 +150,18 @@ pub fn start(run: &Run, cap: usize, tx: Sender<Msg>) -> io::Result<Job> {
         selection,
         exited,
     })
+}
+
+fn writer(mut stdin: ChildStdin) -> Sender<String> {
+    let (tx, rx) = channel::<String>();
+    thread::spawn(move || {
+        for line in rx {
+            if writeln!(stdin, "{line}").is_err() {
+                break;
+            }
+        }
+    });
+    tx
 }
 
 /// Keeps each line as it ends; a line longer than a modal shows is cut.
@@ -180,8 +198,8 @@ fn read_lines(mut r: impl Read, id: u64, out: &Arc<Output>, tx: &Sender<Msg>) {
 impl Job {
     /// A line of input; a script that stopped reading just misses it.
     pub fn send_line(&mut self, line: &str) {
-        if let Some(stdin) = &mut self.stdin
-            && writeln!(stdin, "{line}").is_err()
+        if let Some(stdin) = &self.stdin
+            && stdin.send(line.to_string()).is_err()
         {
             self.stdin = None;
         }
@@ -194,22 +212,27 @@ impl Job {
     /// While `sh` runs, kills its whole process group, so a pipeline dies
     /// with it. Once it has exited, whatever it left in the background stays
     /// (a daemon it started, say). std has no killpg, hence `kill`.
-    pub fn kill(&self) {
+    pub fn kill(&self) -> io::Result<()> {
+        self.kill_with("kill")
+    }
+
+    fn kill_with(&self, program: &str) -> io::Result<()> {
         if self.exited.load(Ordering::Acquire) {
-            return;
+            return Ok(());
         }
-        let _ = Command::new("kill")
+        Command::new(program)
             .args(["-KILL", "--", &format!("-{}", self.pgid)])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status();
+            .status()
+            .map(drop)
     }
 }
 
 impl Drop for Job {
     fn drop(&mut self) {
-        self.kill();
+        let _ = self.kill();
         let _ = std::fs::remove_file(&self.selection);
     }
 }
@@ -257,6 +280,52 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .status()
             .is_ok_and(|s| s.success())
+    }
+
+    #[test]
+    fn drain_waits_once() {
+        let (tx, rx) = channel();
+        let t = Instant::now();
+        let job = start(&run("sleep 30 & true"), 200, tx).unwrap();
+        let pgid = job.pgid;
+        let (_, st) = collect(&rx);
+        let took = t.elapsed();
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", "--", &format!("-{pgid}")])
+            .status();
+        assert!(st.unwrap().success());
+        assert!(took < Duration::from_millis(180), "{took:?}");
+    }
+
+    #[test]
+    fn a_missing_kill_is_reported() {
+        let (tx, _rx) = channel();
+        let job = start(&run("sleep 30"), 200, tx).unwrap();
+        assert!(job.kill_with("/nonexistent/kill").is_err());
+        assert!(job.kill().is_ok());
+    }
+
+    #[test]
+    fn input_never_blocks_the_ui() {
+        let (tx, _rx) = channel();
+        let mut job = start(&run("sleep 30"), 200, tx).unwrap();
+        let (done, wait) = channel();
+        let line = "y".repeat(1024);
+        let writer = thread::spawn(move || {
+            for _ in 0..200 {
+                job.send_line(&line);
+            }
+            let _ = done.send(());
+            job
+        });
+        let sent = wait.recv_timeout(Duration::from_secs(2));
+        if sent.is_ok() {
+            drop(writer.join());
+        }
+        assert!(
+            sent.is_ok(),
+            "send_line blocked on a script that doesn't read"
+        );
     }
 
     #[test]
@@ -362,7 +431,7 @@ mod tests {
         let (tx, rx) = channel();
         let job = start(&run("sleep 30 | sleep 30"), 200, tx).unwrap();
         let pgid = job.pgid;
-        job.kill();
+        job.kill().unwrap();
         let (_, st) = collect(&rx);
         assert!(!st.expect("no exit after kill").success());
         let left = std::process::Command::new("pgrep")

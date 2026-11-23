@@ -132,7 +132,13 @@ fn run(
                     }
                 }
                 #[cfg(feature = "scripts")]
-                Out::Kill(id) => drop(job.take_if(|j| j.id == id)),
+                Out::Kill(id) => {
+                    if let Some(j) = job.take_if(|j| j.id == id)
+                        && let Err(e) = j.kill()
+                    {
+                        app.footer = Some(format!("error: kill: {e}"));
+                    }
+                }
             }
         }
         if app.quit {
