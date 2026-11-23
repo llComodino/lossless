@@ -42,6 +42,7 @@ pub enum Pending {
         select: Option<String>,
     },
     Tracks,
+    MusicDir,
     Done,
 }
 
@@ -102,6 +103,8 @@ pub struct App {
     pub artists: Columns<Entry>,
     pub search: Search,
     pub library: Local,
+    /// The daemon's music folder (`get music_dir`), for absolute paths.
+    pub music_dir: Option<String>,
     /// One per view, by `View::index()`; each view's `selected` and
     /// `offset` are positions in its filtered list.
     pub filters: [Filter; 4],
@@ -139,6 +142,7 @@ impl App {
             artists: Columns::default(),
             search: Search::default(),
             library: Local::default(),
+            music_dir: None,
             filters: Default::default(),
             ranker: Ranker::new(),
             footer: None,
@@ -165,6 +169,7 @@ impl App {
         self.expect(resync.subscribe, Pending::Subscribe);
         self.expect(resync.status, Pending::Status);
         self.expect(resync.queue, Pending::Queue);
+        self.expect(resync.music_dir, Pending::MusicDir);
         self.first_queue = true;
     }
 
@@ -200,6 +205,7 @@ impl App {
 
     fn reset(&mut self, generation: u32) {
         self.generation = generation;
+        self.music_dir = None;
         self.pending.clear();
         self.stop_editing();
         self.status = None;
@@ -731,9 +737,14 @@ impl App {
         let Some(pending) = self.pending.remove(&id) else {
             return vec![];
         };
-        let body = match result {
-            Outcome::Ok(body) => body,
-            Outcome::Err(e) => {
+        let body = match (result, &pending) {
+            (Outcome::Ok(Body::Value(v)), Pending::MusicDir) => {
+                self.music_dir = Some(v);
+                return vec![];
+            }
+            (_, Pending::MusicDir) => return vec![],
+            (Outcome::Ok(body), _) => body,
+            (Outcome::Err(e), _) => {
                 self.footer = Some(format!("error: {e}"));
                 return vec![];
             }
@@ -1846,6 +1857,7 @@ mod tests {
                 subscribe: 10,
                 status: 11,
                 queue: 12,
+                music_dir: 13,
             },
         );
         run(
@@ -1888,6 +1900,7 @@ mod tests {
                 subscribe: 10,
                 status: 11,
                 queue: 12,
+                music_dir: 13,
             },
         );
         assert!(app.connected);
@@ -1916,6 +1929,65 @@ mod tests {
         assert_eq!(app.footer.as_deref(), Some("--socket given: no profiles"));
     }
 
+    fn resync(base: u64) -> Resync {
+        Resync {
+            subscribe: base,
+            status: base + 1,
+            queue: base + 2,
+            music_dir: base + 3,
+        }
+    }
+
+    #[test]
+    fn music_dir_from_reply() {
+        let mut app = app();
+        let r = resync(10);
+        app.connected(1, &r);
+        run(
+            &mut app,
+            reply(1, r.music_dir, Outcome::Ok(Body::Value("/m".into()))),
+        );
+        assert_eq!(app.music_dir.as_deref(), Some("/m"));
+    }
+
+    #[test]
+    fn music_dir_error_is_silent() {
+        let mut app = app();
+        let r = resync(10);
+        app.connected(1, &r);
+        let e = WireError {
+            code: ErrorCode::NoMusicDir,
+            message: "no music_dir configured".into(),
+        };
+        run(&mut app, reply(1, r.music_dir, Outcome::Err(e)));
+        assert_eq!(app.music_dir, None);
+        assert_eq!(app.footer, None);
+    }
+
+    #[test]
+    fn music_dir_follows_the_connection() {
+        let mut app = app();
+        let r = resync(10);
+        app.connected(1, &r);
+        run(
+            &mut app,
+            reply(1, r.music_dir, Outcome::Ok(Body::Value("/m".into()))),
+        );
+        let r2 = resync(20);
+        app.connected(2, &r2);
+        assert_eq!(app.music_dir, None);
+        run(
+            &mut app,
+            reply(1, r.music_dir, Outcome::Ok(Body::Value("/old".into()))),
+        );
+        assert_eq!(app.music_dir, None);
+        run(
+            &mut app,
+            reply(2, r2.music_dir, Outcome::Ok(Body::Value("/n".into()))),
+        );
+        assert_eq!(app.music_dir.as_deref(), Some("/n"));
+    }
+
     #[test]
     fn switching_drops_the_old_daemons_replies() {
         let mut app = app();
@@ -1927,6 +1999,7 @@ mod tests {
             subscribe: 10,
             status: 11,
             queue: 12,
+            music_dir: 13,
         };
         app.connected(2, &resync);
         assert_eq!(app.status, None);
@@ -1973,6 +2046,7 @@ mod tests {
             subscribe: 10,
             status: 11,
             queue: 12,
+            music_dir: 13,
         };
         app.connected(2, &resync);
         let outs = run(&mut app, reply(2, 10, Outcome::Ok(Body::Done)));
@@ -2075,6 +2149,7 @@ mod tests {
             subscribe: 10,
             status: 11,
             queue: 12,
+            music_dir: 13,
         };
         app.connected(2, &resync);
         assert!(app.library.tracks.is_empty());
@@ -2511,6 +2586,7 @@ mod tests {
             subscribe: 10,
             status: 11,
             queue: 12,
+            music_dir: 13,
         };
         app.connected(2, &resync);
         assert_eq!(app.filters[0].hits, Some(vec![]));

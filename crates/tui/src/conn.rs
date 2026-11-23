@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::thread;
 
-use lossless_proto::{Command, Request, ServerMessage, decode, encode};
+use lossless_proto::{Command, Property, Request, ServerMessage, decode, encode};
 
 pub enum Msg {
     Server(u32, ServerMessage),
@@ -21,6 +21,7 @@ pub struct Resync {
     pub subscribe: u64,
     pub status: u64,
     pub queue: u64,
+    pub music_dir: u64,
 }
 
 pub struct Conn {
@@ -91,6 +92,9 @@ impl Conn {
             subscribe: self.send(Command::Subscribe)?,
             status: self.send(Command::Status)?,
             queue: self.send(Command::Queue)?,
+            music_dir: self.send(Command::Get {
+                property: Property::MusicDir,
+            })?,
         })
     }
 
