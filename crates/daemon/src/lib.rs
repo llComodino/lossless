@@ -16,7 +16,7 @@ use log::{debug, info, warn};
 use lossless_engine::{Command as PlayerCmd, Output, Player, Snapshot, choose};
 use lossless_library::{Library, collect, read_track};
 use lossless_proto::{
-    Body, Command, Event, Outcome, Request, ServerMessage, Track, decode, encode,
+    Body, Command, Event, Outcome, Property, Request, ServerMessage, Track, decode, encode,
 };
 
 mod config;
@@ -366,6 +366,13 @@ impl State {
                 ))
             }
             Command::Update => self.rescan().map(|_| Body::Done),
+            Command::Get {
+                property: Property::MusicDir,
+            } => self
+                .music_dir
+                .as_ref()
+                .map(|d| Body::Value(d.display().to_string()))
+                .ok_or(RequestError::NoMusicDir),
             Command::Add { paths, at } => play(PlayerCmd::Add {
                 paths: self.tracks(&paths)?,
                 at,

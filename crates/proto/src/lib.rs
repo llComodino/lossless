@@ -28,10 +28,21 @@ pub struct Request {
     pub command: Command,
 }
 
+/// A daemon setting `get` can read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Property {
+    MusicDir,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Command {
     Status,
+    /// One daemon setting, as `Body::Value`.
+    Get {
+        property: Property,
+    },
     Queue,
     /// Start or resume; with an index, jump to that queue entry.
     Play {
@@ -166,6 +177,7 @@ pub enum Body {
     },
     Entries(Vec<Entry>),
     Names(Vec<String>),
+    Value(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -458,6 +470,32 @@ mod tests {
     }
 
     #[test]
+    fn get_round_trips() {
+        let line = r#"{"id":1,"cmd":"get","property":"music_dir"}"#;
+        let req: Request = decode(line).unwrap();
+        assert_eq!(
+            req.command,
+            Command::Get {
+                property: Property::MusicDir
+            }
+        );
+        assert_eq!(encode(&req).unwrap(), format!("{line}\n"));
+        let reply = ServerMessage::Reply {
+            id: 1,
+            result: Outcome::Ok(Body::Value("/m".into())),
+        };
+        assert_eq!(
+            encode(&reply).unwrap(),
+            "{\"type\":\"reply\",\"id\":1,\"ok\":{\"kind\":\"value\",\"data\":\"/m\"}}\n"
+        );
+    }
+
+    #[test]
+    fn get_unknown_property_is_an_error() {
+        assert!(decode::<Request>(r#"{"id":1,"cmd":"get","property":"nope"}"#).is_err());
+    }
+
+    #[test]
     fn volume_on_the_wire() {
         let req = Request {
             id: 6,
@@ -604,6 +642,9 @@ mod props {
         prop_oneof![
             Just(Command::Status),
             Just(Command::Queue),
+            Just(Command::Get {
+                property: Property::MusicDir
+            }),
             of(any::<usize>()).prop_map(|index| Command::Play { index }),
             Just(Command::Pause),
             Just(Command::Toggle),

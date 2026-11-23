@@ -484,3 +484,11 @@ fn volume_command() {
         "Error: no volume control (mixer = none or unavailable)"
     );
 }
+
+#[test]
+fn get_prints_the_music_dir() {
+    let s = Server::start();
+    let out = s.ok(&["get", "music_dir"]);
+    assert_eq!(out, format!("{}\n", s.dir.path("music").display()));
+    assert!(!s.err(&["get", "nope"]).is_empty());
+}
