@@ -14,11 +14,16 @@ use lossless_daemon::run;
 use lossless_engine::fixtures::{BLOCK, Dir, flac_at};
 use lossless_proto::profile::Profile;
 
+/// In-process daemons never register on the real session bus.
 fn write_config(dir: &Dir, text: &str) -> PathBuf {
     let p = dir.path("config.toml");
-    std::fs::write(&p, text).unwrap();
+    std::fs::write(&p, format!("{text}\nmpris = false\n")).unwrap();
     p
 }
+
+/// Nothing listens here: a daemon built with `mpris` must not reach the
+/// real session bus (zbus would fall back to /run/user/UID/bus).
+const NO_BUS: &str = "unix:path=/nonexistent/lossless-test-bus";
 
 /// Connect once `run` has bound the socket (it binds before serving).
 fn connect(socket: &Path) -> UnixStream {
@@ -205,6 +210,7 @@ fn run_stops_on_a_read_only_state_dir() {
 fn losslessd(env: &[(&str, &Path)]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_losslessd"));
     cmd.env_remove("HOME")
+        .env("DBUS_SESSION_BUS_ADDRESS", NO_BUS)
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_RUNTIME_DIR")
         .env_remove("XDG_STATE_HOME");
@@ -264,6 +270,7 @@ fn spawn_with(dir: &Dir, args: &[&str]) -> std::process::Child {
 fn spawn_env(dir: &Dir, args: &[&str], env: &[(&str, &Path)]) -> std::process::Child {
     Command::new(env!("CARGO_BIN_EXE_losslessd"))
         .env_remove("HOME")
+        .env("DBUS_SESSION_BUS_ADDRESS", NO_BUS)
         .env("XDG_CONFIG_HOME", dir.path("xdg"))
         .env_remove("XDG_RUNTIME_DIR")
         .env_remove("XDG_STATE_HOME")
