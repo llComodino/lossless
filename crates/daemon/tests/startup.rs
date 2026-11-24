@@ -680,7 +680,6 @@ mod mpris {
         let _child = daemon(&dir, &address, "mpris = false\n");
         let c = connect(&dir.path("s.sock"));
         assert!(call(&c, r#"{"id":1,"cmd":"status"}"#).contains("status"));
-        thread::sleep(Duration::from_secs(1));
         assert!(!owned(&address, NAME), "registered despite mpris = false");
     }
 }

@@ -198,10 +198,7 @@ pub(crate) fn metadata(d: &State, snap: &Snapshot) -> HashMap<String, OwnedValue
             .and_then(|n| i32::try_from(n).ok())
             .and_then(owned),
     );
-    put(
-        "xesam:url",
-        owned(map::file_url(&path.display().to_string())),
-    );
+    put("xesam:url", owned(map::file_url(path)));
     m
 }
 
@@ -332,7 +329,10 @@ impl Player {
         if self.snap()?.status.volume.is_none() {
             return Err(fdo::Error::NotSupported("no mixer".into()));
         }
-        self.send(PlayerCmd::SetVolume(map::volume_from_mpris(v)))
+        match map::volume_from_mpris(v) {
+            Some(v) => self.send(PlayerCmd::SetVolume(v)),
+            None => Ok(()),
+        }
     }
 
     #[zbus(property(emits_changed_signal = "false"))]
