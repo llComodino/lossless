@@ -624,6 +624,9 @@ fn a_stalled_subscriber_does_not_stop_the_others() {
             repeat: None,
             random: Some(i % 2 == 0),
         });
+        // Reading its own events keeps `c` under BACKLOG: only `stalled` falls behind.
+        let want = i % 2 == 0;
+        c.wait_for(|e| matches!(e, Event::Mode { random, .. } if *random == want));
         c.events.clear();
     }
     c.ok(Command::SetMode {
