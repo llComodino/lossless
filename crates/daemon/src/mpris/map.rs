@@ -1,3 +1,6 @@
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
+
 use lossless_proto::profile::Profile;
 use lossless_proto::{Event, PlayState, Repeat};
 
@@ -79,9 +82,9 @@ pub(crate) fn track_id(index: Option<usize>) -> String {
 }
 
 /// `file://` plus `path`, every byte outside `A-Za-z0-9-._~/` encoded.
-pub(crate) fn file_url(path: &str) -> String {
+pub(crate) fn file_url(path: &Path) -> String {
     let mut url = String::from("file://");
-    for b in path.bytes() {
+    for &b in path.as_os_str().as_bytes() {
         if b.is_ascii_alphanumeric() || b"-._~/".contains(&b) {
             url.push(char::from(b));
         } else {
@@ -242,11 +245,21 @@ mod tests {
     #[test]
     fn file_url_encodes() {
         assert_eq!(
-            file_url("/m/A B/01 #1 100%.flac"),
+            file_url(Path::new("/m/A B/01 #1 100%.flac")),
             "file:///m/A%20B/01%20%231%20100%25.flac"
         );
-        assert_eq!(file_url("/m/Bj\u{f6}rk.flac"), "file:///m/Bj%C3%B6rk.flac");
-        assert_eq!(file_url("/m/a-b_c.d~e"), "file:///m/a-b_c.d~e");
+        assert_eq!(
+            file_url(Path::new("/m/Bj\u{f6}rk.flac")),
+            "file:///m/Bj%C3%B6rk.flac"
+        );
+        assert_eq!(file_url(Path::new("/m/a-b_c.d~e")), "file:///m/a-b_c.d~e");
+    }
+
+    #[test]
+    fn file_url_keeps_non_utf8_bytes() {
+        use std::ffi::OsStr;
+        let p = Path::new(OsStr::from_bytes(b"/m/Bj\xf6rk.flac"));
+        assert_eq!(file_url(p), "file:///m/Bj%F6rk.flac");
     }
 
     fn state(state: PlayState, position_ms: u64) -> Event {

@@ -198,10 +198,7 @@ pub(crate) fn metadata(d: &State, snap: &Snapshot) -> HashMap<String, OwnedValue
             .and_then(|n| i32::try_from(n).ok())
             .and_then(owned),
     );
-    put(
-        "xesam:url",
-        owned(map::file_url(&path.display().to_string())),
-    );
+    put("xesam:url", owned(map::file_url(path)));
     m
 }
 
