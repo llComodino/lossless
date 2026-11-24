@@ -167,14 +167,14 @@ fn saved(snap: &Snapshot) -> state::Saved {
     }
 }
 
-/// Forward player events to every subscribed client, dropping dead ones, and
-/// save the state once per batch of queued events if any changes it (before
-/// broadcasting, so a client that saw the event can rely on the file). The stream ends only when the
-/// player thread is gone, so `on_player_gone` runs.
 /// Told about every batch of player events, after it is saved and before
 /// clients hear of it.
 type Observer = Box<dyn FnMut(&[Event]) + Send>;
 
+/// Forward player events to every subscribed client, dropping dead ones, and
+/// save the state once per batch of queued events if any changes it (before
+/// broadcasting, so a client that saw the event can rely on the file). The
+/// stream ends only when the player thread is gone, so `on_player_gone` runs.
 fn fan_out(
     events: Receiver<Event>,
     mut save: impl FnMut(),
