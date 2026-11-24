@@ -67,11 +67,8 @@ pub(crate) fn volume_to_mpris(percent: u8) -> f64 {
     clippy::cast_sign_loss,
     reason = "clamped to 0..=100"
 )]
-pub(crate) fn volume_from_mpris(v: f64) -> u8 {
-    if v.is_nan() {
-        return 0;
-    }
-    (v.clamp(0.0, 1.0) * 100.0).round() as u8
+pub(crate) fn volume_from_mpris(v: f64) -> Option<u8> {
+    (!v.is_nan()).then(|| (v.clamp(0.0, 1.0) * 100.0).round() as u8)
 }
 
 pub(crate) fn track_id(index: Option<usize>) -> String {
@@ -226,11 +223,11 @@ mod tests {
 
     #[test]
     fn volume_from_mpris_clamps() {
-        assert_eq!(volume_from_mpris(0.5), 50);
-        assert_eq!(volume_from_mpris(-1.0), 0);
-        assert_eq!(volume_from_mpris(7.0), 100);
-        assert_eq!(volume_from_mpris(f64::NAN), 0);
-        assert_eq!(volume_from_mpris(0.333), 33);
+        assert_eq!(volume_from_mpris(0.5), Some(50));
+        assert_eq!(volume_from_mpris(-1.0), Some(0));
+        assert_eq!(volume_from_mpris(7.0), Some(100));
+        assert_eq!(volume_from_mpris(f64::NAN), None);
+        assert_eq!(volume_from_mpris(0.333), Some(33));
         assert_eq!(volume_to_mpris(100), 1.0);
         assert_eq!(volume_to_mpris(40), 0.4);
     }

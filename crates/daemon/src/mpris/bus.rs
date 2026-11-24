@@ -329,7 +329,10 @@ impl Player {
         if self.snap()?.status.volume.is_none() {
             return Err(fdo::Error::NotSupported("no mixer".into()));
         }
-        self.send(PlayerCmd::SetVolume(map::volume_from_mpris(v)))
+        match map::volume_from_mpris(v) {
+            Some(v) => self.send(PlayerCmd::SetVolume(v)),
+            None => Ok(()),
+        }
     }
 
     #[zbus(property(emits_changed_signal = "false"))]
